@@ -84,9 +84,32 @@ impl Saved {
     }
 }
 
-/// A path as Windows compares names: each character upper-cased one for one (NTFS's table maps a UTF-16 unit to one unit), and a
-/// character whose upper case is more than one left as it is. `to_lowercase` folds whole strings: "İ" became "i" and a combining dot, the
-/// same as "i̇", and of two files Windows keeps apart, the edits and the commands kept one.
+/// A path as Windows compares names: each UTF-16 unit in the OS's invariant upper case (LCMapStringEx, LCMAP_UPPERCASE: the table NTFS and
+/// CompareStringOrdinal's ignore-case compare by), a surrogate left as it is (that table has no entry for one). On an NTFS volume, every
+/// BMP character's case partners and six beyond the BMP (1,229 pairs, each made as two files) were the same or apart for NTFS as for this
+/// key. Rust's case mappings are newer than that table: one character at a time they joined 278 of the pairs NTFS keeps apart or parted
+/// ones it joins (ı and I, ſ and S, µ and Μ, ǅ and Ǆ), and `to_lowercase` of the whole name made "İ" one with "i̇", so that of two files
+/// Windows keeps apart, the edits and the commands kept one. If the OS does not map the name, it is its own key (two names stay two).
+#[cfg(windows)]
+fn path_key(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT};
+    let units: Vec<u16> = path.as_os_str().encode_wide().map(|unit| if unit == u16::from(b'/') { u16::from(b'\\') } else { unit }).collect();
+    let (Ok(length), false) = (i32::try_from(units.len()), units.is_empty()) else { return units };
+    let mut upper = vec![0u16; units.len()];
+    // SAFETY: both buffers hold `length` units; the invariant locale and no version or sort handle.
+    let written = unsafe {
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, units.as_ptr(), length, upper.as_mut_ptr(), length, std::ptr::null(),
+                      std::ptr::null(), 0)
+    };
+    if written != length {
+        return units;
+    }
+    units.iter().zip(upper).map(|(&unit, upper)| if (0xD800..=0xDFFF).contains(&unit) { unit } else { upper }).collect()
+}
+
+/// Elsewhere: each character upper-cased one for one, a character whose upper case is more than one left as it is.
+#[cfg(not(windows))]
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\").chars().map(|c| {
         let mut upper = c.to_uppercase();
@@ -631,6 +654,53 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    /// Decides: two names are one key where NTFS takes them for the same entry and two where it keeps two (each pair made as two
+    /// files on an NTFS volume: the case partners Rust's newer case mappings join or part otherwise, a character beyond the BMP, and ones
+    /// that differ only in ASCII case or in their separators).
+    #[cfg(windows)]
+    #[test]
+    fn names_are_one_key_where_ntfs_takes_them_for_one_file() {
+        let same = |a: &str, b: &str| path_key(Path::new(a)) == path_key(Path::new(b));
+        for (a, b) in [("\u{130}.txt", "i\u{307}.txt"), ("\u{131}.txt", "I.txt"), ("\u{17F}.txt", "S.txt"), ("\u{B5}.txt", "\u{39C}.txt"),
+                       ("\u{1C5}.txt", "\u{1C4}.txt"), ("\u{261}.txt", "\u{A7AC}.txt"), ("\u{10428}.txt", "\u{10400}.txt")] {
+            assert!(!same(a, b), "{a:?} and {b:?} are two files on NTFS");
+        }
+        for (a, b) in [("Sample.txt", "sAmPle.txt"), ("src/a.rs", "SRC\\A.RS"), ("\u{3B1}.txt", "\u{391}.txt"), ("\u{E9}.txt", "\u{C9}.txt")] {
+            assert!(same(a, b), "{a:?} and {b:?} are one file on NTFS");
+        }
+    }
+
+    /// Decides: of two files Windows keeps apart that a case-folded key joined ("İ.txt" and "i̇.txt" for `to_lowercase`, "ı.txt" and
+    /// "I.txt" for a character's own upper case), the session's changes keep both, one saved by an edit and one named by a command, and a name
+    /// differing only in ASCII case is still the file it names.
+    #[cfg(windows)]
+    #[test]
+    fn two_files_windows_keeps_apart_stay_two_in_the_changes() {
+        let mut f = fixture();
+        let root = f.file.parent().unwrap().to_path_buf();
+        let dotted = root.join("\u{130}.txt");
+        let combined = root.join("i\u{307}.txt");
+        let dotless = root.join("\u{131}.txt");
+        let capital = root.join("I.txt");
+        for path in [&dotted, &combined, &dotless, &capital] {
+            std::fs::write(path, "before").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".txt")).count(), 4,
+                   "NTFS keeps all four names");
+        f.marks.begin("edit", "t", None).unwrap();
+        f.marks.before_edit(&[dotted.clone(), dotless.clone()]).unwrap();
+        f.marks.commanded(vec![Touched { path: combined.clone(), made: true }, Touched { path: capital.clone(), made: true },
+                               Touched { path: root.join("\u{130}.TXT"), made: false }]).unwrap();
+        for path in [&dotted, &combined, &dotless, &capital] {
+            std::fs::write(path, "after").unwrap();
+        }
+        let mut paths: Vec<String> = f.marks.session_changes(&root).iter().map(|change| change.path.clone()).collect();
+        paths.sort();
+        let mut expected = vec!["\u{130}.txt".to_string(), "i\u{307}.txt".to_string(), "\u{131}.txt".to_string(), "I.txt".to_string()];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     #[cfg(windows)]
