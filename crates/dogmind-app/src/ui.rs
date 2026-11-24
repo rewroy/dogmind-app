@@ -11034,7 +11034,7 @@ impl App {
         let Some(exe) = self.builds.first().map(|(path, _)| path.clone()) else { return };
         let mut command = std::process::Command::new(&exe);
         if self.workspace.is_dir() && self.workspace != Path::new(".") {
-            command.arg(&self.workspace);
+            command.arg(&self.workspace).arg("--remembered");
         }
         command.arg("--after").arg(std::process::id().to_string());
         if let Some(session) = &self.current_session {
@@ -18197,6 +18197,8 @@ pub struct Restart {
     pub resume: Option<PathBuf>,
     /// It was in the tray, out of sight, and this one stays there too.
     pub hidden: bool,
+    /// The folder given is the workspace the older copy had open, and not one the person has just chosen: it opens as it is (`settings::starting_folder`).
+    pub remembered: bool,
 }
 
 /// Waits, at most this long, for a process to end. One that is gone already, or cannot be looked at, is not waited for.
@@ -18280,8 +18282,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         lang::set(&saved.display_language);
         // (before the transcript and the composer are made, whose first format takes it)
         TEXT_SCALE.store(saved.text_percent(), Ordering::Relaxed);
-        // (the folder given at the start is the person's choice, and opens where it leads; the one remembered opens as it is)
-        let chosen = folder_argument.map(settings::as_chosen).filter(|path| path.is_dir()).or_else(|| saved.workspace.clone().filter(|path| path.is_dir()));
+        let chosen = settings::starting_folder(folder_argument, restart.remembered || restart.after.is_some(), saved.workspace.clone());
         let needs_folder = chosen.is_none();
         // Until a folder is chosen the start panel stays over the chat, and nothing can be sent.
         let workspace = chosen.unwrap_or_else(|| Path::new(".").to_path_buf());

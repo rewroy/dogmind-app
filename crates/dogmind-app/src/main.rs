@@ -84,6 +84,7 @@ fn main() -> ExitCode {
             Some("--after") => restart.after = arguments.next().and_then(|pid| pid.to_str()?.parse().ok()),
             Some("--resume") => restart.resume = arguments.next().map(std::path::PathBuf::from),
             Some("--hidden") => restart.hidden = true,
+            Some("--remembered") => restart.remembered = true,
             _ if folder.is_none() => folder = Some(std::path::PathBuf::from(argument)),
             _ => {}
         }

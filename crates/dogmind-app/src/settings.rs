@@ -620,6 +620,13 @@ pub fn as_chosen(folder: PathBuf) -> PathBuf {
     }
 }
 
+/// The workspace a start opens: the folder given, if it is one, and otherwise the one remembered. The folder given is the person's choice, and opens
+/// where it leads ([`as_chosen`]), unless the app gave it to itself as it started again (`remembered`: it is the workspace the older copy had open,
+/// which a command may have made a link since), when it opens as it is, as the one remembered does.
+pub fn starting_folder(given: Option<PathBuf>, remembered: bool, saved: Option<PathBuf>) -> Option<PathBuf> {
+    given.map(|folder| if remembered { folder } else { as_chosen(folder) }).filter(|path| path.is_dir()).or_else(|| saved.filter(|path| path.is_dir()))
+}
+
 /// Whether `path` is `folder` or lies under it, as the same folder may be spelled in another case by the system and by a dialog.
 pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
     let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -681,6 +688,11 @@ mod tests {
         assert!(super::same_or_inside(&real_spelled, &std::fs::canonicalize(&real).map(|path| std::path::PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"))).unwrap()), "{}", real_spelled.display());
         assert!(!real_spelled.to_string_lossy().starts_with("\\\\?\\"));
         assert_eq!(super::as_chosen(real.clone()), real, "a folder as it is");
+        // At a start: given by the person, where it leads; given by the app to itself as it starts again, or remembered, as it is (the sandbox refuses it).
+        assert_eq!(super::starting_folder(Some(link.clone()), false, None), Some(real_spelled.clone()));
+        assert_eq!(super::starting_folder(Some(link.clone()), true, None), Some(link.clone()));
+        assert_eq!(super::starting_folder(None, false, Some(link.clone())), Some(link.clone()));
+        assert_eq!(super::starting_folder(Some(dir.path().join("gone")), false, Some(real.clone())), Some(real.clone()), "no folder given: the one remembered");
     }
 
     /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
