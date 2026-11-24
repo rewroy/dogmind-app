@@ -117,14 +117,18 @@ pub(crate) const WEB_RULES: &str = "## Web Content
 pub(crate) const NO_DRIVE_ROOT: &str = "In the sandbox, `dir`, `del` and `erase` work only in their plain forms, and `vol`, `tree`, `attrib`, `xcopy`, `robocopy` and `where /r` answer \"Access is denied\" or an odd error even inside the workspace, because they read the drive's root. List with `list_files` or `find_files`. Delete with a plain `del a.txt` or `rmdir /s /q folder`, and copy with `copy`.";
 
 /// What is in the workspace at its top: a model that is not told looks, and one that finds nothing looks elsewhere.
-fn folder_contents(folder: &Path) -> String {
+fn folder_contents(entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>) -> String {
     const SHOWN: usize = 40;
-    let mut names: Vec<String> = std::fs::read_dir(folder).into_iter().flatten().flatten().filter_map(|entry| {
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
         // (a big file's size, which is all a model lists the folder again to learn: a round of a real job, for "app.log (1.5 MB)")
         let big = entry.metadata().ok().map(|data| data.len()).filter(|size| *size >= 100 * 1024).map_or(String::new(), |size| format!(" ({:.1} MB)", size as f64 / (1024.0 * 1024.0)));
-        (name != ".git").then(|| if entry.path().is_dir() { format!("{name}/") } else { format!("{name}{big}") })
-    }).collect();
+        names.push(if entry.path().is_dir() { format!("{name}/") } else { format!("{name}{big}") });
+    }
     names.sort();
     if names.is_empty() {
         return "The workspace is empty: this is a new project, and it starts here.".to_string();
@@ -179,11 +183,27 @@ fn environment() -> String {
 
 /// What the first message of a session carries: what is in the workspace, and where its git stands.
 pub fn workspace_state(cwd: &Path) -> String {
+    let details = match std::fs::read_dir(cwd).map(folder_contents) {
+        Ok(contents) => format!("{contents}\n- {}", workspace_git_state(cwd)),
+        Err(error) => format!("The workspace could not be listed: {error}"),
+    };
+    let state = format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {details}", cwd.display());
+    #[cfg(windows)]
+    {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if let Some(reason) = crate::sandbox::refusal(cwd, home.as_deref()) {
+            return format!("{state}\n- {reason}");
+        }
+    }
+    state
+}
+
+fn workspace_git_state(cwd: &Path) -> String {
     // (no answer from git is not the same as no repository)
     let none = if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." };
     // (a folder of a larger repository: git, run outside the sandbox, finds that repository, and a command in the sandbox cannot reach it, so the model is told both)
     let above = crate::tools::repository_above(cwd);
-    let git = crate::tools::git_info(cwd).map_or(none.to_string(), |info| match &above {
+    crate::tools::git_info(cwd).map_or(none.to_string(), |info| match &above {
         Some(top) => {
             let last = info.last_commit.as_ref().map_or(String::new(), |last| format!(" Its last commit: {last}."));
             format!(
@@ -197,16 +217,7 @@ pub fn workspace_state(cwd: &Path) -> String {
             )
         }
         None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked),
-    });
-    let state = format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd));
-    #[cfg(windows)]
-    {
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        if let Some(reason) = crate::sandbox::refusal(cwd, home.as_deref()) {
-            return format!("{state}\n- {reason}");
-        }
-    }
-    state
+    })
 }
 
 /// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
@@ -1009,6 +1020,36 @@ mod tests {
         assert!(state.contains("a.txt, src/.") && !state.contains("The workspace is empty") && !state.contains(".git/"), "{state}");
         std::fs::write(folder.path().join("big.log"), vec![b'x'; 300 * 1024]).unwrap();
         assert!(workspace_state(folder.path()).contains("a.txt, big.log (0.3 MB), src/."), "a big file says how big");
+    }
+
+    #[test]
+    fn an_unreadable_entry_keeps_the_files_before_and_after_it_in_the_listing() {
+        let dir = crate::in_container::tempdir().unwrap();
+        for name in ["alpha.txt", "omega.txt"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut entries = std::fs::read_dir(dir.path()).unwrap();
+        let first = entries.next().unwrap();
+        let failed = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let contents = folder_contents([first, failed].into_iter().chain(entries));
+        assert!(contents.contains("alpha.txt, omega.txt"), "{contents}");
+    }
+
+    #[test]
+    fn an_unavailable_workspace_is_not_described_as_a_new_project() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let missing = dir.path().join("moved");
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "contents").unwrap();
+        for path in [&missing, &file] {
+            let error = std::fs::read_dir(path).unwrap_err().to_string();
+            let facts = workspace_state(path);
+            assert!(facts.contains(&error), "{facts}");
+            assert!(!facts.contains("new project") && !facts.contains("not a git repository"), "{facts}");
+        }
+        assert!(!missing.exists());
+        let empty = crate::in_container::tempdir().unwrap();
+        assert!(workspace_state(empty.path()).contains("The workspace is empty"));
     }
 
     /// A folder of a larger repository: the first message names the repository and says that git cannot reach it from the sandbox; the top of a repository keeps the sentence it had.
