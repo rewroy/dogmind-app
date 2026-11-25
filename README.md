@@ -50,6 +50,22 @@ Keys are kept in Windows' Credential Manager, never in the settings file.
 - Edits and commands ask first, as the mode says. Once web content is in a conversation, what it may have asked for is asked every time.
 - Conversations can be encrypted in *Settings > Privacy* (off by default).
 
+## Privacy
+
+Dogmind sends no conversation or file to its developers, and it has no telemetry. It reaches the network only for these:
+
+- **The connection you chose.** With Straydog on this PC, the conversation stays on this PC. With another machine, an
+  OpenAI-compatible service, Codex or Claude, the conversation goes there (under that service's terms).
+- **Web search and reading (on by default).** Search words go to DuckDuckGo (then Bing, or Brave with a Brave key), and a page read
+  comes from its site. Turn it off with *Web search and reading* in the settings.
+- **Update checks (on by default).** Every six hours the app asks GitHub for a new version, sending only its own version; updates and
+  the engine are downloaded from GitHub too. *Update automatically* in *Settings > About* stops them.
+- **Getting a model for this PC.** The engine downloads it from Hugging Face.
+- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs.
+- **MCP servers you add, and commands you allow the network.**
+
+Problem reports are not sent by themselves either.
+
 ## Updating and removing
 
 When a new version is out, the app tells you and updates with one button. To remove it, use *Settings > General > Remove this app
