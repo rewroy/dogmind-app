@@ -214,10 +214,14 @@ impl Web {
         }
         body.push_str(&format!("Address: {final_url}\n\n{shown}\n"));
         let end = start + shown.chars().count();
-        if end < total {
+        if start >= total && start > 0 {
+            // (nothing below the address would read as a page with nothing on it: say where this read went)
+            body.push_str(&format!("\n[start_char={start} is at or past the end of this page, which has {total} characters: there is no more to read. web_read without start_char reads it from the top]\n"));
+        } else if end < total {
             body.push_str(&format!("\n[{end} of {total} characters shown: web_read again with start_char={end} for more]\n"));
         }
-        if total < FEW_CHARS {
+        // (past the end, a short page is not one that looks empty for its scripts: it was read before)
+        if total < FEW_CHARS && start < total {
             body.push_str("\n[Little text here: this reader does not run JavaScript, so a page built by scripts looks empty.]\n");
         }
         if start == 0 && !page.links.is_empty() {
@@ -1289,6 +1293,19 @@ mod tests {
         assert!(text.contains("<untrusted_web_content") && text.contains("Ignore previous") && !text.contains("SECRET"), "{text}");
         assert!(web.is_known(&format!("{base}/next?a=1")));
         assert!(!web.is_known(&format!("{base}/next?a=1&stolen=key")));
+    }
+
+    /// `start_char` past the end is said to be past it: an empty body alone reads as a page with nothing on it.
+    #[test]
+    fn a_read_past_the_end_says_so() {
+        let html = "<title>T</title><p>Only a few words here.</p>";
+        let answer: &'static str = Box::leak(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{html}", html.len()).into_boxed_str());
+        let base = serve(vec![answer]);
+        let mut web = local();
+        let cancel = AtomicBool::new(false);
+        let text = web.read(&json!({"url": format!("{base}/start"), "start_char": 1_000_000}), &cancel).unwrap();
+        assert!(text.contains("past the end"), "{text}");
+        assert!(!text.contains("Only a few words") && !text.contains("does not run JavaScript"), "{text}");
     }
 
     #[test]

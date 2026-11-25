@@ -113,7 +113,7 @@ pub fn schemas() -> Value {
     let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
     json!([
         function("apply_patch", "Replace exact text in existing files. Set path inside each edit to the file containing its old_string. All edits land together or none do. Read the target if you need its exact text. old_string must match once (or `count` times), without line numbers.", json!({
-            "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer", "minimum": 0}}, "required": ["path", "old_string", "new_string"]}}
+            "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer", "minimum": 1}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
         function("create_file", CREATE_FILE_IN_PARTS, json!({
             "path": {"type": "string"},
@@ -217,7 +217,9 @@ pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
     let new = arguments.get("new_string").cloned().unwrap_or(Value::Null);
     let mut edit = json!({"path": path, "old_string": old, "new_string": new});
     if arguments.get("replace_all").and_then(Value::as_bool) == Some(true) && !old.is_empty() {
-        let found = std::fs::read(resolve(workspace, path)).ok().and_then(|bytes| {
+        // (counted by holding it: one larger than memory is left to apply_patch, which refuses it before reading)
+        let file = resolve(workspace, path);
+        let found = std::fs::metadata(&file).ok().filter(|data| data.len() <= MOST_READ_WHOLE).and_then(|_| std::fs::read(&file).ok()).and_then(|bytes| {
             let (text, encoding) = readable_file_text(&bytes)?;
             let body = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
             let exact = body.matches(old).count();
@@ -1266,6 +1268,11 @@ impl Workbench {
             let Some(known) = self.seen.get(&path) else {
                 return Err(format!("{given} exists and has not been read in this session: read it first, then change it with apply_patch or write it again"));
             };
+            // (written whole, added to or over: one larger than memory is refused before it is read, as read_file does)
+            let size = std::fs::metadata(&path).map_err(|error| format!("{given}: {error}"))?.len();
+            if size > MOST_READ_WHOLE {
+                return Err(format!("{given} is too large to write here, at {} MB: use a command that changes just the part you need. Nothing was written", size / 1_048_576));
+            }
             before = std::fs::read(&path).map_err(|error| format!("{given}: {error}"))?;
             if *known != sha16(&before) {
                 return Err(format!("{given} changed since it was read: read it again"));
@@ -1343,8 +1350,12 @@ impl Workbench {
             let count = match edit.get("count") {
                 None => 1,
                 Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| format!("edit {}: count must be a non-negative integer, for example 2: nothing was changed", number + 1))?,
+                    .ok_or_else(|| format!("edit {}: count must be a whole number, 1 or more, for example 2: nothing was changed", number + 1))?,
             };
+            // (0 asked for no change at all: with old_string absent it found nothing, changed nothing, and was reported as applied)
+            if count == 0 {
+                return Err(format!("edit {}: count 0 asks for no change, so there is no edit to apply: give the number of times old_string is there, or leave count out to change it once: nothing was changed", number + 1));
+            }
             if old.is_empty() {
                 return Err(format!("edit {}: old_string is empty", number + 1));
             }
@@ -1357,6 +1368,11 @@ impl Workbench {
                     // (no read is asked for, nor that the file is as it was read: old_string has to be there as often as asked, as it is now, and that is
                     // what keeps an edit to what the model knows of the file. A file the model had written itself and knew to the byte was refused for not
                     // having been read in the session, and 5,207 characters were sent again after a read for nothing.)
+                    // (held whole to cut and join its text: one larger than memory is refused before it is read, as read_file does)
+                    let size = std::fs::metadata(&path).map_err(|error| format!("{}: {error}: nothing was changed", path.display()))?.len();
+                    if size > MOST_READ_WHOLE {
+                        return Err(format!("{} is too large to edit here, at {} MB: use a command that changes just the part you need: nothing was changed", path.display(), size / 1_048_576));
+                    }
                     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}: nothing was changed", path.display()))?;
                     let Some((mut text, encoding)) = text_of_file(&bytes) else {
                         return Err(format!("{given} is binary: nothing was changed"));
@@ -5600,6 +5616,18 @@ mod tests {
         }
     }
 
+    /// `count` of 0 is not a patch that landed: with old_string absent it found nothing, changed nothing, and said it was applied.
+    #[test]
+    fn a_patch_that_asks_for_no_change_is_refused() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "first\n").unwrap();
+        let patch = json!({"edits": [{"path": "a.txt", "old_string": "absent", "new_string": "x", "count": 0}]});
+        let why = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap_err();
+        assert!(why.contains("count 0") && why.contains("nothing was changed"), "{why}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first\n");
+    }
+
     #[test]
     fn an_ambiguous_patch_shows_bounded_match_locations_after_prior_edits() {
         let (dir, mut bench, cancel) = bench();
@@ -5973,6 +6001,30 @@ mod tests {
         std::fs::File::create(&large).unwrap().set_len(MOST_READ_WHOLE + 1).unwrap();
         let said = read_file(&json!({"path": "model.gguf"}), dir.path()).err().unwrap();
         assert!(said.contains("too large"), "{said}");
+    }
+
+    /// A patch holds the file whole to cut and join its text: one larger than memory is refused before it is read, as read_file does.
+    #[test]
+    fn a_file_too_large_to_hold_is_not_patched() {
+        let (dir, mut bench, cancel) = bench();
+        let large = dir.path().join("model.gguf");
+        std::fs::File::create(&large).unwrap().set_len(MOST_READ_WHOLE + 1).unwrap();
+        let patch = json!({"edits": [{"path": "model.gguf", "old_string": "x", "new_string": "y"}]});
+        let why = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap_err();
+        assert!(why.contains("too large"), "{why}");
+    }
+
+    /// create_file adds on by holding the file whole and writing it again: one larger than memory is refused before it is read.
+    #[test]
+    fn a_file_too_large_to_hold_is_not_written_again() {
+        let (dir, mut bench, cancel) = bench();
+        let large = dir.path().join("model.gguf");
+        std::fs::File::create(&large).unwrap().set_len(MOST_READ_WHOLE + 1).unwrap();
+        // (kept as far as it was seen when it was written, as the session's file holds it)
+        let seen = bench.take_seen();
+        bench.restore_seen(seen.into_iter().chain([(large.clone(), "seen".to_string())]).collect());
+        let why = bench.run("create_file", &json!({"path": "model.gguf", "content": "y", "append": true}), dir.path(), &cancel).unwrap_err();
+        assert!(why.contains("too large") && why.contains("Nothing was written"), "{why}");
     }
 
     #[test]
