@@ -240,7 +240,9 @@ def install_wheel(wheel, site, files):
 def refuse_unless_tools(folder):
     """The folder is replaced whole, and `--tools-only` is told which on the command line: only an empty one, or an earlier tools folder, is this script's to take."""
     names = {item.name for item in folder.iterdir()}
-    if names and not names & {"python", "node", "git"} or names - {"python", "node", "git", ".open-to-sandbox"}:
+    # (the marks that the folder was opened to commands: `.open-to-sandbox`, and one for each container, `.open-to-sandbox-<hash of its SID>`)
+    names = {name for name in names if not name.startswith(".open-to-sandbox")}
+    if names and not names & {"python", "node", "git"} or names - {"python", "node", "git"}:
         sys.exit(f"{folder} holds other things than tools: name a folder of its own")
 
 

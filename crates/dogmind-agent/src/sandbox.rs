@@ -684,7 +684,7 @@ fn capability_name(place: &str) -> String {
 }
 
 /// FNV-1a, 64 bits: a short name made from a long one, the same each time.
-fn fnv(text: &str) -> u64 {
+pub(crate) fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 
@@ -1506,6 +1506,11 @@ fn newly_made(root: &Path, found: &[PathBuf]) -> Vec<PathBuf> {
     found.iter().filter(|git| here.insert(key(git)) && !first_look).cloned().collect()
 }
 
+/// Repositories a command made whose disarming did not come to an end (a folder held open by another program, a thing put where the app's file goes): each
+/// look disarms them again, as a command's, whatever else ran, and no command runs in their workspace until it has. Known as there at the look that found
+/// them, they would otherwise be taken for the person's at the next.
+static NOT_YET_DISARMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
 /// The app itself has just made this one, and what it writes there after this has been asked about.
 pub fn note_made_by_the_app(root: &Path, folder: &Path) {
     let mut known = KNOWN_REPOSITORIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1711,10 +1716,10 @@ fn disarm_folder(root: &Path, folder: &Path, taken: &mut Taken) -> Result<(), St
         }
     } else if std::fs::symlink_metadata(&hooks).is_ok() {
         let held = crate::held_way::hold(root, &hooks, false)?;
-        let _kept = crate::held_way::kept_full(held.as_ref()).map_err(|error| error.to_string())?;
+        let kept = crate::held_way::kept_full(held.as_ref()).map_err(|error| error.to_string())?;
         for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".sample") || name.starts_with(crate::held_way::KEPT_MARK) {
+            if name.ends_with(".sample") || kept.is(&name) {
                 continue;
             }
             // (an entry's own type, which is a link's own and not what it leads to; the links in a folder are taken away before it is moved, and not gone through)
@@ -1830,11 +1835,30 @@ unsafe fn look_after_repositories(root: &Path, sid: PSID, when: Look) -> Looked 
     let new = newly_made(root, &found);
     let by_a_command = commands_since_the_last_look(root) || when == Look::AfterACommand;
     let mut looked = Looked { said: Vec::new(), refused: None };
-    if by_a_command && !new.is_empty() {
-        let known: HashSet<String> = found.iter().filter(|git| !new.contains(git)).map(|git| key(git)).collect();
-        for git in &new {
+    let mut to_disarm = if by_a_command { new } else { Vec::new() };
+    {
+        let not_yet = NOT_YET_DISARMED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let not_yet = not_yet.as_ref();
+        for git in &found {
+            if not_yet.is_some_and(|not_yet| not_yet.contains(&key(git))) && !to_disarm.contains(git) {
+                to_disarm.push(git.clone());
+            }
+        }
+    }
+    if !to_disarm.is_empty() {
+        let known: HashSet<String> = found.iter().filter(|git| !to_disarm.contains(git)).map(|git| key(git)).collect();
+        for git in &to_disarm {
             let mut taken = Taken::default();
             let result = disarm_repository(git, root, &known, &mut taken);
+            {
+                let mut not_yet = NOT_YET_DISARMED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let not_yet = not_yet.get_or_insert_with(HashSet::new);
+                if result.is_ok() {
+                    not_yet.remove(&key(git));
+                } else {
+                    not_yet.insert(key(git));
+                }
+            }
             if !taken.names.is_empty() {
                 let shown = git.parent().and_then(|folder| folder.strip_prefix(root).ok()).map_or(String::new(), |place| place.display().to_string());
                 looked.said.push(taken.said_of(&if shown.is_empty() { "the workspace folder itself".to_string() } else { shown }));
@@ -4337,6 +4361,46 @@ mod tests {
         for made_at in [&junction, &into_work, &link, &to_documents, &documents_in_work, &to_keys, &keys_in_work, &to_home] {
             let _ = std::fs::remove_dir(made_at);
         }
+    }
+
+    /// Folders put where the app's file used to go (its name was the app's process id) do not stop a new repository being disarmed: its name is not known
+    /// before it is made.
+    #[test]
+    fn a_folder_where_the_apps_file_went_does_not_stop_the_disarming() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let git = dir.path().join("repo").join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n").unwrap();
+        std::fs::write(git.join("hooks").join("pre-commit"), "evil").unwrap();
+        for place in [git.clone(), git.join("hooks")] {
+            std::fs::create_dir_all(place.join(format!("{}{}", crate::held_way::KEPT_MARK, std::process::id()))).unwrap();
+        }
+        let mut taken = Taken::default();
+        disarm_repository(&git, dir.path(), &HashSet::new(), &mut taken).unwrap();
+        assert!(!git.join("hooks").join("pre-commit").exists(), "the hook is taken out: {:?}", taken.names);
+        assert!(!std::fs::read_to_string(git.join("config")).unwrap().contains("fsmonitor"));
+    }
+
+    /// A new repository whose disarming cannot be done (here: another program holds its `.git` open to delete it) refuses the command, and stays to be
+    /// disarmed: the next look, with no command since, still refuses while it cannot, and disarms it once it can, and the commands go on.
+    #[test]
+    fn a_repository_whose_disarming_failed_is_disarmed_at_the_next_look() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = crate::in_container::tempdir().unwrap();
+        let root = dir.path();
+        assert!(look_between_commands(root).refused.is_none(), "the first look takes what is there as it is");
+        let git = root.join("repo").join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n").unwrap();
+        std::fs::write(git.join("hooks").join("pre-commit"), "evil").unwrap();
+        let held = std::fs::OpenOptions::new().access_mode(DELETE | 0x80).share_mode(7).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&git).unwrap();
+        assert!(look(root).refused.is_some(), "refused while it cannot be disarmed");
+        assert!(git.join("hooks").join("pre-commit").exists());
+        assert!(look_between_commands(root).refused.is_some(), "and at the next look, with no command since");
+        drop(held);
+        let looked = look_between_commands(root);
+        assert!(!git.join("hooks").join("pre-commit").exists(), "disarmed once it can be");
+        assert!(looked.refused.is_none(), "{:?}", looked.refused);
     }
 
     /// While a loop swaps a new repository's `.git` for a junction to a repository of the person's outside and back, arming it again each time, the app

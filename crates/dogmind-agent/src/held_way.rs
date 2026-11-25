@@ -8,6 +8,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// What is said where a place is in the workspace where it really is, but not as it is written.
+pub(crate) const NOT_AS_WRITTEN: &str = "it is in the workspace where it really is, but not as it is written (a link on the way, or the workspace named in two ways), so nothing was written there: write it by its path in the workspace";
+
 /// What is said where a folder on the way is not as it should be.
 pub(crate) const ON_THE_WAY: &str = "a folder on the way to it is a link or a junction, or is not where it was (a command can make one), so nothing was written there";
 
@@ -38,8 +41,15 @@ fn below(root: &Path, folder: &Path) -> Option<Vec<std::ffi::OsString>> {
 
 /// `folder` held from `root` down, its missing folders made when `make`. `Ok(None)` where it is not below `root` as written (a place outside the
 /// workspace that the person allowed, which no command there can write): it is made, if asked, and written as before.
+///
+/// What is not below the root as written is looked at with the long names of what is there (a short name, as `PROJEC~1`, written out, and nothing gone
+/// through). What is still not, but is in the workspace where both really are (a link on the way, or a real path among named ones), is refused: it
+/// would otherwise be written with nothing held.
 pub(crate) fn hold(root: &Path, folder: &Path, make: bool) -> Result<Option<Way>, String> {
-    let Some(parts) = below(root, folder) else {
+    let Some(parts) = below(root, folder).or_else(|| below(&long_names(root), &long_names(folder))) else {
+        if crate::safety::real_path(root).zip(crate::safety::real_path(folder)).is_some_and(|(root, real)| crate::safety::inside(&root, &real)) {
+            return Err(format!("{}: {NOT_AS_WRITTEN}", folder.display()));
+        }
         if make {
             std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
         }
@@ -71,6 +81,31 @@ pub(crate) fn hold(root: &Path, folder: &Path, make: bool) -> Result<Option<Way>
         }
         Ok(None)
     }
+}
+
+/// `path` with the long name of each part that is there (as a folder lists it), and the rest as written: nothing is gone through, and a link keeps its own name.
+fn long_names(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let (mut there, mut rest) = (path.to_path_buf(), Vec::new());
+        loop {
+            if let Some(mut long) = windows::long_path(&there) {
+                for part in rest.iter().rev() {
+                    long.push(part);
+                }
+                return long;
+            }
+            match (there.file_name().map(std::ffi::OsStr::to_os_string), there.parent().map(Path::to_path_buf)) {
+                (Some(name), Some(parent)) => {
+                    rest.push(name);
+                    there = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    path.to_path_buf()
 }
 
 /// A new file at `new`, in the folder `way` holds, filled by `fill` and on the disk: where it lands there, as a handle on it says, and anywhere else
@@ -111,6 +146,15 @@ pub(crate) fn write_new(way: Option<&Way>, new: &Path, fill: impl FnOnce(&mut st
 pub(crate) struct Kept {
     #[cfg(windows)]
     file: Option<std::fs::File>,
+    /// Its name, which no one can know before it is made: a thing put at a name known before would have kept the app from making it.
+    name: Option<String>,
+}
+
+impl Kept {
+    /// Whether this is the name of the app's file, met in the folder it keeps.
+    pub(crate) fn is(&self, name: &str) -> bool {
+        self.name.as_deref() == Some(name)
+    }
 }
 
 /// What the name of a [`Kept`] file begins with: one met in a folder held is the app's own.
@@ -120,8 +164,10 @@ pub(crate) const KEPT_MARK: &str = ".dogmind-held-";
 pub(crate) fn kept_full(way: Option<&Way>) -> std::io::Result<Kept> {
     #[cfg(windows)]
     {
-        let Some(way) = way else { return Ok(Kept { file: None }) };
-        let mark = way.real.join(format!("{KEPT_MARK}{}", std::process::id()));
+        let Some(way) = way else { return Ok(Kept { file: None, name: None }) };
+        let random = crate::conversation_key::random_bytes::<8>().map_err(|_| std::io::Error::other("no random name could be made for the app's file"))?;
+        let name = format!("{KEPT_MARK}{}", crate::conversation_key::hex(&random));
+        let mark = way.real.join(&name);
         let file = match windows::create_new(&mark) {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 windows::take_away_left(Some(way), &mark)?;
@@ -133,12 +179,12 @@ pub(crate) fn kept_full(way: Option<&Way>) -> std::io::Result<Kept> {
             windows::delete(&file);
             return Err(std::io::Error::other(format!("{}: {ON_THE_WAY}", mark.display())));
         }
-        Ok(Kept { file: Some(file) })
+        Ok(Kept { file: Some(file), name: Some(name) })
     }
     #[cfg(not(windows))]
     {
         let _ = way;
-        Ok(Kept {})
+        Ok(Kept { name: None })
     }
 }
 
@@ -210,6 +256,23 @@ mod windows {
                 }
                 Err(format!("{}: {ON_THE_WAY}", named.display()))
             }
+        }
+    }
+
+    /// A path as the file system lists each part of it, short names written out.
+    pub(super) fn long_path(path: &Path) -> Option<PathBuf> {
+        let name: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str()).chain([0]).collect();
+        let mut text = vec![0u16; 1024];
+        loop {
+            // SAFETY: the name ends with a zero; the buffer lives through the call, which is told its length.
+            let length = unsafe { windows_sys::Win32::Storage::FileSystem::GetLongPathNameW(name.as_ptr(), text.as_mut_ptr(), text.len() as u32) } as usize;
+            if length == 0 {
+                return None;
+            }
+            if length < text.len() {
+                return Some(PathBuf::from(String::from_utf16_lossy(&text[..length])));
+            }
+            text.resize(length + 1, 0);
         }
     }
 
@@ -399,6 +462,41 @@ mod tests {
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing made outside");
         std::fs::remove_dir(root.join("j")).unwrap();
         assert!(hold(root, &outside.path().join("x"), false).unwrap().is_none(), "outside the root: not held, written as before");
+    }
+
+    /// A path written with a short name (as `PROJEC~1`) is held as the folder it names: nothing is written through a junction on its way, and a plain one is
+    /// held. One that is in the workspace where it really is, but under another name for the root (a real path among named ones), is not written at all.
+    #[test]
+    fn a_short_name_or_another_name_for_the_root_is_not_written_unheld() {
+        let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path();
+        let long = root.join("project-with-a-long-name");
+        std::fs::create_dir_all(long.join("plain")).unwrap();
+        let junction = |link: &Path, target: &Path| {
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+            assert!(made.status.success());
+        };
+        junction(&long.join("sub"), outside.path());
+        let short = {
+            let name: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(long.as_os_str()).chain([0]).collect();
+            let mut text = vec![0u16; 1024];
+            // SAFETY: the buffers live through the call, which is told the length of the one it writes.
+            let length = unsafe { windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(name.as_ptr(), text.as_mut_ptr(), text.len() as u32) } as usize;
+            PathBuf::from(String::from_utf16_lossy(&text[..length]))
+        };
+        assert_ne!(short.file_name(), long.file_name(), "a short name is there: {}", short.display());
+        let refused = hold(root, &short.join("sub").join("deeper"), true).err().unwrap_or_default();
+        assert!(refused.contains(ON_THE_WAY), "{refused}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing made outside");
+        assert!(hold(root, &short.join("plain"), false).unwrap().is_some(), "held as the folder it names");
+        // (the root named through a junction of the person's, the folder written by where it really is)
+        let (real_root, named_root) = (root.join("real-root"), root.join("named-root"));
+        std::fs::create_dir_all(real_root.join("a")).unwrap();
+        junction(&named_root, &real_root);
+        let refused = hold(&named_root, &real_root.join("a"), false).err().unwrap_or_default();
+        assert!(refused.contains(NOT_AS_WRITTEN), "{refused}");
+        std::fs::remove_dir(&named_root).unwrap();
+        std::fs::remove_dir(long.join("sub")).unwrap();
     }
 
     /// A loop in the background puts a junction to a folder outside in the place of a folder of the workspace, and the folder back, over and over, as a

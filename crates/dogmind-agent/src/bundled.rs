@@ -14,7 +14,8 @@ pub const NAMES: [&str; 3] = ["python.exe", "node.exe", "git.exe"];
 /// The runtime of MSYS (Git's `usr\bin`, MSYS2) and of Cygwin: a folder with one of these in it holds programs that cannot start in the sandbox.
 const UNIX_RUNTIMES: [&str; 2] = ["msys-2.0.dll", "cygwin1.dll"];
 /// Written when everything in `tools\` can be read by the sandbox: a stop half way goes on from the start next time.
-const OPENED: &str = ".open-to-sandbox";
+/// What the name of the mark that the tools were opened to a container's commands begins with: then `-` and a hash of that container's SID.
+pub const OPENED: &str = ".open-to-sandbox";
 /// What the workspace gets from `pip install`, which cannot write in the bundled folder.
 pub const PY_DEPS: &str = ".pydeps";
 /// What the model is told is there, of each of the three. It reaches the prompt and has to stay the same from one session to the next.
@@ -241,28 +242,35 @@ fn git_identity(temp: &str) -> String {
     file
 }
 
-static DONE: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+static DONE: Mutex<Option<HashSet<(PathBuf, String)>>> = Mutex::new(None);
 
 /// So that the sandbox can read and run the folder. The first time through it writes to each thing in it; a second caller waits for that here. The app starts this in the
 /// background, so that a person's first command rarely waits. A folder every container can read already (Program Files) needs nothing, and cannot be written to anyway.
 pub fn open_to_sandbox(root: &Path) -> Result<(), String> {
+    // SAFETY: the SID lives as long as the process.
+    unsafe { open_to(root, crate::sandbox::profile_sid()?) }
+}
+
+/// `root` opened to the commands of the container `sid`, once. The mark of it is that container's own (`OPENED`, `-`, a hash of its SID): a folder opened to
+/// one container is not so to another, as a copy of the tools or a development build's profile, and one mark for all had the other's commands find nothing
+/// there to run. A mark of no container's, from before, stands for none.
+unsafe fn open_to(root: &Path, sid: windows_sys::Win32::Security::PSID) -> Result<(), String> {
+    let text = crate::sandbox::sid_text(sid);
+    let memo = (root.to_path_buf(), text.clone());
     let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if done.get_or_insert_with(HashSet::new).contains(root) {
+    if done.get_or_insert_with(HashSet::new).contains(&memo) {
         return Ok(());
     }
-    // SAFETY: the SID lives as long as the process.
-    unsafe {
-        let sid = crate::sandbox::profile_sid()?;
-        crate::sandbox::grant_way_to(root, sid);
-        if !crate::sandbox::open_to_every_container(root) && !root.join(OPENED).exists() {
-            let not_changed = crate::read_folders::open_for_reading(root, sid)?;
-            if not_changed > 0 {
-                return Err(format!("{not_changed} things in {} could not be opened to commands", root.display()));
-            }
-            std::fs::write(root.join(OPENED), "").map_err(|error| format!("{}: {error}", root.display()))?;
+    crate::sandbox::grant_way_to(root, sid);
+    let mark = root.join(format!("{OPENED}-{:016x}", crate::sandbox::fnv(&text)));
+    if !crate::sandbox::open_to_every_container(root) && !mark.exists() {
+        let not_changed = crate::read_folders::open_for_reading(root, sid)?;
+        if not_changed > 0 {
+            return Err(format!("{not_changed} things in {} could not be opened to commands", root.display()));
         }
+        std::fs::write(&mark, "").map_err(|error| format!("{}: {error}", root.display()))?;
     }
-    done.get_or_insert_with(HashSet::new).insert(root.to_path_buf());
+    done.get_or_insert_with(HashSet::new).insert(memo);
     Ok(())
 }
 
@@ -404,6 +412,41 @@ mod tests {
         let said = crate::tools::Workbench::new(work).run("execute_command", &serde_json::json!({"command": line}), work, &AtomicBool::new(false)).unwrap();
         let code = said.rsplit("exit_code: ").next().and_then(|code| code.trim().parse().ok());
         (code, said)
+    }
+
+    /// The tools opened to one container are opened to another all the same (a copy of them, a development build's profile), and to the one only once: its
+    /// mark says so at the next start. An old mark of no container's stands for none.
+    #[test]
+    fn the_tools_are_opened_to_each_container_once() {
+        let named = |name: &str| -> windows_sys::Win32::Security::PSID {
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let mut sid = std::ptr::null_mut();
+            // SAFETY: the name ends with a zero; the SID is left for the process's end.
+            assert!(unsafe { windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut sid) } >= 0);
+            sid
+        };
+        let root = crate::in_container::tempdir().unwrap();
+        std::fs::write(root.path().join("tool.exe"), "x").unwrap();
+        std::fs::write(root.path().join(OPENED), "").unwrap();
+        let (one, other) = (named(&format!("DogmindApp.Exec.Tests.Opened.One.P{}", std::process::id())), named(&format!("DogmindApp.Exec.Tests.Opened.Other.P{}", std::process::id())));
+        // SAFETY: the SIDs live to the process's end.
+        let (one_text, other_text) = unsafe { (crate::sandbox::sid_text(one), crate::sandbox::sid_text(other)) };
+        let list = |path: &Path| crate::sandbox::dacl_text(path).unwrap();
+        // SAFETY: as above.
+        unsafe { open_to(root.path(), one) }.unwrap();
+        assert!(list(&root.path().join("tool.exe")).contains(&one_text), "opened to the one, an old mark notwithstanding");
+        // (the one's entry taken off the folder by hand, and this process's memo forgotten, as at the next start: the mark says it is open to the one)
+        let taken_off = std::process::Command::new("icacls").arg(root.path()).arg("/remove:g").arg(format!("*{one_text}")).output().unwrap();
+        assert!(taken_off.status.success() && !list(root.path()).contains(&one_text));
+        DONE.lock().unwrap().take();
+        // SAFETY: as above.
+        unsafe { open_to(root.path(), one) }.unwrap();
+        assert!(!list(root.path()).contains(&one_text), "not opened to the one again");
+        // SAFETY: as above.
+        unsafe { open_to(root.path(), other) }.unwrap();
+        assert!(list(root.path()).contains(&other_text) && list(&root.path().join("tool.exe")).contains(&other_text), "opened to the other");
+        let marks = std::fs::read_dir(root.path()).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(&format!("{OPENED}-"))).count();
+        assert_eq!(marks, 2, "a mark for each");
     }
 
     /// In the real sandbox, with the real thing, in the layout that ships. Each thing a clean machine has nothing else for.

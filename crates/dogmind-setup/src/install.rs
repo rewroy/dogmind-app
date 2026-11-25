@@ -809,9 +809,12 @@ pub fn remove(folder: &Path, shell: &dyn Shell, on: &mut dyn FnMut(f64)) -> Resu
             Err(error) => problems.push(format!("{}: {error}", path.display())),
         }
     }
-    // (made there by the app and its tools, and of no use without them)
-    for (root, name) in [("tools", ".open-to-sandbox")] {
-        let _ = std::fs::remove_file(folder.join(root).join(name));
+    // (made there by the app and its tools, and of no use without them: the mark that the tools were opened to commands, one for each container, and one of
+    // older versions, of no container's)
+    for entry in std::fs::read_dir(folder.join("tools")).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(".open-to-sandbox") && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
     remove_old_copies(folder, &manifest.files.iter().map(|file| file.to_lowercase()).collect());
     remove_empty_folders(folder, manifest.files.iter().map(String::as_str));

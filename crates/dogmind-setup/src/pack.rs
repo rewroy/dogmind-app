@@ -84,7 +84,7 @@ pub fn overlay_start(file: &mut (impl Read + Seek)) -> io::Result<u64> {
 pub fn is_shipped(relative: &str) -> bool {
     let name = relative.rsplit('\\').next().unwrap_or(relative).to_lowercase();
     // (`NAME.previous-TIME.EXT`: a file the app or its engine was running from when a new build came in, moved aside for it)
-    !(name.ends_with(".pdb") || name == ".open-to-sandbox" || name.ends_with(".dogmind-new") || name.contains(".previous-"))
+    !(name.ends_with(".pdb") || name.starts_with(".open-to-sandbox") || name.ends_with(".dogmind-new") || name.contains(".previous-"))
 }
 
 /// A path in the package: below its folder, and nothing that could lead out of it or into a stream of a file.
@@ -548,7 +548,7 @@ pub mod tests {
         for good in ["a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "console.log", "nulls.txt", "com10.txt", "a\\.nul"] {
             assert!(is_safe(good), "{good}");
         }
-        assert!(is_shipped("a.exe") && !is_shipped("x\\A.PDB") && !is_shipped("tools\\.open-to-sandbox") && !is_shipped("dogmind-app.previous-002327.exe") && !is_shipped("x.dll.dogmind-new"));
+        assert!(is_shipped("a.exe") && !is_shipped("x\\A.PDB") && !is_shipped("tools\\.open-to-sandbox") && !is_shipped("tools\\.open-to-sandbox-0123456789abcdef") && !is_shipped("dogmind-app.previous-002327.exe") && !is_shipped("x.dll.dogmind-new"));
         assert!(!is_shipped("straydog.previous-163000.exe") && !is_shipped("cublasLt64_13.previous-163000.dll") && !is_shipped("fonts\\BIZUDGothic-Regular.previous-163000.ttf"));
     }
 
