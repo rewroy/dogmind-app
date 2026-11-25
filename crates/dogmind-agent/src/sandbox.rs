@@ -26,6 +26,23 @@ use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
 
+/// The container a program that runs the agent for a check of its own (a measurement's driver) chose for its commands ([`use_profile`]).
+static CHOSEN_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Commands run in the container of this name, and not the person's, for a program that runs the agent for a check: a measurement whose commands would leave what they
+/// make in the container of the app the person uses on the same PC. Before the first command, once. The app never calls it, and nothing the person sets, nor a variable, reaches
+/// it: a release of the app keeps its commands in their container whatever its environment says.
+pub fn use_profile(name: &str) -> Result<(), String> {
+    // (a name Windows takes for a container: 64 characters at most, of letters, digits, `.`, `-` and `_`)
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return Err(format!("{name:?} is no name for a container"));
+    }
+    if PROFILE_SID.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some() {
+        return Err("a command has run already, in the container it had".to_string());
+    }
+    CHOSEN_PROFILE.set(name.to_string()).map_err(|_| "a container was chosen already".to_string())
+}
+
 /// The container commands run in. The tests have one of their own: what their runs leave (the grants on its temp folder, what their commands leave in it) was in the
 /// container of the app the person uses on the same PC, which is not a place for tests; 667 grants their restricted commands had left there were inherited by all in it.
 /// A development build is given another by `DOGMIND_SANDBOX_PROFILE`, for a run of the app that is a check (a dogfood run, a measurement) and not the person's own: their
@@ -35,6 +52,9 @@ fn profile_name() -> &'static str {
     return "DogmindApp.Exec.Tests";
     #[cfg(not(test))]
     {
+        if let Some(chosen) = CHOSEN_PROFILE.get() {
+            return chosen;
+        }
         #[cfg(debug_assertions)]
         {
             static NAMED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
