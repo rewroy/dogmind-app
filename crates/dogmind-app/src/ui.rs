@@ -14452,6 +14452,8 @@ impl App {
         let at = dogmind_agent::trajectory::now();
         if let Some(began) = self.connect_began.take() {
             let _ = self.agent.commands.send(Command::Connection { at: at.clone(), what: "connect".into(), ms: began.elapsed().as_millis() as u64, outcome: outcome.into() });
+            // (which app it was and what it talked to, for a run read later: a trajectory said neither, and whether a build had a change in it could not be told)
+            let _ = self.agent.commands.send(Command::Connection { at: at.clone(), what: "app".into(), ms: 0, outcome: app_line(self.settings.active_provider().map(|provider| provider.kind), &self.model) });
         }
         if let Some(waiting) = self.connect_waiting_since.take() {
             let _ = self.agent.commands.send(Command::Connection { at, what: "loading_wait".into(), ms: waiting.elapsed().as_millis() as u64, outcome: outcome.into() });
@@ -18984,6 +18986,25 @@ fn tray_speaks(word: TrayWord, shown: bool, in_front: bool) -> bool {
     match word {
         TrayWord::Version => !shown,
         TrayWord::Attention => !in_front,
+    }
+}
+
+/// The trajectory's line of which app a connection was made by and to what: its version, the source it was built from (with a mark where the tree had
+/// changes) and the day, then the provider's kind and the model.
+fn app_line(kind: Option<Kind>, model: &str) -> String {
+    let to = kind.map_or("no provider".to_string(), |kind| format!("{kind:?}"));
+    format!("{}; {to}{}", crate::crash::version_line(), if model.is_empty() { String::new() } else { format!(" {model}") })
+}
+
+#[cfg(test)]
+mod app_line_tests {
+    /// A trajectory says which build of the app made a connection, and to what.
+    #[test]
+    fn a_connection_says_which_build_of_the_app_and_what_it_talked_to() {
+        let line = super::app_line(Some(super::Kind::Codex), "gpt-5.5");
+        assert!(line.starts_with(&format!("Dogmind {} (", env!("CARGO_PKG_VERSION"))) && line.contains(env!("DOGMIND_APP_BUILD").split(',').next().unwrap()), "{line}");
+        assert!(line.ends_with("; Codex gpt-5.5"), "{line}");
+        assert!(super::app_line(None, "").ends_with("; no provider"));
     }
 }
 
