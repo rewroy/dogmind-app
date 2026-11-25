@@ -3464,8 +3464,11 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if lower_err.contains("config file") || (denied && in_git) || (in_git && lower_err.contains("permission denied")) {
         notes.push_str("note: the sandbox refuses changes to `.git\\config` and `.git\\hooks`, as what is written there would run outside it the next time git is used. Tell the user the exact command, for them to run.\n");
     }
+    // (a folder that Python made open to its owner alone is why, wherever it is: it is no place outside the workspace)
+    if let Some(folder) = denied.then(|| closed_folder(line, err, workspace)).flatten() {
+        notes.push_str(&closed_folder_note(&folder, python_isolated(line)));
     // (the line may name no path, as `python clean.py` does: then the refusal's own line says where)
-    if denied && (names_outside(line, workspace) || err.lines().any(|said| says_access_denied(said, system_access_denied()) && names_outside(said, workspace))) {
+    } else if denied && (names_outside(line, workspace) || err.lines().any(|said| says_access_denied(said, system_access_denied()) && names_outside(said, workspace))) {
         notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
@@ -3496,10 +3499,107 @@ fn chrome_note(out: &str, err: &str) -> Option<&'static str> {
 /// A program's own words count too: Python's `'C:\\Users\\me\\a.txt'`, in quotes and with its backslashes doubled.
 fn names_outside(line: &str, workspace: &Path) -> bool {
     let root = workspace.to_string_lossy().to_lowercase();
+    // (the sandbox's own temp folder is no place outside: it is a command's TEMP, its to write in. Told it was outside, a model asks the user to run the command as them)
+    let own = crate::sandbox::temp_folder().map(|folder| folder.to_string_lossy().to_lowercase());
     line.split(|c: char| c.is_whitespace() || c == '"').any(|word| {
         let word = word.trim_matches(|c: char| matches!(c, '\'' | '(' | ')' | '[' | ']' | ',' | ';')).replace("\\\\", "\\").to_lowercase();
         word.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) && word.as_bytes().get(1) == Some(&b':') && !word.starts_with(&root)
+            && !own.as_deref().is_some_and(|own| under(&word, own))
     })
+}
+
+/// Whether `path` is `folder` or in it, both in lower case.
+fn under(path: &str, folder: &str) -> bool {
+    let folder = folder.trim_end_matches('\\');
+    path.strip_prefix(folder).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+}
+
+/// The folder a refusal came from where it is one that Python made open to its owner alone ([`crate::sandbox::open_to_its_owner_alone`]), in the workspace or the
+/// sandbox's own temp folder: the place named in the line or in what said access was denied, or a folder above it up to the one it is in. Python since 3.12.4 makes
+/// every folder of `tempfile.mkdtemp`, `TemporaryDirectory`, pytest's `tmp_path` and pip so, and the command that made it cannot open it; told the folder was outside the
+/// workspace, a model asked for the command to be run as the user, and told nothing, it took the project's tests for broken.
+fn closed_folder(line: &str, err: &str, workspace: &Path) -> Option<PathBuf> {
+    let roots: Vec<String> = std::iter::once(workspace.to_path_buf()).chain(crate::sandbox::temp_folder()).map(|root| root.to_string_lossy().to_lowercase()).collect();
+    let refusals = err.lines().filter(|said| says_access_denied(said, system_access_denied()));
+    for text in refusals.chain(std::iter::once(line)) {
+        for named in paths_named(text) {
+            let lower = named.to_string_lossy().to_lowercase();
+            let Some(root) = roots.iter().find(|root| under(&lower, root)) else { continue };
+            let mut at = Some(named.as_path());
+            while let Some(here) = at.filter(|here| { let here = here.to_string_lossy().to_lowercase(); under(&here, root) && here.trim_end_matches('\\') != root.trim_end_matches('\\') }) {
+                if here.is_dir() && crate::sandbox::open_to_its_owner_alone(here) {
+                    return Some(here.to_path_buf());
+                }
+                at = here.parent();
+            }
+        }
+    }
+    None
+}
+
+/// The absolute paths in a line: quoted (Python's `'C:\\x\\y'`, with its doubled backslashes, or in double quotes, spaces and all) or a word of their own.
+fn paths_named(text: &str) -> Vec<PathBuf> {
+    let looks_absolute = |word: &str| word.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) && word.as_bytes().get(1) == Some(&b':') && word.as_bytes().get(2) == Some(&b'\\');
+    let mut found: Vec<String> = Vec::new();
+    for quote in ['\'', '"'] {
+        found.extend(text.split(quote).skip(1).step_by(2).map(|inside| inside.replace("\\\\", "\\")));
+    }
+    found.extend(text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'').map(|word| word.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';')).replace("\\\\", "\\")));
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for word in found.into_iter().filter(|word| looks_absolute(word)) {
+        let path = PathBuf::from(word.trim_end_matches(['.', ':']));
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Whether the line runs Python with `-I` or `-E` (alone or with other letters, `-IB`), which keep it from PYTHONPATH and so from the sandbox's sitecustomize.
+fn python_isolated(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.iter().enumerate().any(|(at, word)| {
+        let name = word.trim_matches('"').rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        if !(name == "python" || name == "py" || name.strip_prefix("python3").is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))) {
+            return false;
+        }
+        let mut rest = words[at + 1..].iter();
+        while let Some(flag) = rest.next() {
+            // (the launcher's version, `py -3.13`)
+            if name == "py" && flag.strip_prefix('-').is_some_and(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-'))) {
+                continue;
+            }
+            let Some(letters) = flag.strip_prefix('-').filter(|letters| !letters.is_empty() && letters.chars().all(|c| c.is_ascii_alphabetic())) else { break };
+            if letters.contains('I') || letters.contains('E') {
+                return true;
+            }
+            // (what follows -c or -m is the program's; -X and -W take a word)
+            match letters.chars().last() {
+                Some('c' | 'm') => break,
+                Some('X' | 'W') => {
+                    rest.next();
+                }
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
+/// What a command refused by such a folder is told: what made it so, that it is no place outside, and the way that works. Every command's Python starts with the
+/// sandbox's sitecustomize, on PYTHONPATH, which makes such a folder open to it (and the app's own Python has the same in its own site-packages): a Python started
+/// with `-I` or `-E` does not read PYTHONPATH.
+fn closed_folder_note(folder: &Path, isolated: bool) -> String {
+    let way = if isolated {
+        "`-I` and `-E` keep a Python from the sitecustomize the sandbox puts on PYTHONPATH for every Python, which makes these folders open to the command: run it again without them."
+    } else {
+        "If the user asked for this, run the same command again with `outside_sandbox: true`: the user is asked, and if they allow it, it runs as them."
+    };
+    format!(
+        "note: `{}` was made by Python with mode 0o700, as `tempfile.mkdtemp`, `TemporaryDirectory`, pytest's `tmp_path` and pip make their folders: since Python 3.12.4 such a folder on Windows is open to its owner alone, and no command in the sandbox can open it, the one that made it included. It is not outside the workspace. {way}\n",
+        folder.display()
+    )
 }
 
 /// The Unix tools a line starts: the first word of each of its commands, when it is one of those a model reaches for from habit. By the line that runs, in which `| head` is no longer there.
@@ -6650,6 +6750,63 @@ mod tests {
         for (line, status, err) in [("type C:\\work\\a.txt", Some(1), "Access is denied."), ("where python", Some(0), ""), ("python x.py", Some(1), "boom"), ("powershell -c x", Some(1), "boom")] {
             assert_eq!(sandbox_notes(line, root, status, err), "", "{line}");
         }
+    }
+
+    /// A real model's Python 3.14 in the sandbox: `tempfile.mkdtemp()` made a folder in the sandbox's temp folder that the same command could not write in, and the note
+    /// said it was outside the workspace; made in the workspace, nothing was said. Both are told why, and neither is called outside.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_python_made_open_to_its_owner_alone_is_told_as_that_and_not_as_outside() {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        use std::os::windows::ffi::OsStrExt;
+        let dir = crate::in_container::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        // (as CPython's os.mkdir makes a folder for mode 0o700)
+        let made = |path: &Path| {
+            let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)\0".encode_utf16().collect();
+            let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            // SAFETY: the descriptor is the system's until freed, and lives through the call that uses it.
+            unsafe {
+                let mut descriptor = std::ptr::null_mut();
+                assert_ne!(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut descriptor, std::ptr::null_mut()), 0);
+                let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor, bInheritHandle: 0 };
+                assert_ne!(CreateDirectoryW(name.as_ptr(), &attributes), 0);
+                windows_sys::Win32::Foundation::LocalFree(descriptor as _);
+            }
+        };
+        let closed = workspace.join("tmpmxlun60z");
+        made(&closed);
+        let open = workspace.join("plain");
+        std::fs::create_dir(&open).unwrap();
+        assert!(crate::sandbox::open_to_its_owner_alone(&closed) && !crate::sandbox::open_to_its_owner_alone(&open) && !crate::sandbox::open_to_its_owner_alone(&workspace));
+        // (Python's own words, its path in repr: backslashes doubled)
+        let said = |path: &Path| format!("Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nPermissionError: [Errno 13] Permission denied: '{}'", path.join("x").display().to_string().replace('\\', "\\\\"));
+        let told = sandbox_notes("python -I -c \"import tempfile\"", &workspace, Some(1), &said(&closed));
+        assert!(told.contains("mode 0o700") && told.contains("tmpmxlun60z") && told.contains("not outside the workspace") && !told.contains("cannot read or change anything outside"), "{told}");
+        // (with -I the sandbox's sitecustomize was not read: that is the way out)
+        assert!(told.contains("run it again without them"), "{told}");
+        // (a folder under one Python made: the refusal names a file deeper down; with no -I there is no way but as the user)
+        let deeper = closed.join("pytest-0");
+        let plain = sandbox_notes("python -m pytest", &workspace, Some(1), &said(&deeper));
+        assert!(plain.contains("mode 0o700") && plain.contains("`outside_sandbox: true`") && !plain.contains("without them"), "{plain}");
+        for line in ["python -I -c \"x\"", "py -3.13 -IB x.py", "C:\\Python314\\python.exe -X utf8 -E x.py", "\"python3\" -I x.py"] {
+            assert!(python_isolated(line), "{line}");
+        }
+        for line in ["python -m pytest -I", "python -c \"-I\"", "python x.py -I", "grep -E x", "pip install -I x"] {
+            assert!(!python_isolated(line), "{line}");
+        }
+        // (a plain folder refused is not that, and in the workspace no place outside either)
+        assert_eq!(sandbox_notes("python -I -c \"import os\"", &workspace, Some(1), &said(&open)), "");
+        // The sandbox's own temp folder is no place outside the workspace.
+        let own = crate::sandbox::temp_folder().unwrap().join("Temp").join("tmpcrt5waf5").join("x");
+        let in_own = sandbox_notes("python -I -c \"import tempfile\"", &workspace, Some(1), &format!("PermissionError: [Errno 13] Permission denied: '{}'", own.display().to_string().replace('\\', "\\\\")));
+        assert!(!in_own.contains("cannot read or change anything outside"), "{in_own}");
+        assert!(sandbox_notes("type D:\\elsewhere\\a.txt", &workspace, Some(1), "Access is denied.").contains("cannot read or change anything outside"));
+        // (whoever runs the test can remove the folder: OWNER RIGHTS is theirs)
+        std::fs::remove_dir(&closed).unwrap();
     }
 
     /// A real model's `set CARGO_TARGET_DIR=%TEMP%\sd-isolation-target && cargo build`: cmd kept the space before `&&` in the value, and cargo failed on a path that ended in a space.

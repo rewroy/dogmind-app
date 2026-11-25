@@ -1009,6 +1009,11 @@ impl Dacl {
         self.control & SE_DACL_PROTECTED != 0
     }
 
+    /// The SIDs this list lets in, as text.
+    unsafe fn allowed_sids(&self) -> Vec<String> {
+        self.aces.iter().filter(|ace| ace.len() > 8 && u32::from(ace[0]) == ACCESS_ALLOWED_ACE_TYPE).map(|ace| sid_text(ace.as_ptr().add(8) as PSID)).collect()
+    }
+
     /// Whether this one allows `sid` exactly this, with exactly these flags, and was not inherited.
     unsafe fn is_exact(ace: &[u8], sid: PSID, mask: u32, flags: u8) -> bool {
         Dacl::is_allowed_for(ace, sid) && ace[1] == flags && u32::from_ne_bytes([ace[4], ace[5], ace[6], ace[7]]) == mask
@@ -1279,6 +1284,18 @@ unsafe fn account_name(sid: PSID) -> Option<String> {
 }
 
 /// A SID as its text (S-1-...); empty if the system cannot say it.
+/// Whether a folder is open to its owner alone, as Python makes one with mode 0o700 since 3.12.4 (`tempfile.mkdtemp`, `TemporaryDirectory`, pytest's `tmp_path`, pip):
+/// a list of its own that takes nothing from the folders above, with SYSTEM, the administrators and OWNER RIGHTS on it, and no container and no capability. A command in the
+/// sandbox cannot open it, the one that made it included: the container's SID, or a workspace's capability, has to be on a list as well as the person.
+pub(crate) fn open_to_its_owner_alone(path: &Path) -> bool {
+    // SAFETY: the list is copied out of the descriptor into memory of its own, and its SIDs are read within each entry.
+    unsafe {
+        let Ok(dacl) = Dacl::read(path) else { return false };
+        let sids = dacl.allowed_sids();
+        dacl.protected() && sids.iter().any(|sid| sid == "S-1-3-4") && !sids.iter().any(|sid| sid.starts_with("S-1-15-"))
+    }
+}
+
 pub(crate) unsafe fn sid_text(sid: PSID) -> String {
     let mut text: *mut u16 = std::ptr::null_mut();
     if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
