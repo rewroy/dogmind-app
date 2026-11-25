@@ -4158,7 +4158,9 @@ impl Agent {
         let (result, images) = self.shown_pictures(result, pictures);
         let (result, images) = if name == "check_page" && !nested { self.with_check_pictures(result, images) } else { (result, images) };
         // A server's answer is as much a stranger's as a page: it may have come from one.
-        let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
+        let described: Vec<String> = arguments.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)))
+            || (name == prompt::DESCRIBE_TOOLS && self.mcp.as_ref().is_some_and(|hub| hub.describes_a_stranger(&described)));
         // (a server's failure is its words as much as its answer is: marked as data, and counted as what it said)
         if from_a_stranger && (result.is_ok() || name.starts_with("mcp__")) && !self.web_from.iter().any(|known| known == name) {
             // (the plain mark too, as a version that does not read the sources reads it)

@@ -349,16 +349,17 @@ pub fn tools_added(tools: &[serde_json::Value], code_mode: bool, call_added: boo
     };
     let mut text = format!("{TOOLS_ADDED}\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way{how}:");
     let name = |tool: &serde_json::Value| tool.pointer("/function/name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    for tool in tools.iter().filter(|tool| !by_name.contains(&name(tool)) && name(tool) != DESCRIBE_TOOLS) {
+    // (what each server says its tools are, it says as it likes: data in a block, as its answers are, and the note's own words are the app's alone)
+    let in_full: String = tools.iter().filter(|tool| !by_name.contains(&name(tool)) && name(tool) != DESCRIBE_TOOLS).map(|tool| format!("{}\n", told_in_full(tool))).collect();
+    if !in_full.is_empty() {
         text.push('\n');
-        text.push_str(&told_in_full(tool));
+        text.push_str(&crate::web::envelope(crate::web::MCP_DESCRIPTIONS, &in_full));
     }
     if !by_name.is_empty() {
         text.push_str(&format!("\nThese are told by name, as their servers say a lot about them: `{DESCRIBE_TOOLS}({{names: [...]}})` gives what each one is and its arguments. Ask for a tool's before its first call."));
-        for tool in tools.iter().filter(|tool| by_name.contains(&name(tool))) {
-            text.push('\n');
-            text.push_str(&told_by_its_name(tool));
-        }
+        let lines: String = tools.iter().filter(|tool| by_name.contains(&name(tool))).map(|tool| format!("{}\n", told_by_its_name(tool))).collect();
+        text.push('\n');
+        text.push_str(&crate::web::envelope(crate::web::MCP_DESCRIPTIONS, &lines));
     }
     text
 }
@@ -766,6 +767,18 @@ mod tests {
         assert!(told.contains("`describe_tools({names: [...]})`") && !told.contains("- `describe_tools`"), "how to get the rest, and not itself listed");
         let before: usize = tools[..tools.len() - 1].iter().map(|tool| super::told_in_full(tool).chars().count() + crate::code_mode::declarations(&serde_json::Value::Array(vec![tool.clone()])).concat().chars().count()).sum();
         assert!(told.chars().count() * 5 < before, "{} characters against {before} told in full twice", told.chars().count());
+    }
+
+    /// What the servers say their tools are is in blocks, in full and by name; the note's own words, before them, are the app's.
+    #[test]
+    fn the_servers_words_of_their_tools_are_in_blocks() {
+        let (big, small) = (super::server_tools("editor", 196, 700), super::server_tools("modeler", 3, 300));
+        let tools: Vec<serde_json::Value> = big.iter().chain(&small).cloned().collect();
+        let told = super::tools_added(&tools, false, false);
+        assert_eq!(told.matches("<untrusted_web_content").count(), 2, "one for those in full, one for those by name: {}", &told[..400]);
+        let first_block = told.find("<untrusted_web_content").unwrap();
+        assert!(told[..first_block].starts_with(super::TOOLS_ADDED) && !told[..first_block].contains("mcp__"), "the app's words come first, and no server's");
+        assert!(told.contains("The block above came from the MCP servers, as what their tools are"));
     }
 
     /// The project's instruction files come with a word on whose rules they are; with none, neither comes.

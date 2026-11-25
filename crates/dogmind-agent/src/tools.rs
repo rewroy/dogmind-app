@@ -4115,7 +4115,11 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
     let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
-    report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
+    let printed = format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref()));
+    // (what a command that reached the network printed may be what a server sent it: data in a block, as a page is; not counted as the web's, or every
+    // command with the network after it would ask)
+    report.push_str(&if network { format!("{}
+", crate::web::envelope(crate::web::NETWORK_OUTPUT, &printed)) } else { printed });
     let ended = match done.status {
         Some(code) => format!("exit_code: {code}"),
         None => format!("exit_code: none, {} after {} s", done.ended, started.elapsed().as_secs()),
@@ -4172,7 +4176,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let mut report = String::from("sandbox: none (the person approved or allowed this command)\n");
     // (all of it kept, as a sandboxed command's is: the part cut out is read back, not run again)
     let whole = (out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT / 2).then(|| kept_whole(&out, &err)).flatten();
-    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap_evenly(&out, MAX_OUTPUT, whole.as_deref()), cap_evenly(&err, MAX_OUTPUT / 2, whole.as_deref())));
+    let printed = format!("stdout:\n{}\nstderr:\n{}\n", cap_evenly(&out, MAX_OUTPUT, whole.as_deref()), cap_evenly(&err, MAX_OUTPUT / 2, whole.as_deref()));
+    report.push_str(&if crate::safety::wants_network(arguments) { format!("{}
+", crate::web::envelope(crate::web::NETWORK_OUTPUT, &printed)) } else { printed });
     let ended = match status {
         Some(status) => format!("exit_code: {}", status.code().unwrap_or(-1)),
         None => format!("exit_code: none, {ended} after {} s", started.elapsed().as_secs()),
@@ -4703,6 +4709,17 @@ mod change_tests {
         assert!(said.contains("exit_code: 0") && fresh.join(".git").join("HEAD").is_file(), "{said}");
         let left: Vec<_> = std::fs::read_dir(fresh.join(".git")).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with(crate::held_way::KEPT_MARK)).collect();
         assert!(left.is_empty(), "the app's file is gone: {left:?}");
+    }
+
+    /// What a command that reached the network printed is in a block, as a page is, its exit code outside it; a command with no network prints as it did.
+    #[test]
+    fn what_a_command_with_the_network_printed_is_in_a_block() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let with = execute_command(&json!({"command": "echo from-a-server", "network": true}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(with.contains("<untrusted_web_content") && with.contains("from-a-server") && with.contains("The block above came from a command that reached the network"), "{with}");
+        assert!(with.lines().last() == Some("exit_code: 0") && with.starts_with("exit_code: 0"), "how it ended is the app's, on a line of its own: {with}");
+        let without = execute_command(&json!({"command": "echo local"}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(!without.contains("<untrusted_web_content") && without.contains("local"), "{without}");
     }
 
     /// While a loop swaps `.pydeps` for a junction to a repository of the person's and back, the ignore file the app writes there lands in the workspace
