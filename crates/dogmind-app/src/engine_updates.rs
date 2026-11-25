@@ -769,15 +769,7 @@ fn worker_sid() -> std::result::Result<String, String> {
 
 #[cfg(windows)]
 fn system_icacls() -> std::result::Result<PathBuf, String> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buffer = [0u16; 32768];
-    // SAFETY: buffer is writable for the given length; Windows returns its UTF-16 length.
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if length == 0 || length >= buffer.len() {
-        return Err(t("Cannot locate the Windows system directory.").into());
-    }
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("icacls.exe"))
+    crate::machine::system_program("icacls.exe").ok_or_else(|| t("Cannot locate the Windows system directory.").into())
 }
 
 #[cfg(windows)]

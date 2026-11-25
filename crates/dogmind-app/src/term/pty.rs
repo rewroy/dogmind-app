@@ -254,9 +254,9 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if self.job.is_none() {
-            // (no job holds it: the shell and what it started are ended by taskkill, which follows the tree)
-            let mut kill = std::process::Command::new("taskkill");
+        // (no job holds it: the shell and what it started are ended by taskkill, which follows the tree. Windows' own, by its path: by name, the first
+        // taskkill.exe on PATH ran, as the person, at each terminal's end, where the shell itself is always found by its full path)
+        if let Some(mut kill) = self.job.is_none().then(|| crate::machine::system_program("taskkill.exe")).flatten().map(std::process::Command::new) {
             kill.args(["/T", "/F", "/PID", &self.pid.to_string()]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(0x0800_0000);
             let _ = kill.status();
         }
