@@ -195,3 +195,19 @@ files or listens for anything from outside it.
 The app shares no code with Straydog, which moves on its own. It starts `straydog.exe`, runs `straydog setup`, reads the bundles
 from `fetch --help`, and speaks HTTP: all of that is in `crates/dogmind-app/src/engine.rs`, so that following Straydog is mostly
 reading.
+
+## Privacy
+
+Dogmind sends no conversation or file to its developers, and it has no telemetry. It reaches the network only for these:
+
+- **The connection you chose.** With Straydog on this PC, the conversation stays on this PC. With another machine, an
+  OpenAI-compatible service, Codex or Claude, the conversation goes there (under that service's terms).
+- **Web search and reading (on by default).** Search words go to DuckDuckGo (then Bing, or Brave with a Brave key), and a page read
+  comes from its site. Turn it off with *Web search and reading* in the settings.
+- **Update checks (on by default).** Every six hours the app asks GitHub for a new version, sending only its own version; updates and
+  the engine are downloaded from GitHub too. *Update automatically* (the app) and *Update bundled Straydog automatically* (the engine) in *Settings > About* stop them.
+- **Getting a model for this PC.** The engine downloads it from Hugging Face.
+- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs, even with web search and reading off.
+- **The bundled guidance CLI.** The CLI that looks up web-building guidance fetches its package from the npm registry the first
+  time it is used (without asking).
+- **MCP servers you add, and commands you allow the network.**

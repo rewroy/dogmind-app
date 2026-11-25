@@ -21,7 +21,7 @@ Windows 11, no administrator rights needed. Run `DogmindSetup-VERSION.exe` from 
 To run a model on this PC you need an NVIDIA GPU with a recent driver and about 76 GB free on the drive. Without one, the other
 connections still work.
 
-The app is not signed yet. If Windows says *Windows protected your PC*, choose *More info > Run anyway*; with Smart App Control on, Windows will not run it.
+It is not signed yet: at a warning, choose *More info > Run anyway* (with Smart App Control on, it will not run).
 
 ## Getting started
 
@@ -46,25 +46,19 @@ Keys are kept in Windows' Credential Manager, never in the settings file.
 
 ## Safety
 
-- Commands run in a sandbox (an AppContainer): they can write only to the workspace, and reach the network only when you allow it (except the bundled guidance CLI, see Privacy).
-- Edits and commands ask first, as the mode says. Once web content is in a conversation, what it may have asked for is asked every time.
+- Commands run in a sandbox (an AppContainer): they write only to the workspace and reach the network only when you allow it.
+- Edits and commands ask before they run.
 - Conversations can be encrypted in *Settings > Privacy* (off by default).
 
 ## Privacy
 
-Dogmind sends no conversation or file to its developers, and it has no telemetry. It reaches the network only for these:
+Nothing is sent to the developers and there is no telemetry. The network is reached only for these ([details](docs/guide.md#privacy)):
 
-- **The connection you chose.** With Straydog on this PC, the conversation stays on this PC. With another machine, an
-  OpenAI-compatible service, Codex or Claude, the conversation goes there (under that service's terms).
-- **Web search and reading (on by default).** Search words go to DuckDuckGo (then Bing, or Brave with a Brave key), and a page read
-  comes from its site. Turn it off with *Web search and reading* in the settings.
-- **Update checks (on by default).** Every six hours the app asks GitHub for a new version, sending only its own version; updates and
-  the engine are downloaded from GitHub too. *Update automatically* (the app) and *Update bundled Straydog automatically* (the engine) in *Settings > About* stop them.
-- **Getting a model for this PC.** The engine downloads it from Hugging Face.
-- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs, even with web search and reading off.
-- **The bundled guidance CLI.** The CLI that looks up web-building guidance fetches its package from the npm registry the first
-  time it is used (without asking).
-- **MCP servers you add, and commands you allow the network.**
+- the connection you chose (Straydog on this PC stays on this PC)
+- web search and reading (on by default)
+- update checks (on by default; only the version is sent)
+- getting a model, a checked page's libraries and the bundled guidance
+- MCP servers you add and commands you allow
 
 ## Updating and removing
 
@@ -73,14 +67,12 @@ from this PC*.
 
 ## When something goes wrong
 
-`/report` makes a problem report: attach it to an [issue](https://github.com/rewroy/dogmind-app/issues) with what you were doing.
-Nothing is sent by itself. Report a security problem privately, as [SECURITY.md](SECURITY.md) says.
+`/report` makes a report to attach to an [issue](https://github.com/rewroy/dogmind-app/issues). Security problems: [SECURITY.md](SECURITY.md).
 
 ## More
 
-The details of using it, encrypting conversations, keeping the engine's state, how updates work, building, and the agent's tools and
-sandbox are in the [guide](docs/guide.md).
+The details are in the [guide](docs/guide.md).
 
 ## License
 
-MIT (`LICENSE`). The licenses of what ships with it are in `LICENSE.txt` beside the app.
+MIT (`LICENSE`).
