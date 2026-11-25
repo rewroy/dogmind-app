@@ -2959,7 +2959,7 @@ impl Agent {
             self.emit(Event::Notice("That turn is gone.".into()));
             return;
         };
-        let restored = if files { marks.restore(id, &now()) } else { Restored::default() };
+        let restored = if files { marks.restore(&self.workspace, id, &now()) } else { Restored::default() };
         if !conversation {
             self.rewound.extend(restored.written.iter().chain(&restored.removed).cloned());
         }

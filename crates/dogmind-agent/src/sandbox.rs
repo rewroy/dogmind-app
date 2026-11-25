@@ -1686,7 +1686,11 @@ fn write_down_link(room: Option<&Path>, link: &Path, name: &str) {
 
 /// What is taken out of one git folder, put aside inside it as it is: its hooks other than the samples, and its config as it was, before it is written again without what names a program.
 /// A link where a hook or the config should be is taken away, and where it led is written down beside the rest.
-fn disarm_folder(folder: &Path, taken: &mut Taken) {
+fn disarm_folder(root: &Path, folder: &Path, taken: &mut Taken) -> Result<(), String> {
+    // (the git folder, and the folders on the way to it, held from the first look to the last write, and it kept from being made a mount point by a file of
+    // the app's in it, as an empty one can be: see `held_way`)
+    let way = crate::held_way::hold(root, folder, false)?;
+    let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
     // (made when first needed: a folder with nothing taken out of it gets none)
     let mut room: Option<Option<PathBuf>> = None;
     let mut room_for = |taken: &mut Taken| -> Option<PathBuf> {
@@ -1705,10 +1709,12 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
         if remove_link(&hooks) {
             taken.names.push("a link in place of its hooks".to_string());
         }
-    } else {
+    } else if std::fs::symlink_metadata(&hooks).is_ok() {
+        let held = crate::held_way::hold(root, &hooks, false)?;
+        let _kept = crate::held_way::kept_full(held.as_ref()).map_err(|error| error.to_string())?;
         for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".sample") {
+            if name.ends_with(".sample") || name.starts_with(crate::held_way::KEPT_MARK) {
                 continue;
             }
             // (an entry's own type, which is a link's own and not what it leads to; the links in a folder are taken away before it is moved, and not gone through)
@@ -1739,13 +1745,13 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
         if remove_link(&config) {
             taken.names.push("a link in place of its config".to_string());
         }
-        return;
+        return Ok(());
     }
     // (git does not ask that it be UTF-8)
-    let Ok(bytes) = std::fs::read(&config) else { return };
+    let Ok(bytes) = std::fs::read(&config) else { return Ok(()) };
     let (kept, gone) = config_without_programs(&String::from_utf8_lossy(&bytes));
     if gone.is_empty() {
-        return;
+        return Ok(());
     }
     // The config as it was, byte for byte, on the disk before it is written again; and the new one whole, as a power cut leaves the old or the new, and never zeros.
     let saved = room_for(taken).is_some_and(|room| {
@@ -1758,6 +1764,7 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
             taken.names.extend(gone.into_iter().map(|name| format!("{name} (removed: the config could not be put aside)")));
         }
     }
+    Ok(())
 }
 
 /// Takes out of a repository a command made what would run as the person the next time git is used there: its hooks, and what its config names. Guarding it first would keep later commands from
@@ -1771,15 +1778,14 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
 fn disarm_repository(git: &Path, root: &Path, known: &HashSet<String>, taken: &mut Taken) -> Result<(), String> {
     refuse_links(&[git])?;
     if git.is_dir() {
-        disarm_folder(git, taken);
-        return Ok(());
+        return disarm_folder(root, git, taken);
     }
     // A worktree's or a submodule's: the folder it points to, and for a worktree, the repository that says it is part of.
     let Some(folder) = git_folder_of(git, root)? else { return Ok(()) };
     let common = common_folder_of(&folder, root);
-    disarm_folder(&folder, taken);
+    disarm_folder(root, &folder, taken)?;
     if let Some(common) = common?.filter(|common| !known.contains(&key(common))) {
-        disarm_folder(&common, taken);
+        disarm_folder(root, &common, taken)?;
     }
     Ok(())
 }
@@ -2748,7 +2754,7 @@ const OFFLINE: [(&str, &str); 10] = [
     ("PIP_NO_INDEX", "1"), ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
 ];
 
-/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the sandbox's own temp folder, put first on PYTHONPATH.
+/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the app's own for the sandbox, put first on PYTHONPATH.
 const PYTHON_SHIM_FOLDER: &str = "dogmind-python";
 /// The sitecustomize a command's Python starts with, whichever Python it is (a person's own has none of the bundled one's): see its own words.
 const PYTHON_SHIM: &str = r#"# Dogmind's, for a command in its sandbox. On Windows, Python 3.13 and later make a folder of mode 0o700 (tempfile.mkdtemp, TemporaryDirectory,
@@ -2783,16 +2789,17 @@ def _dogmind_next_sitecustomize():
 _dogmind_next_sitecustomize()
 "#;
 
-/// `PYTHON_SHIM` in the sandbox's temp folder, written where it is not there as it is. A command can read it there, and nothing a command does to it outlasts the next.
-fn put_python_shim(temp: &str) {
-    if temp.is_empty() {
-        return;
-    }
-    let file = Path::new(temp).join(PYTHON_SHIM_FOLDER).join("sitecustomize.py");
+/// `PYTHON_SHIM` in the app's own folder for the sandbox, which a command reads and cannot write (`for_sandbox_folder`), written where it is not there as
+/// it is: the folder to put on PYTHONPATH. It was in the command's temp folder, which a command writes: one that made the shim's folder there a junction
+/// had the app write sitecustomize.py as the person wherever it led, over a person's own in their Python's site-packages.
+fn put_python_shim() -> Option<String> {
+    let base = for_sandbox_folder()?;
+    let folder = base.join(PYTHON_SHIM_FOLDER);
+    let file = folder.join("sitecustomize.py");
     if std::fs::read_to_string(&file).ok().as_deref() != Some(PYTHON_SHIM) {
-        let _ = std::fs::create_dir_all(file.parent().expect("a folder"));
-        let _ = std::fs::write(&file, PYTHON_SHIM);
+        crate::temp_writes::write(&base, &file, PYTHON_SHIM).ok()?;
     }
+    Some(folder.display().to_string())
 }
 
 /// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
@@ -2800,10 +2807,8 @@ fn put_python_shim(temp: &str) {
 fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: bool, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    if !as_person {
-        put_python_shim(&temp);
-    }
-    let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
+    let shim = if as_person { None } else { put_python_shim() };
+    let mut block = environment_block(block, crate::bundled::root().as_deref(), shim, temp, workspace, build_tools);
     // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
     if as_person {
         block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL", POWERSHELL_POLICY.0, NO_ZONE_CHECKS.0].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
@@ -2842,7 +2847,7 @@ fn their_git_first(block: &mut [(String, String)], inherited: &str, bundled: Opt
 /// A command's environment from what it inherits. The PATH comes out as the bundled tools and the folder `npm install -g` fills, then what the machine has (without a person's own Python,
 /// Node or Git, and without a folder of MSYS or Cygwin programs, which cannot start here and would stand in for Windows' own `find` and `sort`), and last the folders of Visual Studio's
 /// compiler when `build_tools` finds them: nothing that is earlier on it can be shadowed by a later one.
-fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
+fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, shim: Option<String>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
     crate::msvc::add_to(&mut block, build_tools);
     // (before anything is made of it, with a bundle or without: `path_of` leaves the same ones off)
     if let Some((_, path)) = block.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case("PATH")) {
@@ -2857,8 +2862,8 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     // Where git looks for its per-user files: the person's profile is closed to a command, and it would warn on every run.
     block.push(("XDG_CONFIG_HOME".to_string(), temp.clone()));
     // (its sitecustomize first, for any Python: a folder of mode 0o700 made under the container is one the container cannot open, see PYTHON_SHIM)
-    if !temp.is_empty() {
-        block.push(("PYTHONPATH".to_string(), format!("{temp}\\{PYTHON_SHIM_FOLDER}")));
+    if let Some(shim) = shim {
+        block.push(("PYTHONPATH".to_string(), shim));
     }
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
@@ -4334,6 +4339,70 @@ mod tests {
         }
     }
 
+    /// While a loop swaps a new repository's `.git` for a junction to a repository of the person's outside and back, arming it again each time, the app
+    /// takes out of it what would run, many times: the person's repository keeps its config and its hooks, and nothing is put aside in it.
+    #[test]
+    fn while_a_git_folder_is_swapped_for_a_junction_the_persons_repository_is_not_changed() {
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        let arm = |git: &Path| {
+            let _ = std::fs::create_dir_all(git.join("hooks"));
+            let _ = std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n");
+            let _ = std::fs::write(git.join("hooks").join("pre-commit"), "evil");
+        };
+        arm(&git);
+        let their_git = theirs.path().join(".git");
+        arm(&their_git);
+        let before = (std::fs::read(their_git.join("config")).unwrap(), std::fs::read(their_git.join("hooks").join("pre-commit")).unwrap());
+        let swapping = crate::held_way::swapping::Swapping::start(&git, &their_git, arm);
+        let mut taken_out = 0;
+        for _ in 0..60 {
+            let mut taken = Taken::default();
+            let _ = disarm_repository(&git, &root, &HashSet::new(), &mut taken);
+            taken_out += usize::from(!taken.names.is_empty());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        let after = (std::fs::read(their_git.join("config")).unwrap(), std::fs::read(their_git.join("hooks").join("pre-commit")).unwrap());
+        assert!(after == before, "the person's config and hooks are as they were");
+        let aside: Vec<_> = std::fs::read_dir(&their_git).unwrap().flatten().map(|entry| entry.file_name()).filter(|name| name.to_string_lossy().starts_with("dogmind-disarmed")).collect();
+        assert!(aside.is_empty(), "put aside in theirs: {aside:?}");
+        assert!(swaps > 0 && taken_out > 0, "{swaps} swaps, {taken_out} taken out");
+    }
+
+    /// The Python shim is in the app's folder for the sandbox, which commands read and cannot write, and is on PYTHONPATH from there: its old place in a
+    /// restricted command's temp folder made a junction to a person's site-packages leaves their sitecustomize.py as it was, and the command still runs.
+    /// (The container's own temp folder is every test's, and is left as it is.)
+    #[test]
+    fn the_python_shim_is_not_written_through_a_commands_temp_folder() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let data = outside_folder("shim-data");
+        crate::workspace_grants::use_test_folder(&data);
+        let site = outside_folder("shim-site-packages");
+        std::fs::write(site.join("sitecustomize.py"), "theirs").unwrap();
+        let work = work_folder("shim-temp");
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        let restricted_temp = PathBuf::from(decode(&restricted("echo %TEMP%").unwrap().stdout).trim());
+        let old = restricted_temp.join(PYTHON_SHIM_FOLDER);
+        if let Ok(found) = std::fs::symlink_metadata(&old) {
+            if found.file_type().is_symlink() { std::fs::remove_dir(&old).unwrap() } else { std::fs::remove_dir_all(&old).unwrap() }
+        }
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&old).arg(&site).output().unwrap();
+        assert!(made.status.success(), "{}: {}{}", old.display(), decode(&made.stdout), decode(&made.stderr));
+        let said = restricted("echo %PYTHONPATH%").unwrap();
+        assert_eq!(said.status, Some(0));
+        let shim = PathBuf::from(decode(&said.stdout).trim());
+        assert!(crate::safety::inside(&data, &shim), "on PYTHONPATH from the app's folder: {}", shim.display());
+        assert_eq!(std::fs::read_to_string(shim.join("sitecustomize.py")).unwrap(), PYTHON_SHIM);
+        let ran = command("echo %PYTHONPATH%", &work, false);
+        assert_eq!((ran.status, PathBuf::from(decode(&ran.stdout).trim())), (Some(0), shim), "the container's too");
+        assert_eq!(std::fs::read_to_string(site.join("sitecustomize.py")).unwrap(), "theirs");
+        std::fs::remove_dir(&old).unwrap();
+    }
+
     #[test]
     fn a_timeout_ends_all_a_command_started() {
         let folder = work_folder("timeout");
@@ -5071,7 +5140,7 @@ mod tests {
     #[test]
     fn a_commands_powershell_runs_scripts_and_the_persons_keeps_their_policy() {
         let place = crate::in_container::tempdir().unwrap();
-        let block = environment_block(Vec::new(), None, place.path().display().to_string(), place.path(), || None);
+        let block = environment_block(Vec::new(), None, None, place.path().display().to_string(), place.path(), || None);
         assert!(block.iter().any(|(name, value)| name == POWERSHELL_POLICY.0 && value == "Bypass"), "{block:?}");
         assert!(block.iter().any(|(name, value)| name == NO_ZONE_CHECKS.0 && value == "1"), "no question nobody can answer: {block:?}");
         let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None)).to_ascii_lowercase();
@@ -5317,23 +5386,23 @@ mod tests {
         let inherited = std::env::join_paths([&own_node, &other]).unwrap().to_string_lossy().into_owned();
         let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
         let temp = dir.path().display().to_string();
-        let made = environment_block(start(), Some(&root), temp.clone(), &work, || Some(build_tools()));
+        let made = environment_block(start(), Some(&root), None, temp.clone(), &work, || Some(build_tools()));
         // (and where `npm install -g` puts its commands, in the sandbox's folder, after the bundled tools)
         let global = PathBuf::from(&temp).join("npm-global");
         assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), global.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
         // The PATH alone, for a question about a name, is the same one (without the folder of the commands that were installed, which no question about a name of the project's own is about).
         let without_global: Vec<PathBuf> = path_folders(&made).into_iter().filter(|folder| *folder != global).collect();
         assert_eq!(path_of(start(), Some(&root), || Some(build_tools())), without_global);
-        assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, temp.clone(), &work, || Some(build_tools()))));
-        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None)).into_iter().filter(|folder| *folder != global).collect::<Vec<_>>());
+        assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, None, temp.clone(), &work, || Some(build_tools()))));
+        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), None, temp.clone(), &work, || None)).into_iter().filter(|folder| *folder != global).collect::<Vec<_>>());
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!(value("LIB"), Some("C:\\vs\\lib\\x64;C:\\kits\\um\\x64"));
         assert_eq!(value("INCLUDE"), Some("C:\\vs\\include;C:\\kits\\ucrt"));
         // Without the bundled tools: the machine's PATH, and then the same.
-        let plain = environment_block(start(), None, temp.clone(), &work, || Some(build_tools()));
+        let plain = environment_block(start(), None, None, temp.clone(), &work, || Some(build_tools()));
         assert_eq!(path_folders(&plain), [own_node.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
         // On a machine with none found, PATH is what it was.
-        let none = environment_block(start(), Some(&root), temp, &work, || None);
+        let none = environment_block(start(), Some(&root), None, temp, &work, || None);
         assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), global, other]);
         assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
     }
@@ -5359,10 +5428,10 @@ mod tests {
         let global = PathBuf::from(&temp).join("npm-global");
         let bundled = [root.join("python"), root.join("node"), root.join("git\\cmd")];
         // Without a bundle: the machine's PATH, minus the two.
-        assert_eq!(path_folders(&environment_block(start(), None, temp.clone(), &work, || None)), [plain.clone()]);
+        assert_eq!(path_folders(&environment_block(start(), None, None, temp.clone(), &work, || None)), [plain.clone()]);
         assert_eq!(path_of(start(), None, || None), [plain.clone()]);
         // With one: the same, after its own, and `path_of` says what `environment_block` gives.
-        let made = path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None));
+        let made = path_folders(&environment_block(start(), Some(&root), None, temp.clone(), &work, || None));
         assert_eq!(made, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), global.clone(), plain.clone()]);
         assert_eq!(path_of(start(), Some(&root), || None), made.iter().filter(|folder| **folder != global).cloned().collect::<Vec<_>>());
         // (and Visual Studio's still come last)
@@ -5394,7 +5463,7 @@ mod tests {
         }
         let dir = crate::in_container::tempdir().unwrap();
         let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("LIB".to_string(), "C:\\dev\\lib".to_string()), ("INCLUDE".to_string(), "C:\\dev\\include".to_string()), ("LIBPATH".to_string(), "C:\\dev\\libpath".to_string())];
-        let made = environment_block(start, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
+        let made = environment_block(start, None, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!((value("PATH"), value("LIB"), value("INCLUDE"), value("LIBPATH")), (Some("C:\\a"), Some("C:\\dev\\lib"), Some("C:\\dev\\include"), Some("C:\\dev\\libpath")));
     }
@@ -5406,7 +5475,7 @@ mod tests {
         let root = dir.path().join("tools");
         for bundled in [None, Some(root.as_path())] {
             let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("disable_telemetry".to_string(), "0".to_string())];
-            let made = environment_block(start, bundled, dir.path().display().to_string(), dir.path(), || None);
+            let made = environment_block(start, bundled, None, dir.path().display().to_string(), dir.path(), || None);
             let set: Vec<&str> = made.iter().filter(|(name, _)| name.eq_ignore_ascii_case("DISABLE_TELEMETRY")).map(|(_, value)| value.as_str()).collect();
             assert_eq!(set, ["1"], "{bundled:?}");
         }

@@ -728,25 +728,24 @@ pub(crate) fn take_the_place(new: &Path, path: &Path) -> std::io::Result<()> {
 }
 
 /// A file's whole text, written beside it and then in its place: a write that fails on the way (a full disk, the app ended) leaves the file
-/// as it was, where writing over it left it empty or cut.
-fn written_whole(path: &Path, bytes: &[u8], exists: bool) -> std::io::Result<()> {
+/// as it was, where writing over it left it empty or cut. The folders from `root` to it are held while it is written, and those it lacks are made
+/// (`held_way`): a command may have made one a junction to anywhere.
+pub(crate) fn written_whole(root: &Path, path: &Path, bytes: &[u8], exists: bool) -> std::io::Result<()> {
+    let way = crate::held_way::hold(root, path.parent().unwrap_or(root), !exists).map_err(std::io::Error::other)?;
     let new = written_beside(path);
-    let done = std::fs::File::create(&new)
-        .and_then(|mut out| {
-            std::io::Write::write_all(&mut out, bytes)?;
-            out.sync_all()
-        })
-        .and_then(|()| if exists { take_the_place(&new, path) } else { std::fs::rename(&new, path) });
-    if done.is_err() {
+    crate::held_way::write_new(way.as_ref(), &new, |out| std::io::Write::write_all(out, bytes))?;
+    crate::held_way::into_place(&new, path, exists).inspect_err(|_| {
         let _ = std::fs::remove_file(&new);
-    }
-    done
+    })
 }
 
 /// Every file's new text, or none: each is written whole beside its file first, and only when all of them are on the disk do they take
 /// the files' places, one by one. A failure on the way puts back what had changed. No file is ever left part written, and what is said
-/// of a failure is what the files are.
-fn write_all_or_none(files: &[(&Path, &[u8], Vec<u8>)]) -> Result<(), String> {
+/// of a failure is what the files are. The folders from `root` to each are held from before the first is written to after the last (`held_way`).
+pub(crate) fn write_all_or_none(root: &Path, files: &[(&Path, &[u8], Vec<u8>)]) -> Result<(), String> {
+    let ways = files.iter()
+        .map(|(path, _, _)| crate::held_way::hold(root, path.parent().unwrap_or(root), false).map_err(|error| format!("{error}: nothing was changed")))
+        .collect::<Result<Vec<_>, String>>()?;
     let beside: Vec<PathBuf> = files.iter().map(|(path, _, _)| written_beside(path)).collect();
     let forget = |from: usize| {
         for new in &beside[from..] {
@@ -754,30 +753,29 @@ fn write_all_or_none(files: &[(&Path, &[u8], Vec<u8>)]) -> Result<(), String> {
         }
     };
     for (at, (path, _, after)) in files.iter().enumerate() {
-        let written = std::fs::File::create(&beside[at]).and_then(|mut out| {
-            std::io::Write::write_all(&mut out, after)?;
-            out.sync_all()
-        });
+        let written = crate::held_way::write_new(ways[at].as_ref(), &beside[at], |out| std::io::Write::write_all(out, after));
         if let Err(error) = written {
             forget(0);
             return Err(format!("{}: {error}: nothing was changed", path.display()));
         }
     }
     for (at, (path, _, _)) in files.iter().enumerate() {
-        if let Err(error) = take_the_place(&beside[at], path) {
+        if let Err(error) = crate::held_way::into_place(&beside[at], path, true) {
             forget(at);
             // (the old text goes back as the new went in: whole, beside, then in place)
             let not_back: Vec<String> = files[..at]
                 .iter()
-                .filter(|(done, before, _)| {
+                .zip(&ways)
+                .filter(|((done, before, _), way)| {
                     let back = written_beside(done);
-                    let put = std::fs::write(&back, before).and_then(|()| take_the_place(&back, done));
+                    let put = crate::held_way::write_new(way.as_ref(), &back, |out| std::io::Write::write_all(out, before))
+                        .and_then(|()| crate::held_way::into_place(&back, done, true));
                     if put.is_err() {
                         let _ = std::fs::remove_file(&back);
                     }
                     put.is_err()
                 })
-                .map(|(done, _, _)| done.display().to_string())
+                .map(|((done, _, _), _)| done.display().to_string())
                 .collect();
             return Err(if not_back.is_empty() {
                 format!("{}: {error}: the files are as they were", path.display())
@@ -1282,9 +1280,6 @@ impl Workbench {
                 seen_in_part = Some(covered);
             }
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("{given}: {error}"))?;
-        }
         // In the file's own form: its encoding, its byte order mark and its line ends. Appended as bytes, words went onto UTF-16 as UTF-8, and
         // LF lines onto CRLF ones; written over, a mark PowerShell 5.1 needs to read Japanese went.
         // (a new file is all ASCII before it is written)
@@ -1300,7 +1295,7 @@ impl Workbench {
         if marked {
             written.splice(0..0, UTF8_MARK.iter().copied());
         }
-        written_whole(&path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
+        written_whole(workspace, &path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
         let lines = file_text(&written).0.lines().count();
         self.saw(path.clone(), sha16(&written));
         if self.cut_file.as_ref() == Some(&path) {
@@ -1419,7 +1414,7 @@ impl Workbench {
                 .map_err(|error| format!("{}: {error}: nothing was changed", file.path.display()))?;
             Ok((file.path.as_path(), file.original.as_slice(), bytes))
         }).collect::<Result<Vec<_>, String>>()?;
-        write_all_or_none(&writes)?;
+        write_all_or_none(workspace, &writes)?;
         let mut report = String::new();
         for (file, (_, _, bytes)) in files.iter().zip(writes) {
             let PatchFile { path, before, after, .. } = file;
@@ -3382,6 +3377,16 @@ fn foreign_owner_note(err: &str, workspace: &Path) -> Option<String> {
 }
 
 /// One line more where a sandbox's answer reads as something else: a model believes it, and the next rounds go on that.
+/// `.pydeps` in the workspace, hidden from its repository by an ignore file of its own, written as the person with the folders on the way held (`held_way`):
+/// written by its name, a `.pydeps` a command had made a junction would have had the person's own `.gitignore` wherever it led made `*`.
+fn ignore_pydeps(workspace: &Path) {
+    let folder = workspace.join(crate::bundled::PY_DEPS);
+    if folder.is_dir() {
+        let file = folder.join(".gitignore");
+        let _ = written_whole(workspace, &file, b"*\n", file.exists());
+    }
+}
+
 #[cfg(windows)]
 fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -> String {
     let mut notes = String::new();
@@ -3392,9 +3397,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     }
     if crate::bundled::root().is_some() && lower.contains("pip") && lower.contains("install") {
         // (a repository need not see them)
-        if workspace.join(crate::bundled::PY_DEPS).is_dir() {
-            let _ = std::fs::write(workspace.join(crate::bundled::PY_DEPS).join(".gitignore"), "*\n");
-        }
+        ignore_pydeps(workspace);
         notes.push_str("note: `pip install` puts packages in .pydeps in the workspace, and python finds them there. The bundled Python itself cannot be changed.\n");
     }
     // (a real model ended its own server so, `taskkill /F /IM python.exe /T`: every session's commands run in the one sandbox, and a
@@ -3978,6 +3981,10 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     }
     let mut said_by_init = String::new();
     let line: &str = if let Some((words, rest)) = &started_with_init {
+        // (as the person: the folder it makes .git in, and those on the way, held while it does, and the folder kept from being made a mount point by a
+        // file of the app's in it, as an empty one can be: see `held_way`)
+        let way = crate::held_way::hold(&resolve(workspace, "."), &cwd, false).map_err(|error| format!("{error}. The command was not started"))?;
+        let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| format!("{error}. The command was not started"))?;
         let mut command = Command::new(crate::bundled::git_program());
         command.args(["init", "--template="]).args(words).current_dir(&cwd).stdin(Stdio::null());
         no_window(&mut command);
@@ -4631,6 +4638,48 @@ mod change_tests {
 
     /// The case a review run met: `members = ["crates/*"]` under the user folder, which cargo cannot expand in the container.
     #[cfg(windows)]
+    /// While a loop swaps the folder a leading `git init` runs in for a junction to a folder outside and back, the app's own `git init` there makes `.git`
+    /// in the workspace or is refused, many times: none is made outside.
+    #[test]
+    fn while_a_folder_is_swapped_for_a_junction_git_init_makes_nothing_outside() {
+        let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let swapping = crate::held_way::swapping::Swapping::start(&sub, outside.path(), |sub| {
+            let _ = std::fs::remove_dir_all(sub.join(".git"));
+        });
+        let mut made = 0;
+        for _ in 0..30 {
+            made += usize::from(execute_command(&json!({"command": "git init", "cwd": "sub"}), dir.path(), &AtomicBool::new(false), None).is_ok_and(|said| said.contains("exit_code: 0")));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert!(!outside.path().join(".git").exists(), "no .git outside");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(swaps > 0 && made > 0, "{swaps} swaps, {made} made");
+    }
+
+    /// While a loop swaps `.pydeps` for a junction to a repository of the person's and back, the ignore file the app writes there lands in the workspace
+    /// or not at all, many times: the person's own `.gitignore` is as it was.
+    #[test]
+    fn while_pydeps_is_swapped_for_a_junction_their_gitignore_is_not_changed() {
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let pydeps = dir.path().join(crate::bundled::PY_DEPS);
+        std::fs::create_dir_all(&pydeps).unwrap();
+        std::fs::write(theirs.path().join(".gitignore"), "target/\n").unwrap();
+        let swapping = crate::held_way::swapping::Swapping::start(&pydeps, theirs.path(), |_| {});
+        for _ in 0..60 {
+            ignore_pydeps(dir.path());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert_eq!(std::fs::read_to_string(theirs.path().join(".gitignore")).unwrap(), "target/\n");
+        assert!(swaps > 0, "the junction was put in place");
+        // (with nothing swapping it, as ever)
+        ignore_pydeps(dir.path());
+        assert_eq!(std::fs::read_to_string(pydeps.join(".gitignore")).unwrap(), "*\n", "written in the workspace");
+    }
+
     #[test]
     fn cargo_loads_a_workspace_of_member_patterns_with_a_restricted_token() {
         if !std::process::Command::new("cargo").arg("--version").output().is_ok_and(|output| output.status.success()) {
