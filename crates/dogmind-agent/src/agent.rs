@@ -9827,7 +9827,9 @@ Body").unwrap();
         last.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
         // (the second and third: longer than the line after a stop and shorter than a draft the first stop or a written file's is stopped at)
         let between = DRAFT_LINES_AFTER_STOP + 5;
-        assert!(between < DRAFT_LINES && between < LONG_DRAFT_LINES);
+        // (the lower of the first stop's two lines is DRAFT_LINES: shorter than it is shorter than a written file's too)
+        const _: () = assert!(DRAFT_LINES < LONG_DRAFT_LINES);
+        assert!(between > DRAFT_LINES_AFTER_STOP && between < DRAFT_LINES);
         let (client, bodies) = trickling_server(vec![
             long(format!("Plan.\n{}", fenced(&code_lines(DRAFT_LINES + 2)))),
             long(format!("Again.\n{}", fenced(&code_lines(between)))),
