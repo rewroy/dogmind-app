@@ -39,9 +39,20 @@ const ON_THE_GPU: &str = " --use-angle=d3d11";
 /// How any other page is drawn: on the CPU, with no GPU process to start, which costs a run of a page with no WebGL 0.3 to 0.4 s (1.3 s against 1.7).
 const ON_THE_CPU: &str = " --disable-gpu";
 
-/// Checks that went back to the CPU after a run on the GPU crashed or hung: past two, a machine whose GPU will not draw for the sandbox is not asked again in this
-/// run of the app.
+/// Checks in a row that went back to the CPU after a run on the GPU crashed or hung: past two, a machine whose GPU will not draw for the sandbox is not asked again
+/// in this run of the app. A run on the GPU that drew well puts it back to none: a page heavy enough for a run to be stopped once is no GPU that will not draw, and
+/// counted so, two such runs with checks that drew well between them sent every later check of a run to the CPU, at four times the time of each.
 static GPU_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// The GPU drew a run well: what failed before is not counted against it ([`GPU_FAILURES`]).
+fn gpu_drew_well() {
+    GPU_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Whether pages that draw with WebGL are drawn on the GPU: not after two checks in a row went back to the CPU from it.
+fn gpu_draws() -> bool {
+    GPU_FAILURES.load(Ordering::Relaxed) < 2
+}
 
 /// The model's server is on this machine, and so, with a CUDA build, on its GPU. Its weights fill the GPU's memory (a partially resident model is made to), and
 /// a browser drawing there takes some of it, which may page the engine's out before its next request or fail an allocation of its: pages are then drawn on the
@@ -1600,7 +1611,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         texts.extend(needs.iter().flat_map(|needs| needs.run.iter()).filter_map(|script| std::fs::read_to_string(folder.join(script)).ok()).filter(|text| text.len() < 4 << 20));
         draws_webgl(&texts)
     });
-    let gpu_available = GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed);
+    let gpu_available = gpu_draws() && !ENGINE_HERE.load(Ordering::Relaxed);
     let on_gpu = AtomicBool::new(gpu_available && (webgl || served.is_some_and(|url| served_draws_webgl(url, &root))));
     let extensions = extension_flags(ours.as_deref().and_then(frames_extension).as_deref());
     let virtual_screen = supports_virtual_screen(&program);
@@ -1632,6 +1643,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         for _ in 0..TRIES {
             let started = std::time::Instant::now();
             let profile = profiles.next();
+            let gpu_run = on_gpu.load(Ordering::Relaxed);
             let line = page_line(&program, &browser_flags(), virtual_screen, run_wait, &profile, &address);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
             (dom, err) = (crate::sandbox::decode(&done.stdout), browser_stderr(&done.stderr));
@@ -1641,6 +1653,9 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             }
             ended_as = end_of_run(done.status, &dom, &err);
             finished = ended_as == EndOfRun::Read;
+            if finished && gpu_run {
+                gpu_drew_well();
+            }
             read_took.set(started.elapsed());
             how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
             note_browser_run("page", how.clone(), started);
@@ -1705,6 +1720,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
             taken.limit = limit;
             let profile = profiles.next();
+            let gpu_run = on_gpu.load(Ordering::Relaxed);
             let line = shot_line(&program, &browser_flags(), &window, wait, &profile, &shot, &capture);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
             let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
@@ -1722,6 +1738,9 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             if let Ok(whole) = shot_image {
                 if crate::temp_writes::place_for(ours, &picture).is_ok() && whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                     taken.picture = Some(picture.clone());
+                    if gpu_run {
+                        gpu_drew_well();
+                    }
                     taken.said_there = done.map(|done| page_console(&browser_stderr(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
                 }
@@ -3313,6 +3332,23 @@ mod tests {
         assert_eq!(reads.len(), 2, "the read, and the read again with no other try after it: {reads:?}");
         assert!(reads[0] == "exit code 0x0" && reads[1] != "exit code 0x0", "{reads:?}");
         assert!(said.contains("How it looks at mobile") && said.contains("on this machine's GPU"), "the picture after it on the GPU still: {said}");
+    }
+
+    /// The GPU is left for the CPU after two checks in a row went back from it, and a run it drew well in between puts the count back.
+    #[test]
+    fn the_gpu_is_left_only_after_two_checks_in_a_row_failed_on_it() {
+        let before = GPU_FAILURES.load(Ordering::Relaxed);
+        GPU_FAILURES.store(0, Ordering::Relaxed);
+        // (as off_the_gpu counts a check that went back to the CPU)
+        let failed = || GPU_FAILURES.fetch_add(1, Ordering::Relaxed);
+        failed();
+        assert!(gpu_draws());
+        gpu_drew_well();
+        failed();
+        assert!(gpu_draws(), "a failure, a check drawn well, a failure: still the GPU");
+        failed();
+        assert!(!gpu_draws(), "two in a row: the CPU");
+        GPU_FAILURES.store(before, Ordering::Relaxed);
     }
 
     /// How much of a page's time fits in a run, by the speed of a read: a run's start is not of the page's time.
