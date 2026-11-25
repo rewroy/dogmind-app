@@ -395,6 +395,16 @@ fn step_parts(steps: &str) -> (Vec<String>, usize) {
 }
 
 /// The numbers of the parts of the steps that began, in the order they did, from what the browser said: a line `DOGMIND-STEPS-PART 2/3` for each.
+/// Whether the steps were still going when the page was read: none said they were done or failed, none began again with a reload, and they did not go to
+/// another page. A longer wait is what such steps may want.
+fn steps_not_ended(err: &str, folder_url: &str) -> bool {
+    let console = console_lines(err, folder_url);
+    let began = parts_begun(err);
+    !console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE") || line.contains("DOGMIND-STEPS-FAILED: "))
+        && steps_left(err).is_none()
+        && !began.iter().any(|part| began.iter().filter(|other| *other == part).count() > 1)
+}
+
 fn parts_begun(err: &str) -> Vec<usize> {
     err.lines().filter_map(|line| line.split_once("DOGMIND-STEPS-PART ").and_then(|(_, rest)| rest.split('/').next()?.trim().parse().ok())).collect()
 }
@@ -1789,6 +1799,32 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                 shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn {}): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n", drawn_on(on_gpu.load(Ordering::Relaxed)));
             }
         }
+        // Steps that had not ended when the page was read, at a wait below the longest a check gives, are read once more at the longest before the check
+        // answers: a run of the browser, some seconds, where the model asked for a larger wait in a round of its own (40 to 80 s of a request) and checked
+        // again, 42 times in 35 runs of the tasks that build a page. The pictures are of the read that is said.
+        let longest = MOST_WAIT_MS + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+        let mut read_again = None;
+        if steps.is_some() && copy_name.is_some() && finished && wait < longest && steps_not_ended(&err, &base_url) && !cancel.load(Ordering::Relaxed) {
+            let asked = wait;
+            ended(std::mem::take(&mut pictures), true);
+            drop(kept.take());
+            stop.store(false, Ordering::Relaxed);
+            let (again, again_pictures, again_kept) = read_with_pictures(longest);
+            match again {
+                Ok(read) if read.2 => {
+                    (dom, err, finished, how, ended_as) = read;
+                    (pictures, kept, wait) = (again_pictures, again_kept, longest);
+                    read_again = Some(asked);
+                }
+                // (a read at the longest that did not end as a read does is no better: the first is said, and its pictures taken again)
+                _ => {
+                    ended(again_pictures, true);
+                    drop(again_kept);
+                    stop.store(false, Ordering::Relaxed);
+                    pictures = start(asked);
+                }
+            }
+        }
         let mut console = console_lines(&err, &base_url);
         let (mut steps_said, mut steps_lost) = (String::new(), None);
         if let (Some(page), Some(copy)) = (&page, &copy_name) {
@@ -1809,8 +1845,12 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                     _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
                     (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
                     (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
-                    (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-                    (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
+                    (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.{}\n",
+                                                  read_again.map_or(String::new(), |asked| format!(" They had not ended at the {asked} ms of its time asked for, and the page was read again at {wait}: a wait_ms of {wait} gives them their time next time."))),
+                    // (told to shorten the waits, a real model sped up the page's own animation for a check and undid it after: the page checked was not the page)
+                    (false, None, None) if wait >= longest => format!(
+                        "Steps: they had not ended when the page was read, after {wait} ms of its time{}, the longest a check gives. A check gives no longer. Leave the page's own timings as they are: a page sped up for a check is not the page that was asked for. Check a part of the steps at a time (what the page shows before their end, then the rest from a state they can reach sooner), and say what was not checked.\n",
+                        read_again.map_or(String::new(), |asked| format!(" (read again at it, as at the {asked} ms asked for they had not ended either)"))),
                     (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
                 };
                 let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
@@ -3183,6 +3223,27 @@ mod tests {
         assert!(said.contains("How it looks at mobile"), "{said}");
         let failed = check_page(&serde_json::json!({"path": "index.html", "steps": "await click('#nothing')"}), dir.path(), &AtomicBool::new(false)).unwrap();
         assert!(failed.contains("STEPS FAILED: nothing matches #nothing"), "{failed}");
+    }
+
+    /// Steps longer than the wait asked for are read again at the longest a check gives, and said so, with what wait gives them their time; steps longer
+    /// than that are told as the longest there is, with the page's own timings to be left as they are.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn steps_cut_by_the_wait_asked_for_are_read_again_at_the_longest() {
+        let data = crate::in_container::tempdir().unwrap();
+        crate::workspace_grants::use_test_folder(data.path());
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>slow</title><button id=go>go</button><p id=out></p>")]);
+        let steps = "await click('#go'); await wait(4000); document.getElementById('out').textContent = 'shown'; console.log('after the wait');";
+        let started = std::time::Instant::now();
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps, "views": ["mobile"], "wait_ms": 2000}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}\n({:?})", started.elapsed());
+        assert!(said.contains("Steps: all ran") && said.contains("after the wait") && said.contains("read again at 10000"), "{said}");
+        assert!(said.contains("How it looks at mobile"), "the picture is of the read said: {said}");
+        let longer = "await click('#go'); await wait(15000); console.log('never');";
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": longer, "views": ["mobile"], "wait_ms": 2000}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("the longest a check gives") && said.contains("read again at it") && said.contains("Leave the page's own timings as they are"), "{said}");
+        assert!(!said.contains("give a larger wait_ms") && !said.contains("shorten the waits"), "{said}");
     }
 
     /// With the real browser, in the real sandbox: steps that reload the page are run in parts, one in each load. What the first part put in the page's storage is there for the
