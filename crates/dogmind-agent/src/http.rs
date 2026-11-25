@@ -600,6 +600,10 @@ pub(crate) mod tests {
     /// timeout, held the request for as long as it liked.
     #[test]
     fn a_tls_handshake_sent_a_byte_at_a_time_ends_in_its_time_and_on_a_stop() {
+        // (with a restricted token schannel fails before the handshake, for want of credentials: there is no handshake to hold)
+        if crate::in_container::cannot_run_with_a_restricted_token(crate::in_container::SCHANNEL) {
+            return;
+        }
         let dripping = || {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();

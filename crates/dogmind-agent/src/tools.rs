@@ -6809,6 +6809,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_folder_python_made_open_to_its_owner_alone_is_told_as_that_and_not_as_outside() {
+        // (it makes a folder with a list of its own and reads that list, which a command, in a container or with a restricted token, may not: the app reads it
+        // from outside the sandbox)
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;

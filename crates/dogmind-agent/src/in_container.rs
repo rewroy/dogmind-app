@@ -15,6 +15,12 @@ pub(crate) const SYSTEM: &str = "look at a drive's root and facts, or draw on a 
 /// has its caller's token (`sandbox::in_the_sandbox`), which reads as the person and reaches the network.
 pub(crate) const KEPT_BY_A_CONTAINER: &str = "hold a command from the person's files or the network, which a container does and a restricted token, as its caller has, does not";
 
+/// Why a test cannot run in a container of another name than the tests' own: what the sandbox writes for its commands goes to the tests' container's folder.
+pub(crate) const OTHER_CONTAINER: &str = "write what the sandbox gives its commands to the tests' own container's folder, which a command in another container cannot";
+
+/// Why a test cannot run with a restricted token: schannel gives such a token no credentials (SEC_E_NO_CREDENTIALS, before any handshake; curl.exe the same).
+pub(crate) const SCHANNEL: &str = "make a TLS connection, for which schannel gives a restricted token no credentials";
+
 /// The tests left out, each with why.
 static LEFT_OUT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
@@ -60,6 +66,11 @@ pub(crate) fn cannot_run(why: &'static str) -> bool {
 /// Whether this test cannot run where it runs, with a restricted token (`KEPT_BY_A_CONTAINER`): counted and said as `cannot_run` says it. In a container it runs.
 pub(crate) fn cannot_run_with_a_restricted_token(why: &'static str) -> bool {
     crate::sandbox::with_a_restricted_token() && left_out(why)
+}
+
+/// Whether this test cannot run where it runs, in a container: counted and said as `cannot_run` says it. With a restricted token it runs.
+pub(crate) fn cannot_run_in_a_container(why: &'static str) -> bool {
+    crate::sandbox::in_a_container() && left_out(why)
 }
 
 /// Counts a test left out, for the end of the run; always true.

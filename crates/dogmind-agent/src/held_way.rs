@@ -499,6 +499,11 @@ mod tests {
     /// held. One that is in the workspace where it really is, but under another name for the root (a real path among named ones), is not written at all.
     #[test]
     fn a_short_name_or_another_name_for_the_root_is_not_written_unheld() {
+        // (short and long names are found by reading each folder from the drive's root, which a container cannot: it gets them for some parts and not others,
+        // and the long names of a short path are not found. Outside a container they are, and so with a restricted token)
+        if crate::in_container::cannot_run_in_a_container(crate::in_container::SYSTEM) {
+            return;
+        }
         let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
         let root = dir.path();
         let long = root.join("project-with-a-long-name");
@@ -515,6 +520,7 @@ mod tests {
             let length = unsafe { windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(name.as_ptr(), text.as_mut_ptr(), text.len() as u32) } as usize;
             PathBuf::from(String::from_utf16_lossy(&text[..length]))
         };
+        assert!(short.is_absolute(), "a short name for {}", long.display());
         assert_ne!(short.file_name(), long.file_name(), "a short name is there: {}", short.display());
         let refused = hold(root, &short.join("sub").join("deeper"), true).err().unwrap_or_default();
         assert!(refused.contains(ON_THE_WAY), "{refused}");

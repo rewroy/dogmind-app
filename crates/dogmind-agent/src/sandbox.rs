@@ -871,7 +871,7 @@ pub fn with_a_restricted_token() -> bool {
 }
 
 /// Whether this process runs in an AppContainer itself (`in_the_sandbox`).
-fn in_a_container() -> bool {
+pub(crate) fn in_a_container() -> bool {
     static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN.get_or_init(|| {
         // SAFETY: the token is this process's own, opened for asking and closed here; the answer is a 32-bit value.
@@ -4514,6 +4514,10 @@ mod tests {
     #[test]
     fn a_repository_whose_disarming_failed_is_disarmed_at_the_next_look() {
         use std::os::windows::fs::OpenOptionsExt;
+        // (it gives the repository's folders a list of the app's own, which a command, in a container or with a restricted token, may not)
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path();
         assert!(look_between_commands(root).refused.is_none(), "the first look takes what is there as it is");
@@ -5426,6 +5430,11 @@ mod tests {
         let folder = work_folder("python-temp");
         let script = "import os, shutil, tempfile; made = []\nfor where in (None, os.getcwd()):\n    with tempfile.TemporaryDirectory(dir=where) as d:\n        open(os.path.join(d, 'a.txt'), 'w').write('x')\n        made.append(os.path.basename(d))\nd = tempfile.mkdtemp(dir=os.getcwd()); open(os.path.join(d, 'b.txt'), 'w').write('y'); shutil.rmtree(d)\nprint('ok', len(made))";
         std::fs::write(folder.join("probe.py"), script).unwrap();
+        // (the sitecustomize it is about is written to the tests' own container's folder, which a command in another container, the one this run is in, cannot write:
+        // its Python then starts without it. A restricted token's commands can, and run it)
+        if crate::in_container::cannot_run_in_a_container(crate::in_container::OTHER_CONTAINER) {
+            return;
+        }
         let done = command("python probe.py", &folder, false);
         let (said, errors) = (decode(&done.stdout), decode(&done.stderr));
         // (in the tests' own container, a person's Python is not opened to commands: only the bundle's is, where `DOGMIND_TOOLS` names one)

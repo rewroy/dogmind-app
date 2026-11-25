@@ -418,6 +418,10 @@ mod tests {
     /// mark says so at the next start. An old mark of no container's stands for none.
     #[test]
     fn the_tools_are_opened_to_each_container_once() {
+        // (it writes the folder's list, which a command, in a container or with a restricted token, may not)
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let named = |name: &str| -> windows_sys::Win32::Security::PSID {
             let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
             let mut sid = std::ptr::null_mut();
