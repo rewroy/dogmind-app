@@ -394,7 +394,24 @@ fn step_parts(steps: &str) -> (Vec<String>, usize) {
     (parts, more)
 }
 
-/// The numbers of the parts of the steps that began, in the order they did, from what the browser said: a line `DOGMIND-STEPS-PART 2/3` for each.
+#[cfg(test)]
+thread_local! {
+    /// A test's own: what fits in a run, in place of what the read's speed says, and the limit of a read again, to be stopped at.
+    static TEST_FITS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_ONCE_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// What a run of the browser takes before the page's time begins: its start, the page's load and its read (a plain page's run is 1.3 to 1.7 s here).
+const RUN_START: Duration = Duration::from_millis(1500);
+
+/// About how much of a page's time fits in a run of the browser with steps (within [`LIMIT`], a quarter of it to spare), at the speed a read of `wait` ms of it
+/// took `took`: a run's start, and then the page's time drawn as fast as it was in that read. In half-seconds, down.
+fn fits_in_a_run(took: Duration, wait: u64) -> u64 {
+    let drawing = took.saturating_sub(RUN_START).as_millis().max(1) as u64;
+    let room = (LIMIT * 3 / 4).saturating_sub(RUN_START).as_millis() as u64;
+    wait.saturating_mul(room) / drawing / 500 * 500
+}
+
 /// Whether the steps were still going when the page was read: none said they were done or failed, none began again with a reload, and they did not go to
 /// another page. A longer wait is what such steps may want.
 fn steps_not_ended(err: &str, folder_url: &str) -> bool {
@@ -405,6 +422,7 @@ fn steps_not_ended(err: &str, folder_url: &str) -> bool {
         && !began.iter().any(|part| began.iter().filter(|other| *other == part).count() > 1)
 }
 
+/// The numbers of the parts of the steps that began, in the order they did, from what the browser said: a line `DOGMIND-STEPS-PART 2/3` for each.
 fn parts_begun(err: &str) -> Vec<usize> {
     err.lines().filter_map(|line| line.split_once("DOGMIND-STEPS-PART ").and_then(|(_, rest)| rest.split('/').next()?.trim().parse().ok())).collect()
 }
@@ -1598,13 +1616,17 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // (how long the last run that read the page took, for what is said of a picture that took too long)
     let read_took = std::cell::Cell::new(Duration::ZERO);
     // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
-    let read_at = |run_wait: u64| -> Result<(String, String, bool, String, EndOfRun), String> {
+    // `once`: a read that is a chance and no more (steps read again at the longest wait): one run, and one that does not end well is no failure of the GPU's
+    // and is not tried again on the CPU. Counted as one, it turned every later check of a run to the CPU, where that page's runs were stopped at their limit.
+    let read_at = |run_wait: u64, once: bool| -> Result<(String, String, bool, String, EndOfRun), String> {
         // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
         let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
         let mut ended_as = EndOfRun::Stopped;
         let mut hangs = 0;
         // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
         let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
+        #[cfg(test)]
+        let limit = if once { TEST_ONCE_LIMIT.with(std::cell::Cell::get).unwrap_or(limit) } else { limit };
         let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
         let mut before = None;
         for _ in 0..TRIES {
@@ -1628,9 +1650,9 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let silent_hang = hung(&done) && !page_wrote_to_console(&err);
             hangs += usize::from(silent_hang);
             // (a crash or a hang on the GPU is tried again on the CPU, whatever else would end the tries)
-            let to_the_cpu = !finished && off_the_gpu(silent_hang || ended_as == EndOfRun::Crashed);
+            let to_the_cpu = !once && !finished && off_the_gpu(silent_hang || ended_as == EndOfRun::Crashed);
             let again = to_the_cpu || (silent_hang && tries_again_after_a_hang(hangs));
-            if finished || cancel.load(Ordering::Relaxed) || (trying.elapsed() > MOST_TRYING && !to_the_cpu) || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
+            if once || finished || cancel.load(Ordering::Relaxed) || (trying.elapsed() > MOST_TRYING && !to_the_cpu) || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
                 break;
             }
         }
@@ -1750,20 +1772,20 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // The read, with the pictures begun beside it. Its turn is taken first, so that the pictures do not take both before it; a slow read keeps it until the
         // pictures are done, and they go one at a time (`SLOW_READ`).
         let long_steps = steps.is_some() && wait > STEPS_AT_LENGTH;
-        let read_with_pictures = |wait: u64| {
+        let read_with_pictures = |wait: u64, once: bool| {
             // A single GPU-rendered view can take its picture alongside the read even for long steps.
             // Check again on a retry, since the first run may have switched to the CPU.
             let beside = !long_steps || (views.len() == 1 && on_gpu.load(Ordering::Relaxed));
             read_ms.store(u64::MAX, Ordering::Relaxed);
             let reading = slots.take(&never);
             let pictures = if beside { start(wait) } else { Vec::new() };
-            let read = read_at(run_wait_of(wait));
+            let read = read_at(run_wait_of(wait), once);
             read_ms.store(read_took.get().as_millis() as u64, Ordering::Relaxed);
             let kept = reading.filter(|_| !beside || read_took.get() > SLOW_READ);
             let pictures = if beside { pictures } else { start(wait) };
             (read, pictures, kept)
         };
-        let (read, mut pictures, mut kept) = read_with_pictures(wait);
+        let (read, mut pictures, mut kept) = read_with_pictures(wait, false);
         let (mut dom, mut err, mut finished, mut how, mut ended_as) = match read {
             Ok(read) => read,
             Err(error) => {
@@ -1787,7 +1809,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                 }
             }
             let read;
-            (read, pictures, kept) = read_with_pictures(wait);
+            (read, pictures, kept) = read_with_pictures(wait, false);
             (dom, err, finished, how, ended_as) = match read {
                 Ok(read) => read,
                 Err(error) => {
@@ -1802,28 +1824,33 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // Steps that had not ended when the page was read, at a wait below the longest a check gives, are read once more at the longest before the check
         // answers: a run of the browser, some seconds, where the model asked for a larger wait in a round of its own (40 to 80 s of a request) and checked
         // again, 42 times in 35 runs of the tasks that build a page. The pictures are of the read that is said.
+        // Only where the longest fits in a run of the browser, by the speed the read drew the page at: a page drawn on the CPU at a second of a run for each
+        // few hundred ms of its time was read again at the longest, stopped at the run's limit each time, and told to give a larger wait, which fits no better.
+        // The read again is one run, its pictures after it: one that does not end well is no failure of the GPU's and is not tried again on the CPU.
         let longest = MOST_WAIT_MS + parts.len().saturating_sub(1) as u64 * WAIT_MS;
-        let mut read_again = None;
-        if steps.is_some() && copy_name.is_some() && finished && wait < longest && steps_not_ended(&err, &base_url) && !cancel.load(Ordering::Relaxed) {
+        let (first_took, mut read_again, mut stopped_again) = (read_took.get(), None, false);
+        let fits = fits_in_a_run(first_took, wait);
+        #[cfg(test)]
+        let fits = TEST_FITS.with(std::cell::Cell::get).unwrap_or(fits);
+        if steps.is_some() && copy_name.is_some() && finished && wait < longest && fits >= longest && steps_not_ended(&err, &base_url) && !cancel.load(Ordering::Relaxed) {
             let asked = wait;
             ended(std::mem::take(&mut pictures), true);
             drop(kept.take());
             stop.store(false, Ordering::Relaxed);
-            let (again, again_pictures, again_kept) = read_with_pictures(longest);
+            let reading = slots.take(&never);
+            let again = read_at(run_wait_of(longest), true);
+            drop(reading);
             match again {
                 Ok(read) if read.2 => {
                     (dom, err, finished, how, ended_as) = read;
-                    (pictures, kept, wait) = (again_pictures, again_kept, longest);
+                    wait = longest;
                     read_again = Some(asked);
                 }
-                // (a read at the longest that did not end as a read does is no better: the first is said, and its pictures taken again)
-                _ => {
-                    ended(again_pictures, true);
-                    drop(again_kept);
-                    stop.store(false, Ordering::Relaxed);
-                    pictures = start(asked);
-                }
+                // (a read at the longest that did not end as a read does is no better: the first is said, and its pictures taken)
+                _ => stopped_again = true,
             }
+            stop.store(false, Ordering::Relaxed);
+            pictures = start(wait);
         }
         let mut console = console_lines(&err, &base_url);
         let (mut steps_said, mut steps_lost) = (String::new(), None);
@@ -1851,6 +1878,16 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                     (false, None, None) if wait >= longest => format!(
                         "Steps: they had not ended when the page was read, after {wait} ms of its time{}, the longest a check gives. A check gives no longer. Leave the page's own timings as they are: a page sped up for a check is not the page that was asked for. Check a part of the steps at a time (what the page shows before their end, then the rest from a state they can reach sooner), and say what was not checked.\n",
                         read_again.map_or(String::new(), |asked| format!(" (read again at it, as at the {asked} ms asked for they had not ended either)"))),
+                    // (a longer wait that does not fit a run here is no way: what does is said, by the speed the read was drawn at)
+                    (false, None, None) if stopped_again || fits < longest => {
+                        let drawn = if webgl { format!(", WebGL drawn {}", drawn_on(on_gpu.load(Ordering::Relaxed))) } else { String::new() };
+                        let fit = if stopped_again {
+                            format!("read again at {longest} ms, its run was stopped at the {} s a run of the browser may take", LIMIT.as_secs())
+                        } else {
+                            format!("its read took {:.1} s for these {wait} ms{drawn}, and about {fits} ms of its time fit in one", first_took.as_secs_f64())
+                        };
+                        format!("Steps: they had not ended when the page was read, after {wait} ms of its time. A longer wait does not fit in a run of the browser here ({fit}). Leave the page's own timings as they are: check a part of the steps at a time (what the page shows before their end, then the rest from a state they can reach sooner), and say what was not checked.\n")
+                    }
                     (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
                 };
                 let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
@@ -3244,6 +3281,49 @@ mod tests {
         println!("{said}");
         assert!(said.contains("the longest a check gives") && said.contains("read again at it") && said.contains("Leave the page's own timings as they are"), "{said}");
         assert!(!said.contains("give a larger wait_ms") && !said.contains("shorten the waits"), "{said}");
+    }
+
+    /// Steps whose longest does not fit in a run (a page drawn slowly on the CPU) are not read again, and what fits is said in place of a larger wait. A read
+    /// again that is stopped at its limit is said as that, is not tried again on the CPU, and is no failure of the GPU's: counted as one, it sent every later
+    /// check of a run to the CPU.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn steps_that_do_not_fit_a_run_are_not_read_again_and_a_read_again_stopped_is_no_failure_of_the_gpus() {
+        let data = crate::in_container::tempdir().unwrap();
+        crate::workspace_grants::use_test_folder(data.path());
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>slow</title><button id=go>go</button><canvas id=c></canvas><script>document.getElementById('c').getContext('webgl')</script>")]);
+        let steps = serde_json::json!({"path": "index.html", "steps": "await click('#go'); await wait(4000); console.log('after the wait');", "views": ["mobile"], "wait_ms": 2000});
+        TEST_FITS.with(|fits| fits.set(Some(3500)));
+        let started = std::time::Instant::now();
+        let said = check_page(&steps, dir.path(), &AtomicBool::new(false)).unwrap();
+        TEST_FITS.with(|fits| fits.set(None));
+        println!("{said}
+({:?})", started.elapsed());
+        assert!(said.contains("A longer wait does not fit in a run of the browser here") && said.contains("about 3500 ms of its time fit in one") && said.contains("WebGL drawn"), "{said}");
+        assert!(!said.contains("give a larger wait_ms") && !said.contains("read again at"), "{said}");
+        assert!(said.contains("How it looks at mobile"), "{said}");
+        // (the read again, stopped at once: said as that, not tried again on the CPU, and drawn on the GPU after it)
+        let _ = take_runs();
+        TEST_ONCE_LIMIT.with(|limit| limit.set(Some(Duration::from_millis(300))));
+        let said = check_page(&steps, dir.path(), &AtomicBool::new(false)).unwrap();
+        TEST_ONCE_LIMIT.with(|limit| limit.set(None));
+        println!("{said}");
+        assert!(said.contains("read again at 10000 ms, its run was stopped at the 20 s a run of the browser may take") && !said.contains("give a larger wait_ms"), "{said}");
+        let reads: Vec<String> = take_runs().into_iter().filter(|run| run.of == "page").map(|run| run.end).collect();
+        assert_eq!(reads.len(), 2, "the read, and the read again with no other try after it: {reads:?}");
+        assert!(reads[0] == "exit code 0x0" && reads[1] != "exit code 0x0", "{reads:?}");
+        assert!(said.contains("How it looks at mobile") && said.contains("on this machine's GPU"), "the picture after it on the GPU still: {said}");
+    }
+
+    /// How much of a page's time fits in a run, by the speed of a read: a run's start is not of the page's time.
+    #[test]
+    fn what_fits_in_a_run_is_told_by_the_speed_of_the_read() {
+        // (a WebGL page on the GPU: 3.5 s for 7000 ms of its time, so the longest fits)
+        assert!(fits_in_a_run(Duration::from_millis(3500), 7000) >= MOST_WAIT_MS);
+        // (drawn on the CPU: 5 s for 1000 ms, so some 3.5 s of its time fit and the longest does not)
+        assert_eq!(fits_in_a_run(Duration::from_millis(5000), 1000), 3500);
+        // (a read no longer than a run's start is as fast as can be told: anything fits)
+        assert!(fits_in_a_run(Duration::from_millis(1200), 2000) > 100 * MOST_WAIT_MS);
     }
 
     /// With the real browser, in the real sandbox: steps that reload the page are run in parts, one in each load. What the first part put in the page's storage is there for the
