@@ -46,7 +46,7 @@ Keys are kept in Windows' Credential Manager, never in the settings file.
 
 ## Safety
 
-- Commands run in a sandbox (an AppContainer): they can write only to the workspace, and reach the network only when you allow it (save the bundled guidance CLI, see Privacy).
+- Commands run in a sandbox (an AppContainer): they can write only to the workspace, and reach the network only when you allow it (except the bundled guidance CLI, see Privacy).
 - Edits and commands ask first, as the mode says. Once web content is in a conversation, what it may have asked for is asked every time.
 - Conversations can be encrypted in *Settings > Privacy* (off by default).
 
@@ -59,14 +59,12 @@ Dogmind sends no conversation or file to its developers, and it has no telemetry
 - **Web search and reading (on by default).** Search words go to DuckDuckGo (then Bing, or Brave with a Brave key), and a page read
   comes from its site. Turn it off with *Web search and reading* in the settings.
 - **Update checks (on by default).** Every six hours the app asks GitHub for a new version, sending only its own version; updates and
-  the engine are downloaded from GitHub too. *Update automatically* in *Settings > About* stops them.
+  the engine are downloaded from GitHub too. *Update automatically* (the app) and *Update bundled Straydog automatically* (the engine) in *Settings > About* stop them.
 - **Getting a model for this PC.** The engine downloads it from Hugging Face.
-- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs.
+- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs, even with web search and reading off.
 - **The bundled guidance CLI.** The CLI that looks up web-building guidance fetches its package from the npm registry the first
   time it is used (without asking).
 - **MCP servers you add, and commands you allow the network.**
-
-Problem reports are not sent by themselves either.
 
 ## Updating and removing
 
