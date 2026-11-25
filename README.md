@@ -46,7 +46,7 @@ Keys are kept in Windows' Credential Manager, never in the settings file.
 
 ## Safety
 
-- Commands run in a sandbox (an AppContainer): they can write only to the workspace, and reach the network only when you allow it.
+- Commands run in a sandbox (an AppContainer): they can write only to the workspace, and reach the network only when you allow it (save the bundled guidance CLI, see Privacy).
 - Edits and commands ask first, as the mode says. Once web content is in a conversation, what it may have asked for is asked every time.
 - Conversations can be encrypted in *Settings > Privacy* (off by default).
 
@@ -62,6 +62,8 @@ Dogmind sends no conversation or file to its developers, and it has no telemetry
   the engine are downloaded from GitHub too. *Update automatically* in *Settings > About* stops them.
 - **Getting a model for this PC.** The engine downloads it from Hugging Face.
 - **Page checks.** The libraries a checked page uses are fetched from well-known CDNs.
+- **The bundled guidance CLI.** The CLI that looks up web-building guidance fetches its package from the npm registry the first
+  time it is used (without asking).
 - **MCP servers you add, and commands you allow the network.**
 
 Problem reports are not sent by themselves either.
