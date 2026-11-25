@@ -735,7 +735,7 @@ pub(crate) fn written_whole(root: &Path, path: &Path, bytes: &[u8], exists: bool
     let new = written_beside(path);
     crate::held_way::write_new(way.as_ref(), &new, |out| std::io::Write::write_all(out, bytes))?;
     crate::held_way::into_place(&new, path, exists).inspect_err(|_| {
-        let _ = std::fs::remove_file(&new);
+        let _ = crate::held_way::remove(way.as_ref(), &new);
     })
 }
 
@@ -748,8 +748,8 @@ pub(crate) fn write_all_or_none(root: &Path, files: &[(&Path, &[u8], Vec<u8>)]) 
         .collect::<Result<Vec<_>, String>>()?;
     let beside: Vec<PathBuf> = files.iter().map(|(path, _, _)| written_beside(path)).collect();
     let forget = |from: usize| {
-        for new in &beside[from..] {
-            let _ = std::fs::remove_file(new);
+        for (new, way) in beside[from..].iter().zip(&ways[from..]) {
+            let _ = crate::held_way::remove(way.as_ref(), new);
         }
     };
     for (at, (path, _, after)) in files.iter().enumerate() {
@@ -771,7 +771,7 @@ pub(crate) fn write_all_or_none(root: &Path, files: &[(&Path, &[u8], Vec<u8>)]) 
                     let put = crate::held_way::write_new(way.as_ref(), &back, |out| std::io::Write::write_all(out, before))
                         .and_then(|()| crate::held_way::into_place(&back, done, true));
                     if put.is_err() {
-                        let _ = std::fs::remove_file(&back);
+                        let _ = crate::held_way::remove(way.as_ref(), &back);
                     }
                     put.is_err()
                 })
@@ -3985,6 +3985,18 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         // file of the app's in it, as an empty one can be: see `held_way`)
         let way = crate::held_way::hold(&resolve(workspace, "."), &cwd, false).map_err(|error| format!("{error}. The command was not started"))?;
         let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| format!("{error}. The command was not started"))?;
+        // (and the `.git` it makes, made and held by the app first and kept full the same way: one a command made a link to a place outside, or left as a file
+        // that names one, would have had git write the repository's files there as the person; git_init_first lets it make no other)
+        let git = cwd.join(".git");
+        if std::fs::symlink_metadata(&git).is_ok_and(|found| found.file_type().is_symlink() || !found.is_dir()) {
+            return Err(format!("{}: it is a link or a file, and git would write through it as the user, so `git init` was not run. The command was not started", git.display()));
+        }
+        let git_way = if way.is_some() {
+            crate::held_way::hold(&resolve(workspace, "."), &git, true).map_err(|error| format!("{error}. The command was not started"))?
+        } else {
+            None
+        };
+        let _git_kept = crate::held_way::kept_full(git_way.as_ref()).map_err(|error| format!("{error}. The command was not started"))?;
         let mut command = Command::new(crate::bundled::git_program());
         command.args(["init", "--template="]).args(words).current_dir(&cwd).stdin(Stdio::null());
         no_window(&mut command);
@@ -4657,6 +4669,40 @@ mod change_tests {
         assert!(!outside.path().join(".git").exists(), "no .git outside");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         assert!(swaps > 0 && made > 0, "{swaps} swaps, {made} made");
+    }
+
+    /// The `.git` a leading `git init` makes: one a command made a junction to a folder outside beforehand refuses it, and nothing is made there; while a loop
+    /// swaps it for one and back, git init makes it in the workspace or is refused, many times, and never outside; with none there, it is made as ever, and
+    /// nothing of the app's is left in it.
+    #[test]
+    fn git_init_makes_its_git_folder_only_in_the_workspace() {
+        let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let init = || execute_command(&json!({"command": "git init", "cwd": "sub"}), dir.path(), &AtomicBool::new(false), None);
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(sub.join(".git")).arg(outside.path()).output().unwrap();
+        assert!(made.status.success());
+        let refused = init().err().unwrap_or_default();
+        assert!(refused.contains("was not started"), "{refused}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing made outside");
+        std::fs::remove_dir(sub.join(".git")).unwrap();
+        // (the loop sets `.git` aside, puts a junction to the folder outside in its place, and puts it back)
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        let swapping = crate::held_way::swapping::Swapping::start(&sub.join(".git"), outside.path(), |_| {});
+        let mut ran = 0;
+        for _ in 0..30 {
+            ran += usize::from(init().is_ok_and(|said| said.contains("exit_code: 0")));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing made outside while it was swapped");
+        assert!(swaps > 0 && ran > 0, "{swaps} swaps, {ran} ran");
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let said = execute_command(&json!({"command": "git init", "cwd": "fresh"}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(said.contains("exit_code: 0") && fresh.join(".git").join("HEAD").is_file(), "{said}");
+        let left: Vec<_> = std::fs::read_dir(fresh.join(".git")).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with(crate::held_way::KEPT_MARK)).collect();
+        assert!(left.is_empty(), "the app's file is gone: {left:?}");
     }
 
     /// While a loop swaps `.pydeps` for a junction to a repository of the person's and back, the ignore file the app writes there lands in the workspace

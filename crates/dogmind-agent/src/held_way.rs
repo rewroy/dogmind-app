@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 /// What is said where a place is in the workspace where it really is, but not as it is written.
 pub(crate) const NOT_AS_WRITTEN: &str = "it is in the workspace where it really is, but not as it is written (a link on the way, or the workspace named in two ways), so nothing was written there: write it by its path in the workspace";
 
+/// What is said where it cannot be told whether a place is in the workspace.
+pub(crate) const CANNOT_TELL: &str = "where it really is, and so whether it is in the workspace, cannot be told, so nothing was written there";
+
 /// What is said where a folder on the way is not as it should be.
 pub(crate) const ON_THE_WAY: &str = "a folder on the way to it is a link or a junction, or is not where it was (a command can make one), so nothing was written there";
 
@@ -47,8 +50,11 @@ fn below(root: &Path, folder: &Path) -> Option<Vec<std::ffi::OsString>> {
 /// would otherwise be written with nothing held.
 pub(crate) fn hold(root: &Path, folder: &Path, make: bool) -> Result<Option<Way>, String> {
     let Some(parts) = below(root, folder).or_else(|| below(&long_names(root), &long_names(folder))) else {
-        if crate::safety::real_path(root).zip(crate::safety::real_path(folder)).is_some_and(|(root, real)| crate::safety::inside(&root, &real)) {
-            return Err(format!("{}: {NOT_AS_WRITTEN}", folder.display()));
+        // (written with nothing held only where it is outside the workspace where both really are: what cannot be told is not written)
+        match (crate::safety::real_path(root), crate::safety::real_path(folder)) {
+            (Some(root), Some(real)) if !crate::safety::inside(&root, &real) => {}
+            (Some(_), Some(_)) => return Err(format!("{}: {NOT_AS_WRITTEN}", folder.display())),
+            _ => return Err(format!("{}: {CANNOT_TELL}", folder.display())),
         }
         if make {
             std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
@@ -124,7 +130,7 @@ pub(crate) fn write_new(way: Option<&Way>, new: &Path, fill: impl FnOnce(&mut st
     #[cfg(windows)]
     if let Some(way) = way {
         if !windows::placed(&file, &way.real) {
-            windows::delete(&file);
+            let _ = windows::delete(&file);
             return Err(std::io::Error::other(format!("{}: {ON_THE_WAY}", new.display())));
         }
     }
@@ -134,11 +140,27 @@ pub(crate) fn write_new(way: Option<&Way>, new: &Path, fill: impl FnOnce(&mut st
     if filled.is_err() {
         // (what was written of it goes: a full disk, or a copy that would not read)
         #[cfg(windows)]
-        windows::delete(&file);
+        let _ = windows::delete(&file);
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(new);
     }
     filled
+}
+
+/// `path`, a file right in the folder `way` holds, deleted by a handle on it, which says that it is a plain file there as the file system has it: by its name
+/// alone, the folder could have been made a mount point since it was held (an empty one can be), and a file of the same name wherever it led would go.
+pub(crate) fn remove(way: Option<&Way>, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let Some(way) = way {
+        let file = windows::open_to_delete(path)?;
+        if !windows::plain_file(&file) || !windows::placed(&file, &way.real) {
+            return Err(std::io::Error::other(format!("{}: {ON_THE_WAY}", path.display())));
+        }
+        return windows::delete(&file);
+    }
+    #[cfg(not(windows))]
+    let _ = way;
+    std::fs::remove_file(path)
 }
 
 /// A file of the app's in the folder `way` holds, there for as long as this lasts and deleted after: a folder with something in it cannot be made a
@@ -176,7 +198,7 @@ pub(crate) fn kept_full(way: Option<&Way>) -> std::io::Result<Kept> {
             made => made?,
         };
         if !windows::placed(&file, &way.real) {
-            windows::delete(&file);
+            let _ = windows::delete(&file);
             return Err(std::io::Error::other(format!("{}: {ON_THE_WAY}", mark.display())));
         }
         Ok(Kept { file: Some(file), name: Some(name) })
@@ -192,7 +214,7 @@ impl Drop for Kept {
     fn drop(&mut self) {
         #[cfg(windows)]
         if let Some(file) = self.file.take() {
-            windows::delete(&file);
+            let _ = windows::delete(&file);
         }
     }
 }
@@ -252,7 +274,7 @@ mod windows {
             Some(real) if folder && placed => Ok((handle, real)),
             _ => {
                 if made {
-                    delete(&handle);
+                    let _ = delete(&handle);
                 }
                 Err(format!("{}: {ON_THE_WAY}", named.display()))
             }
@@ -283,13 +305,21 @@ mod windows {
 
     /// What an end that came before left at `new`, taken away where it is a plain file in the folder held.
     pub(super) fn take_away_left(way: Option<&super::Way>, new: &Path) -> std::io::Result<()> {
-        let left = std::fs::OpenOptions::new().access_mode(DELETE | FILE_READ_ATTRIBUTES).share_mode(0).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(new)?;
-        let plain = attributes(&left).is_some_and(|found| found & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) == 0);
-        if !plain || way.is_some_and(|way| !placed(&left, &way.real)) {
+        let left = open_to_delete(new)?;
+        if !plain_file(&left) || way.is_some_and(|way| !placed(&left, &way.real)) {
             return Err(std::io::Error::other(format!("{}: {ON_THE_WAY}", new.display())));
         }
-        delete(&left);
-        Ok(())
+        delete(&left)
+    }
+
+    /// A file opened to be deleted by its handle: a link at the name is not opened through.
+    pub(super) fn open_to_delete(path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new().access_mode(DELETE | FILE_READ_ATTRIBUTES).share_mode(7).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+    }
+
+    /// Whether what a handle is of is a plain file: no folder, link or junction.
+    pub(super) fn plain_file(handle: &impl AsRawHandle) -> bool {
+        attributes(handle).is_some_and(|found| found & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) == 0)
     }
 
     /// Whether what a handle is of lies right in `folder`, as the file system has it.
@@ -298,12 +328,13 @@ mod windows {
     }
 
     /// What a handle is of, deleted as its handle closes (an empty folder, or a file).
-    pub(super) fn delete(handle: &impl AsRawHandle) {
+    pub(super) fn delete(handle: &impl AsRawHandle) -> std::io::Result<()> {
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
         // SAFETY: the struct lives through the call, which is told its size.
-        unsafe {
-            SetFileInformationByHandle(handle.as_raw_handle() as HANDLE, FileDispositionInfo, (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32);
-        }
+        let done = unsafe {
+            SetFileInformationByHandle(handle.as_raw_handle() as HANDLE, FileDispositionInfo, (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32)
+        };
+        if done == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
     }
 
     fn attributes(handle: &impl AsRawHandle) -> Option<u32> {
@@ -497,6 +528,51 @@ mod tests {
         assert!(refused.contains(NOT_AS_WRITTEN), "{refused}");
         std::fs::remove_dir(&named_root).unwrap();
         std::fs::remove_dir(long.join("sub")).unwrap();
+    }
+
+    /// A file removed in a folder held, where the folder has been emptied and made a mount point to a folder outside since it was held (as an empty one can
+    /// be): the file of the same name there is not deleted, and the removal says so. A plain one there is deleted.
+    #[test]
+    fn a_file_is_removed_only_right_in_the_folder_held() {
+        let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.txt"), "mine").unwrap();
+        let way = hold(root, &sub, false).unwrap().unwrap();
+        remove(Some(&way), &sub.join("x.txt")).unwrap();
+        assert!(!sub.join("x.txt").exists(), "a plain one is deleted");
+        std::fs::write(outside.path().join("x.txt"), "theirs").unwrap();
+        assert!(swapping::mount_point(&sub, outside.path()), "the held folder, empty, made a mount point");
+        let refused = remove(Some(&way), &sub.join("x.txt")).err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(refused.contains(ON_THE_WAY), "{refused}");
+        assert_eq!(std::fs::read_to_string(outside.path().join("x.txt")).unwrap(), "theirs");
+        drop(way);
+        std::fs::remove_dir(&sub).unwrap();
+    }
+
+    /// While a loop swaps a folder for a junction to one outside, where the person has a file of the same name, a file of the workspace's there is written
+    /// and removed many times: the person's file stays.
+    #[test]
+    fn while_a_folder_is_swapped_for_a_junction_nothing_outside_is_removed() {
+        let (dir, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(outside.path().join("x.txt"), "theirs").unwrap();
+        let swapping = swapping::Swapping::start(&sub, outside.path(), |_| {});
+        let mut removed = 0;
+        for _ in 0..60 {
+            let file = sub.join("x.txt");
+            let _ = crate::tools::written_whole(&root, &file, b"mine", false);
+            if let Ok(way) = hold(&root, &sub, false) {
+                removed += usize::from(remove(way.as_ref(), &file).is_ok());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert_eq!(std::fs::read_to_string(outside.path().join("x.txt")).unwrap(), "theirs");
+        assert!(swaps > 0 && removed > 0, "{swaps} swaps, {removed} removed");
     }
 
     /// A loop in the background puts a junction to a folder outside in the place of a folder of the workspace, and the folder back, over and over, as a

@@ -1371,6 +1371,12 @@ fn refuse_links(paths: &[&Path]) -> Result<(), String> {
     paths.iter().find(|path| is_link(path)).map_or(Ok(()), |link| Err(link_refusal(link)))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test: what a command does between the look for links in a repository and its lists being written.
+    static AFTER_THE_LOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What a command must not change in a repository: a hook, or a line of config, runs outside the sandbox the next time a person or this app uses git there. Looked at before each
 /// command, as the person's own git writes `config` anew, inheriting. Commits, branches and the rest go on as they do. The folder itself cannot be deleted or renamed by the
 /// container either, or a command could put another in its place. What a command makes of a repository it has just created is not seen until the next command starts.
@@ -1379,9 +1385,20 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
     // A link is not gone through: an ACE would land on whatever it leads to, the person's own `config` or `hooks` anywhere, and that would be opened to commands.
     refuse_links(&[git, &git.join("config"), &git.join("hooks")])?;
     // A worktree's or a submodule's: one line, which says where git's folder is. A command that rewrites it has a repository of its own making, hooks and all.
+    // (its folder held, so that the list is written where the file was looked at: see `held_way`)
     if !what.is_dir() {
+        let _way = crate::held_way::hold(root, git.parent().unwrap_or(root), false)?;
         return limit_to(root, git, sid, &[(READ_EXECUTE, 0)], Walk::No);
     }
+    // (the git folder and its hooks held, and each kept from being made a mount point, from here to the last list written: by their names alone, a
+    // command could put a junction to another repository of the person's in their place after the look for links, and its lists would be written)
+    let way = crate::held_way::hold(root, git, false)?;
+    let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
+    let hooks = git.join("hooks");
+    let hooks_way = if hooks.is_dir() { crate::held_way::hold(root, &hooks, false)? } else { None };
+    let _hooks_kept = crate::held_way::kept_full(hooks_way.as_ref()).map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    AFTER_THE_LOOK.with(|between| if let Some(between) = between.borrow().as_ref() { between() });
     // In a repository's own `.git` this has no business: only a worktree's folder under `worktrees` has one. It tells git to read its config and hooks from wherever it says, past all of this.
     // Taken away before each command: the folder has to stay open for git's own new files, so nothing can stop it being made.
     let elsewhere = git.join("commondir");
@@ -1806,6 +1823,12 @@ unsafe fn guard_with_what_it_leads_to(root: &Path, git: &Path, sid: PSID) -> Res
                 common_folder_of(&folder, root)?;
             } else {
                 refuse_links(&[&folder, &folder.join("config"), &folder.join("hooks")])?;
+                // (held as a repository's own git folder is: see `guard_repository`)
+                let way = crate::held_way::hold(root, &folder, false)?;
+                let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
+                let hooks = folder.join("hooks");
+                let hooks_way = if hooks.is_dir() { crate::held_way::hold(root, &hooks, false)? } else { None };
+                let _hooks_kept = crate::held_way::kept_full(hooks_way.as_ref()).map_err(|error| error.to_string())?;
                 let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
                 limit_to(root, &folder.join("config"), sid, &[(READ_EXECUTE, 0)], Walk::No)?;
                 limit_to(root, &folder.join("hooks"), sid, &[(READ_EXECUTE, everything)], Walk::Yes)?;
@@ -4361,6 +4384,74 @@ mod tests {
         for made_at in [&junction, &into_work, &link, &to_documents, &documents_in_work, &to_keys, &keys_in_work, &to_home] {
             let _ = std::fs::remove_dir(made_at);
         }
+    }
+
+    /// A command that puts a junction to a repository of the person's in the place of a repository's `.git` just after the app has looked for links there
+    /// cannot: the folder is held, and the person's lists are as they were.
+    #[test]
+    fn a_git_folder_cannot_be_swapped_between_the_look_and_the_lists() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        let their_git = theirs.path().join(".git");
+        for place in [git.clone(), their_git.clone()] {
+            std::fs::create_dir_all(place.join("hooks")).unwrap();
+            std::fs::write(place.join("config"), "[core]
+	bare = false
+").unwrap();
+        }
+        let lists = || (dacl_text(&their_git).unwrap(), dacl_text(&their_git.join("config")).unwrap(), dacl_text(&their_git.join("hooks")).unwrap());
+        let before = lists();
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let (git, their_git, swapped) = (git.clone(), their_git.clone(), swapped.clone());
+            AFTER_THE_LOOK.with(|between| *between.borrow_mut() = Some(Box::new(move || {
+                if std::fs::rename(&git, git.with_file_name("aside")).is_ok() {
+                    swapped.set(crate::held_way::swapping::mount_point(&{ std::fs::create_dir(&git).unwrap(); git.clone() }, &their_git));
+                }
+            })));
+        }
+        // SAFETY: the profile's SID lives as long as the process.
+        let guarded = unsafe { guard_repository(&root, &git, profile_sid().unwrap()) };
+        AFTER_THE_LOOK.with(|between| *between.borrow_mut() = None);
+        assert!(!swapped.get(), "the held folder could not be set aside");
+        assert!(guarded.is_ok(), "{guarded:?}");
+        assert!(lists() == before, "the person's lists are as they were");
+    }
+
+    /// While a loop swaps a repository's `.git` for a junction to a repository of the person's outside and back, the app guards it many times: the lists of
+    /// the person's config and hooks are as they were.
+    #[test]
+    fn while_a_git_folder_is_swapped_for_a_junction_the_persons_lists_are_not_changed() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        for place in [git.clone(), theirs.path().join(".git")] {
+            std::fs::create_dir_all(place.join("hooks")).unwrap();
+            std::fs::write(place.join("config"), "[core]\n\tbare = false\n").unwrap();
+            std::fs::write(place.join("hooks").join("pre-commit.sample"), "sample").unwrap();
+        }
+        let their_git = theirs.path().join(".git");
+        let lists = || (dacl_text(&their_git).unwrap(), dacl_text(&their_git.join("config")).unwrap(), dacl_text(&their_git.join("hooks")).unwrap());
+        let before = lists();
+        // SAFETY: the profile's SID lives as long as the process.
+        let sid = unsafe { profile_sid() }.unwrap();
+        let swapping = crate::held_way::swapping::Swapping::start(&git, &their_git, |_| {});
+        let mut guarded = 0;
+        for _ in 0..60 {
+            // SAFETY: as above.
+            guarded += usize::from(unsafe { guard_repository(&root, &git, sid) }.is_ok());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert!(lists() == before, "the person's lists are as they were");
+        assert!(swaps > 0 && guarded > 0, "{swaps} swaps, {guarded} guarded");
     }
 
     /// Folders put where the app's file used to go (its name was the app's process id) do not stop a new repository being disarmed: its name is not known

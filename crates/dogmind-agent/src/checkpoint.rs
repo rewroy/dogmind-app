@@ -223,7 +223,7 @@ pub(crate) fn put_back(root: &Path, copy: &Path, path: &Path) -> std::io::Result
     // (on the disk before it takes the place: a power cut just after would otherwise leave the person's file as zeros)
     crate::held_way::write_new(way.as_ref(), &beside, |out| std::io::copy(&mut std::fs::File::open(copy)?, out).map(|_| ()))?;
     crate::held_way::into_place(&beside, path, path.exists()).inspect_err(|_| {
-        let _ = std::fs::remove_file(&beside);
+        let _ = crate::held_way::remove(way.as_ref(), &beside);
     })
 }
 
@@ -625,7 +625,7 @@ impl Checkpoints {
                 None if std::fs::symlink_metadata(&saved.path).is_err() => {}
                 None => match crate::held_way::hold(workspace, saved.path.parent().unwrap_or(workspace), false) {
                     Err(error) => restored.failed.push(error),
-                    Ok(_way) => match std::fs::remove_file(&saved.path) {
+                    Ok(way) => match crate::held_way::remove(way.as_ref(), &saved.path) {
                         Ok(()) => restored.removed.push(saved.path.clone()),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => restored.failed.push(format!("{}: {error}", saved.path.display())),
