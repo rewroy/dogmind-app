@@ -298,7 +298,7 @@ pub const TOOLS_ADDED: &str = "## Tools Added";
 
 /// What one MCP server's tools may take to be told of in full at a time, in characters (some 8,000 tokens). Past it they are told by name and a line, and
 /// `describe_tools` gives the rest of one when it is used: a game editor's server, its 196 tools told in full twice over, put 44,000 tokens in one message,
-/// and the Homelab's DeepSeek took 28 seconds to its first token.
+/// and a served DeepSeek took 28 seconds to its first token.
 pub const SERVER_TOOLS_BUDGET: usize = 24_000;
 
 /// The tool that gives what a tool told by name only is, and its arguments.
@@ -679,7 +679,7 @@ pub const SUGGESTION_NOTICE: &str = "Read as a suggestion: no files will be chan
 /// The phrase of a suggestion put as a question, if what the person typed is one and asks for nothing to be done: 「〜したほうがよくない?」, 「〜はどう?」, 「〜したらどうかな」,
 /// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted. A て or
 /// で that asks ends its clause (。, !, a space, the end): one with a comma after it is as often a particle (「ログ画面で、…したほうがよくない?」).
-/// (Told in the system prompt that such a suggestion is a question, the Homelab's DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
+/// (Told in the system prompt that such a suggestion is a question, a served DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
 /// のだから、キャッシュヒット率も表示したほうがよくないかなあ。」, where the owner had answered it by asking for it themselves.)
 pub fn suggestion_phrase(text: &str) -> Option<String> {
     static RULES: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();

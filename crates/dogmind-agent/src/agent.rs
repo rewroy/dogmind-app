@@ -50,7 +50,7 @@ const RESTART_SILENCE: Duration = Duration::from_secs(90);
 /// How often it is asked.
 const RESTART_ASK_EVERY: Duration = Duration::from_secs(1);
 /// How long in a turn a server that answered in this conversation may refuse, or answer nothing, with the request kept, before it is taken for gone: a restart that
-/// never says it is loading (the process stopped and started again; the Homelab's DeepSeek refused for 1 to 2 minutes so, and a turn failed in 24 s of retries), not a
+/// never says it is loading (the process stopped and started again; a served DeepSeek refused for 1 to 2 minutes so, and a turn failed in 24 s of retries), not a
 /// stop of many minutes, which is said as before.
 const QUIET_RESTART_WAIT: Duration = Duration::from_secs(180);
 
@@ -1443,7 +1443,7 @@ fn one_shape_for_edits(calls: &[crate::message::ToolCall]) -> Vec<crate::message
         let Ok(mut arguments) = serde_json::from_str::<Value>(&call.function.arguments) else { continue };
         let Some(all) = arguments.as_object_mut() else { continue };
         let mut changed = false;
-        // (the list given as its text, in a string: the Homelab's DeepSeek sent 13 edits so, 4,126 characters, and the 68 s it took to write them went for nothing)
+        // (the list given as its text, in a string: a served DeepSeek sent 13 edits so, 4,126 characters, and the 68 s it took to write them went for nothing)
         if let Some(list) = all.get("edits").and_then(Value::as_str).and_then(list_of_text) {
             all.insert("edits".to_string(), list);
             changed = true;
@@ -2281,7 +2281,7 @@ impl Agent {
 
     /// The tools of MCP servers that are new to the conversation: one the person added or changed in Settings, one slow to start, or one a server listed
     /// as it said its tools changed. The tools it is offered are the start of what the engine keeps of it, and a change there has the engine read the whole
-    /// conversation again (most of 2 minutes at 100K tokens on the Homelab's DeepSeek): they stay as they were, and the new ones are told of where the
+    /// conversation again (most of 2 minutes at 100K tokens on a served DeepSeek): they stay as they were, and the new ones are told of where the
     /// conversation is, callable as the others are, directly and from a program. What to tell, if there are any. A tool whose server has gone stays
     /// callable, and a call to it says so.
     fn servers_caught_up(&mut self) -> Option<String> {
@@ -3499,7 +3499,7 @@ impl Agent {
                 unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
                 unchecked_code = unchecked_files(unchecked_code, &[calls.as_slice(), nested.as_slice()].concat());
                 // (only once it has looked at the page as it is now: what it is told is to go through what was asked against that picture; a model that cannot be shown
-                // one goes by what the checks printed, and is told at the same point, or it never was: a lottery turn of the Homelab's DeepSeek, which reads no
+                // one goes by what the checks printed, and is told at the same point, or it never was: a lottery turn of a served DeepSeek, which reads no
                 // pictures, went on through 24 checks to its 30 minutes)
                 let pictures = self.sees_pictures();
                 if !self.polish.told && polish_due(&self.polish, pictures) {
@@ -3536,7 +3536,7 @@ impl Agent {
                 continue;
             }
             // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
-            // last 4,761 characters ended a turn so on the Homelab's DeepSeek, its page unable to run.)
+            // last 4,761 characters ended a turn so on a served DeepSeek, its page unable to run.)
             if !cut_as_text_told && prompt::mostly_code(&completion.content) {
                 if let Some(path) = self.bench.cut_file().map(|path| path_for_trajectory(&path.to_string_lossy(), &self.workspace)) {
                     cut_as_text_told = true;
@@ -7530,7 +7530,7 @@ note: the helper took")), "{log:?}");
         assert!(matches!(gate.check("apply_patch", &made, Path::new("C:\\work")), crate::safety::Verdict::Ask { risk: crate::safety::Risk::High, .. }), "and what it would write outside is seen in this shape too");
     }
 
-    /// The list of edits given as its text in a string, as the Homelab's DeepSeek sent it (the call's arguments as they came, 13 edits in 4,126 characters, five line
+    /// The list of edits given as its text in a string, as a served DeepSeek sent it (the call's arguments as they came, 13 edits in 4,126 characters, five line
     /// breaks typed inside its strings): the gate and the tool see the list, and the conversation keeps what the model wrote.
     #[test]
     fn edits_given_as_the_text_of_a_list_are_taken_as_the_list() {
@@ -9073,7 +9073,7 @@ Body").unwrap();
         (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), stopped, resume)
     }
 
-    /// The Homelab's DeepSeek, stopped and started again between two messages: nothing listened for a while, and the turn failed in 24 s of retries. A server that answered
+    /// A served DeepSeek, stopped and started again between two messages: nothing listened for a while, and the turn failed in 24 s of retries. A server that answered
     /// in this conversation and then refuses is waited for now, with the request kept and the wait shown, and the request goes when it listens again.
     #[test]
     fn a_server_that_answered_and_then_refuses_is_waited_for_and_the_request_goes_when_it_listens_again() {
@@ -9208,7 +9208,7 @@ Body").unwrap();
 
     const LOADING: &str = r#"{"status": "loading", "progress": {"stage": "load", "done": 1, "total": 4}}"#;
 
-    /// The Homelab at 23:46: the engine restarted while a run went on, and the next request failed in 35 s of retries, less than a load. Now the request is kept while `/health` says loading, goes
+    /// A served engine at 23:46: the engine restarted while a run went on, and the next request failed in 35 s of retries, less than a load. Now the request is kept while `/health` says loading, goes
     /// when it says ready, and the three retries are not used for it: four refusals in a row, each in a restart, and the answer comes.
     #[test]
     fn a_request_refused_while_the_server_loads_waits_for_it_and_goes_again() {
