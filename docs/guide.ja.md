@@ -95,7 +95,7 @@ Dogmind を終了したまま更新するには、`DogmindSetup-VERSION.exe --up
 
 このリポジトリは MIT ライセンスです（`LICENSE`）。`assets/lucide/` のアイコンは Lucide のものです（ISC、`assets/lucide/LICENSE`）。
 
-`scripts/package.py` は、実行ファイルの横に `LICENSE.txt` をひとつ置きます。中身はこのアプリ（MIT）、Straydog（MIT）、Lucide（ISC）、BIZ UDゴシック（SIL OFL 1.1）、CUDA ツールキット、WebView2 SDK、同梱のツール、それにアプリと `straydog.exe` に含まれるすべての Rust クレートのライセンス文です。ここか Straydog の依存関係が変わったら、`python scripts/licenses.py` を実行してください。
+`scripts/package.py` は、実行ファイルの横に `LICENSE.txt` をひとつ置きます。中身はこのアプリ（MIT）、Straydog（MIT）、Lucide（ISC）、BIZ UDゴシック（SIL OFL 1.1）、WebView2 SDK、同梱のツール、それにアプリに含まれるすべての Rust クレートのライセンス文です。エンジンは同梱しません。アプリが取得する Straydog のリリースに、そのクレートと CUDA ツールキットのライセンスが含まれます。ここか Straydog の依存関係が変わったら、`python scripts/licenses.py` を実行してください。
 
 ## ビルド
 
@@ -110,7 +110,7 @@ cargo build --release -p dogmind-app -p dogmind-setup
 
 作業は次の版のブランチ `dev/X.Y.Z` で進め、`main` には公開した版だけを置きます。リリースするには、`dev/X.Y.Z` でワークスペースの `Cargo.toml` の `version` を上げ、上の手順でビルドとパッケージ作成をします。次に `dev/X.Y.Z` を pull request でマージコミットとして `main` に合流させ（squash はしません）、そのマージコミットに `vVERSION`（たとえば `v0.1.0`）というタグでプレリリースを公開し、`dist\DogmindSetup-VERSION.exe`、`dist\DogmindSetup-VERSION.parts`（これがあるときだけ、アプリは更新を部分ごとにダウンロードします。なければ全体）、`dist\DogmindApp-VERSION.zip` を添付します。PDB は手元に保管してください。アプリの更新確認は、タグのバージョンがいちばん新しいリリースを通知します。プレリリースも対象で、ドラフトは通知しません。バージョンになっていないタグは無視します。
 
-GPU のツールキットは不要です。エンジンを使うには、Straydog の README の手順でビルドした `straydog.exe` を、ツールキットの `cublas64_13.dll` と `cublasLt64_13.dll` と一緒に、`dogmind-app.exe` の横にコピーしてください。
+GPU のツールキットは不要で、パッケージにエンジンは入っていません。「この PC の Straydog」を選ぶと、アプリが GitHub から Straydog の最新リリース(実行ファイルと cuBLAS。リリースの SHA256SUMS と GitHub のダイジェストで検証)をデータフォルダーに取得し、そこで更新します。自分でビルドしたエンジンを使うには、設定でそのファイルを指定するか、Straydog の README の手順でビルドした `straydog.exe` を、ツールキットの `cublas64_13.dll` と `cublasLt64_13.dll` と一緒に、`dogmind-app.exe` の横にコピーしてください。エンジンを同梱していた版(0.1.17 まで)から更新したアプリは、自分で取得するまでそのエンジンを使い続けます。
 
 パッケージには、実行ファイルの横に `tools\` も入っています。使う人が何もインストールしなくても、どのマシンでもコマンドが同じように動くようにするためです。中身は、よく使うモジュール入りの Python、npm と npx 入りの Node.js、Git で、サンドボックスで実行するコマンドの PATH の先頭に、インストール済みのものより先に置きます。`python -I scripts/fetch_tools.py` が、`scripts/tools.lock.json` に固定したハッシュでこのツリーの外のキャッシュに取得し、`python -I scripts/package.py` がそれらをまとめてライセンスを加えます。横に `tools\` のない開発ビルドは、マシンにあるもの、または `DOGMIND_TOOLS` で指定したフォルダーを使います。
 

@@ -37,7 +37,7 @@ Choose one in *Settings > Models and connections*.
 
 | Kind | What it is | Key |
 | --- | --- | --- |
-| Straydog on this PC | `straydog.exe` beside the app | none |
+| Straydog on this PC | The newest Straydog release, fetched by the app when this is chosen (about 0.6 GB), and a model | none |
 | OpenAI-compatible | Straydog on another machine, or any service with such an API | pasted, or `env:NAME` |
 | Codex | A ChatGPT plan through the official Codex CLI (`codex login` first) | the CLI's |
 | Claude | The Messages API | pasted, or `env:ANTHROPIC_API_KEY` |
