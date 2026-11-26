@@ -5,13 +5,14 @@
 //! that is not reading never holds up the window.
 
 use std::ffi::c_void;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, SetConsoleCtrlHandler, COORD, HPCON};
@@ -19,6 +20,46 @@ use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::*;
 
 use super::shells::{command_line, Shell};
+
+/// What the shell writes, from the pseudo console's pipe. Each read that brings something says when it came, so that the shell's end waits for what it wrote
+/// last to have come through before the console is closed (`QUIET`).
+pub struct Output {
+    pipe: io::PipeReader,
+    heard: Arc<Heard>,
+}
+
+impl Read for Output {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let count = self.pipe.read(into)?;
+        if count > 0 {
+            self.heard.now();
+        }
+        Ok(count)
+    }
+}
+
+/// When the console's output last brought something, in ms from `since`.
+struct Heard {
+    since: Instant,
+    last: AtomicU64,
+}
+
+impl Heard {
+    fn now(&self) {
+        self.last.store(self.since.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn quiet_for(&self) -> Duration {
+        self.since.elapsed().saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed)))
+    }
+}
+
+/// After the shell has ended, the console is closed (which ends the reading) once nothing has come from it for this long, and this long after the end at the
+/// least: what it wrote last is still on its way through the console then. It was closed 150 ms after the end whatever was still coming, and a program's last
+/// lines could be lost at its exit.
+const QUIET: Duration = Duration::from_millis(150);
+/// And at the most this long after the end: what the shell started and left writing to the console does not keep it open.
+const MOST_DRAIN: Duration = Duration::from_secs(2);
 
 /// A handle that closes with this.
 struct Handle(HANDLE);
@@ -139,12 +180,12 @@ fn wide(text: &str) -> Vec<u16> {
 impl Pty {
     /// The shell, started in `folder` with a console of `cols` by `rows` cells; and what it writes, to be read from the pipe that comes with it. `ended` is called, from a thread, with
     /// its exit code when it has ended.
-    pub fn spawn(shell: &Shell, folder: &Path, cols: u16, rows: u16, ended: impl FnOnce(u32) + Send + 'static) -> io::Result<(Pty, io::PipeReader)> {
+    pub fn spawn(shell: &Shell, folder: &Path, cols: u16, rows: u16, ended: impl FnOnce(u32) + Send + 'static) -> io::Result<(Pty, Output)> {
         Pty::spawn_line(&command_line(shell), shell.environment, folder, cols, rows, ended)
     }
 
     /// The same for a command line of its own.
-    pub fn spawn_line(line: &str, environment: &[(&str, &str)], folder: &Path, cols: u16, rows: u16, ended: impl FnOnce(u32) + Send + 'static) -> io::Result<(Pty, io::PipeReader)> {
+    pub fn spawn_line(line: &str, environment: &[(&str, &str)], folder: &Path, cols: u16, rows: u16, ended: impl FnOnce(u32) + Send + 'static) -> io::Result<(Pty, Output)> {
         let (input_read, input_write) = io::pipe()?;
         let (output_read, output_write) = io::pipe()?;
         let size = COORD { X: cols.clamp(1, i16::MAX as u16) as i16, Y: rows.clamp(1, i16::MAX as u16) as i16 };
@@ -212,20 +253,24 @@ impl Pty {
                     }
                 }
             })?;
+            let heard = Arc::new(Heard { since: Instant::now(), last: AtomicU64::new(0) });
             {
-                let (process, console) = (process_handle.clone(), console.clone());
+                let (process, console, heard) = (process_handle.clone(), console.clone(), heard.clone());
                 std::thread::Builder::new().name("terminal-exit".into()).spawn(move || {
                     // (the handle is held by the Arc this thread has)
                     WaitForSingleObject(process.0, INFINITE);
                     let mut code = 0u32;
                     GetExitCodeProcess(process.0, &mut code);
                     ended(code);
-                    // (the last of what it wrote is on its way through the console: it is closed after a moment, which ends the reading)
-                    std::thread::sleep(Duration::from_millis(150));
+                    // (the last of what it wrote is on its way through the console: it is closed once that has come, which ends the reading)
+                    let exited = Instant::now();
+                    while exited.elapsed() < MOST_DRAIN && (exited.elapsed() < QUIET || heard.quiet_for() < QUIET) {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
                     console.close();
                 })?;
             }
-            Ok((Pty { console, process: process_handle, pid: process.dwProcessId, job, input }, output_read))
+            Ok((Pty { console, process: process_handle, pid: process.dwProcessId, job, input }, Output { pipe: output_read, heard }))
         }
     }
 
@@ -254,9 +299,9 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if self.job.is_none() {
-            // (no job holds it: the shell and what it started are ended by taskkill, which follows the tree)
-            let mut kill = std::process::Command::new("taskkill");
+        // (no job holds it: the shell and what it started are ended by taskkill, which follows the tree. Windows' own, by its path: by name, the first
+        // taskkill.exe on PATH ran, as the person, at each terminal's end, where the shell itself is always found by its full path)
+        if let Some(mut kill) = self.job.is_none().then(|| crate::machine::system_program("taskkill.exe")).flatten().map(std::process::Command::new) {
             kill.args(["/T", "/F", "/PID", &self.pid.to_string()]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(0x0800_0000);
             let _ = kill.status();
         }
@@ -308,7 +353,7 @@ mod tests {
     }
 
     /// What the console wrote, read on a thread until it ends.
-    fn read_all(mut output: io::PipeReader) -> std::thread::JoinHandle<Vec<u8>> {
+    fn read_all(mut output: Output) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut all = Vec::new();
             let mut chunk = [0u8; 4096];
@@ -320,6 +365,43 @@ mod tests {
             }
             all
         })
+    }
+
+    /// What a program writes last, at its very end, is read before the console is closed: it waits for the output to go quiet, where it waited 150 ms whatever was
+    /// still coming.
+    #[test]
+    fn the_last_of_what_a_command_writes_at_its_end_is_read() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
+        let folder = std::env::temp_dir();
+        let (pty, output) = Pty::spawn_line(&format!("{} /c for /l %i in (1,1,2000) do @echo line %i", command()), &[], &folder, 80, 24, |_| {}).unwrap();
+        let all = String::from_utf8_lossy(&read_all(output).join().unwrap()).into_owned();
+        assert!(all.contains("line 2000"), "the last line: {:?}", &all[all.len().saturating_sub(300)..]);
+        drop(pty);
+    }
+
+    /// What the shell started and left writing to the console after its end does not keep the console, and the reading, going: it is closed within `MOST_DRAIN`.
+    #[test]
+    fn what_goes_on_writing_after_the_shell_has_ended_does_not_keep_the_console_open() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
+        let folder = std::env::temp_dir();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // (start takes the first quoted word for a title: an empty one first. The child writes with no pause, for far longer than the console is kept)
+        let line = format!("{0} /c start \"\" /b {0} /c \"for /l %i in (1,1,1000000) do @echo tick %i\" & exit 0", command());
+        let (pty, output) = Pty::spawn_line(&line, &[], &folder, 80, 24, move |code| {
+            let _ = sender.send((code, Instant::now()));
+        })
+        .unwrap();
+        let reading = read_all(output);
+        let (_, ended_at) = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+        let all = String::from_utf8_lossy(&reading.join().unwrap()).into_owned();
+        let after = ended_at.elapsed();
+        assert!(all.contains("tick 1") && !all.contains("tick 1000000"), "still writing when it was closed: {:?}", &all[all.len().saturating_sub(200)..]);
+        assert!(after < MOST_DRAIN + Duration::from_millis(1500), "the reading ended {after:?} after the shell");
+        drop(pty);
     }
 
     #[test]

@@ -32,6 +32,8 @@ enum Line {
     Title { title: String },
     /// Web content has entered this conversation: for as long as the session lives, whatever a compaction leaves of it.
     WebSeen,
+    /// The tool that brought it, one line a tool (`web_read`, `web_search`, a server's tool): a server's counts while the person does not trust it.
+    WebFrom { tool: String },
     /// The tools this conversation is offered, the last of these lines counting: they are part of its prefix, and what is installed may differ when it is reopened.
     Tools { tools: serde_json::Value },
     /// What the session works toward, as the person set it (/goal), the last of these lines counting; none: cleared.
@@ -408,7 +410,7 @@ fn load_entries(entries: impl Iterator<Item = (u64, Entry)>) -> Loaded {
                 }
                 Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
+                Ok(Line::WebSeen | Line::WebFrom { .. } | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
@@ -572,6 +574,14 @@ impl Session {
         self.write(&Line::WebSeen)
     }
 
+    /// What a stranger said came in by `tool`; `first`: the plain mark as well.
+    pub fn mark_web_from(&mut self, tool: &str, first: bool) -> Result<(), String> {
+        if first {
+            self.mark_web_seen()?;
+        }
+        self.write(&Line::WebFrom { tool: tool.to_string() })
+    }
+
     pub fn set_goal(&mut self, goal: Option<&str>) -> Result<(), String> {
         self.write(&Line::Goal { goal: goal.map(str::to_string) })
     }
@@ -648,6 +658,52 @@ fn ends_a_line(path: &Path) -> bool {
 pub fn web_seen(path: &Path) -> bool {
     let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
     lines_of(path).is_ok_and(|mut lines| lines.any(|line| line == marked))
+}
+
+/// Where a branch's web content came from when its session's could not be told: no server has this tool, so it is never trusted.
+const UNTOLD_SOURCE: &str = "(unknown)";
+
+/// Where what a stranger said came into a session, by the tool that brought it, and whether some of it cannot be told (then it counts whatever is
+/// trusted). A plain mark is also read from what the results hold: each stranger's block names where it came from (a server's tool, or a page's
+/// address), and a program's block (`run_code`) holds those of the calls it made. A mark with nothing found, or a line that does not open, is untold.
+pub fn web_sources(path: &Path) -> (Vec<String>, bool) {
+    let Ok(entries) = entries_of(path) else { return (Vec::new(), false) };
+    let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
+    let (mut tools, mut blocks, mut plain, mut damaged): (Vec<String>, Vec<String>, bool, bool) = (Vec::new(), Vec::new(), false, false);
+    let add = |tools: &mut Vec<String>, tool: String| {
+        if !tools.contains(&tool) {
+            tools.push(tool);
+        }
+    };
+    for (_, entry) in entries {
+        let Entry::Text(line) = entry else {
+            damaged = true;
+            continue;
+        };
+        if line == marked {
+            plain = true;
+        } else if line.starts_with("{\"kind\":\"web_from\"") {
+            if let Ok(Line::WebFrom { tool }) = serde_json::from_str(&line) {
+                add(&mut tools, tool);
+            }
+        } else if line.contains("untrusted") {
+            // (as many escapes deep as the block was quoted: a program's log holds its calls' results as strings)
+            let bare: String = line.chars().filter(|c| *c != '\\').collect();
+            for source in bare.split("source=\"").skip(1).filter_map(|rest| rest.split('"').next()) {
+                if source != "run_code" {
+                    add(&mut blocks, source.to_string());
+                }
+            }
+        }
+    }
+    // (the blocks are read only under a plain mark: a conversation with none has had no stranger's answer)
+    if plain {
+        for source in blocks {
+            add(&mut tools, source);
+        }
+    }
+    let untold = plain && (damaged || tools.is_empty());
+    (tools, untold)
 }
 
 /// What a session works toward, as the person last set it; none when it was never set or was cleared.
@@ -809,13 +865,13 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
 /// messages it keeps; `title`, when given, is its name. This one is only read. What changed in the workspace since is not undone: a branch
 /// of the conversation, not of the files. A branch of an encrypted session is encrypted, under the same key, with an id of its own; one of a conversation with lines that did not open is
 /// refused, as it would leave them out without a word.
-pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
-    fork_loaded(path, load_for_fork(path)?, through, title)
+pub fn fork(path: &Path, through: usize, title: Option<&str>, policy: &Policy) -> Result<PathBuf, String> {
+    fork_loaded(path, load_for_fork(path)?, through, title, policy)
 }
 
 /// Fork at the selected answer in the same snapshot used to find it. A restored row knows its message number.
 /// A streamed row is identified by its displayed words and the number of earlier matching answers.
-pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>) -> Result<Option<PathBuf>, String> {
+pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>, policy: &Policy) -> Result<Option<PathBuf>, String> {
     let loaded = load_for_fork(path)?;
     let words = words.trim();
     let matches = |message: &Message| message.role == "assistant" && message.content.as_deref().is_some_and(|text| crate::agent::shown_answer(text).trim() == words);
@@ -823,7 +879,7 @@ pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier
         Some(index) => loaded.messages.get(index).filter(|message| matches(message)).map(|_| index),
         None => loaded.messages.iter().enumerate().filter(|(_, message)| matches(message)).nth(earlier_matches).map(|(index, _)| index),
     };
-    through.map(|index| fork_loaded(path, loaded, index, title)).transpose()
+    through.map(|index| fork_loaded(path, loaded, index, title, policy)).transpose()
 }
 
 fn load_for_fork(path: &Path) -> Result<Loaded, String> {
@@ -834,7 +890,7 @@ fn load_for_fork(path: &Path) -> Result<Loaded, String> {
     Ok(loaded)
 }
 
-fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
+fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>, policy: &Policy) -> Result<PathBuf, String> {
     let Loaded { workspace, mut messages, .. } = loaded;
     if through >= messages.len() {
         return Err(format!("{}: it has {} messages, not {}", path.display(), messages.len(), through + 1));
@@ -843,7 +899,8 @@ fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>)
     complete_tool_calls(&mut messages);
     let folder = path.parent().ok_or_else(|| format!("{}: no folder", path.display()))?;
     let now = chrono::Local::now();
-    let writer = sealed_of(path).map_err(|error| format!("{}: {error}", path.display()))?.map(|sealed| sealed.cipher);
+    // (as the conversations are written now, not as the one it is of was: a plain one's branch, after they were encrypted, would stay plain)
+    let writer = policy.writer()?;
     let mut copy = Session::create_with(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string(), writer.as_ref())?;
     let result = write_branch(&mut copy, path, &messages, title);
     let branch = copy.path.clone();
@@ -868,6 +925,12 @@ fn write_branch(copy: &mut Session, path: &Path, messages: &[Message], title: Op
     }
     if web_seen(path) {
         copy.mark_web_seen()?;
+    }
+    // (where it came from goes with it, read from the whole of this file: a branch keeps some of its lines, and not the blocks of what a compaction
+    // took; and a mark that could not say where stays one)
+    let (sources, untold) = web_sources(path);
+    for tool in sources.iter().map(String::as_str).chain(untold.then_some(UNTOLD_SOURCE)) {
+        copy.mark_web_from(tool, false)?;
     }
     // The helpers the kept messages came from go with them, under the branch's own name and the numbers they had (the messages say them): copied as they are, line for line, so that
     // an encrypted one needs no key to be copied and a line that did not open is not lost in the copy.
@@ -1019,6 +1082,49 @@ mod tests {
         assert_eq!(Session::open(&path).unwrap().2.len(), 1);
     }
 
+    /// Where web content came from: each tool's line; and for a plain mark from before those lines were kept, the blocks its results hold, a
+    /// program's calls' among them (as deep in quotes as the program's log put them). A plain mark with no block named is untold.
+    #[test]
+    fn where_web_content_came_from_is_read_from_its_lines_and_for_an_older_mark_from_the_blocks() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-1").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        assert_eq!(web_sources(&session.path), (Vec::new(), false), "none came");
+        session.mark_web_from("mcp__srv__t", true).unwrap();
+        session.mark_web_from("web_read", false).unwrap();
+        assert_eq!(web_sources(&session.path), (vec!["mcp__srv__t".to_string(), "web_read".to_string()], false));
+        assert!(web_seen(&session.path), "and the plain mark, which an older version reads");
+
+        let older = |content: &str| {
+            let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", &format!("20261124-{}", content.len())).unwrap();
+            session.append(&Message::text("tool", content)).unwrap();
+            session.mark_web_seen().unwrap();
+            web_sources(&session.path)
+        };
+        let nested = "<untrusted_web_content id=\"1\" source=\"run_code\">\nLog:\n\"<untrusted web content id=\\\"2\\\" source=\\\"mcp__unity__batch\\\">\\n{}\\n</untrusted web content id=\\\"2\\\">\"\n</untrusted_web_content id=\"1\">";
+        assert_eq!(older(nested), (vec!["mcp__unity__batch".to_string()], false), "a program's call's block");
+        assert_eq!(older("<untrusted_web_content id=\"3\" source=\"https://example.com/\">page</untrusted_web_content id=\"3\">"), (vec!["https://example.com/".to_string()], false), "a page");
+        assert_eq!(older("no block here"), (Vec::new(), true), "a mark that cannot say where");
+
+        // A branch keeps where it came from, read from the whole of its session: the block it came in by is past the branch's last message here.
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-2").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        session.append(&Message::text("assistant", "looking")).unwrap();
+        session.append(&Message::text("tool", "<untrusted_web_content id=\"4\" source=\"https://example.com/\">page</untrusted_web_content id=\"4\">")).unwrap();
+        session.mark_web_seen().unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let branch = fork(&path, 1, None, &Policy::default()).unwrap();
+        assert_eq!(web_sources(&branch), (vec!["https://example.com/".to_string()], false));
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-3").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        session.mark_web_seen().unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let branch = fork(&path, 0, None, &Policy::default()).unwrap();
+        assert_eq!(web_sources(&branch), (vec![UNTOLD_SOURCE.to_string()], false), "a mark that could not say where stays one");
+    }
+
     #[test]
     fn a_branch_has_the_conversation_through_its_message_and_its_pictures_and_the_original_is_as_it_was() {
         let dir = crate::in_container::tempdir().unwrap();
@@ -1036,7 +1142,7 @@ mod tests {
         fs::create_dir_all(crate::images::folder_of(&path)).unwrap();
         fs::write(crate::images::folder_of(&path).join("a.png"), b"png").unwrap();
         let before = fs::read(&path).unwrap();
-        let branch = fork(&path, 2, Some("a title (branch)")).unwrap();
+        let branch = fork(&path, 2, Some("a title (branch)"), &Policy::default()).unwrap();
         assert_ne!(branch, path);
         assert_eq!(fs::read(&path).unwrap(), before, "the original is only read");
         let (_, workspace, messages) = Session::open(&branch).unwrap();
@@ -1046,7 +1152,7 @@ mod tests {
         assert!(tools_of(&branch).is_some());
         let listed = list(dir.path());
         assert!(listed.iter().any(|summary| summary.path == branch && summary.title == "a title (branch)"), "{listed:?}");
-        assert!(fork(&path, 9, None).is_err());
+        assert!(fork(&path, 9, None, &Policy::default()).is_err());
     }
 
     #[test]
@@ -1057,13 +1163,13 @@ mod tests {
             session.append(&Message::text(role, text)).unwrap();
         }
         for (saved_index, earlier_matches) in [(Some(3), 0), (None, 1)] {
-            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None).unwrap().unwrap();
+            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None, &Policy::default()).unwrap().unwrap();
             let messages = read(&branch).unwrap();
             assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["first", "Done", "second", " Done "]);
         }
-        assert!(fork_answer(&session.path, "Done", Some(2), 0, None).unwrap().is_none());
-        assert!(fork_answer(&session.path, "unsaved", None, 0, None).unwrap().is_none());
-        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None).is_err());
+        assert!(fork_answer(&session.path, "Done", Some(2), 0, None, &Policy::default()).unwrap().is_none());
+        assert!(fork_answer(&session.path, "unsaved", None, 0, None, &Policy::default()).unwrap().is_none());
+        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None, &Policy::default()).is_err());
     }
 
     #[cfg(windows)]
@@ -1088,10 +1194,10 @@ mod tests {
             files
         };
         let before = entries();
-        assert!(fork(&session.path, 0, None).unwrap_err().contains("locked.png"));
+        assert!(fork(&session.path, 0, None, &Policy::default()).unwrap_err().contains("locked.png"));
         assert_eq!(entries(), before);
         drop(held);
-        let copy = fork(&session.path, 0, None).unwrap();
+        let copy = fork(&session.path, 0, None, &Policy::default()).unwrap();
         let copied = crate::images::folder_of(&copy);
         assert_eq!(fs::read(copied.join("first.png")).unwrap(), b"first");
         assert_eq!(fs::read(copied.join("locked.png")).unwrap(), b"second");
@@ -1130,7 +1236,7 @@ mod tests {
         drop(file);
         rename(&path, "named after the cut").unwrap();
         assert_eq!(list(dir.path())[0].title, "named after the cut");
-        let copy = fork(&path, 1, None).unwrap();
+        let copy = fork(&path, 1, None, &Policy::default()).unwrap();
         assert_eq!(Session::open(&copy).unwrap().2.len(), 2);
     }
 
@@ -1493,7 +1599,7 @@ mod notice_tests {
         assert_eq!(read(&path).unwrap().len(), 2);
         assert_eq!(Session::open(&path).unwrap().2.len(), 2);
         assert_eq!(list(dir.path())[0].messages, 2);
-        assert_eq!(Session::open(&fork(&path, 1, None).unwrap()).unwrap().2.len(), 2);
+        assert_eq!(Session::open(&fork(&path, 1, None, &Policy::default()).unwrap()).unwrap().2.len(), 2);
     }
 }
 

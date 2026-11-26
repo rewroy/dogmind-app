@@ -1,0 +1,213 @@
+# Dogmind guide
+
+[Back to the README](../README.md)
+
+## Using it
+
+It runs on Windows 11, without administrator rights. Run `DogmindSetup-VERSION.exe` (as `DogmindSetup-0.1.0.exe`), which puts it in `%LOCALAPPDATA%\Programs\Dogmind`, in the Start menu and in Installed apps. Its first page names that folder, and *Change...* opens Windows's folder picker to choose another: one that holds other things gets a `Dogmind` folder inside it, and one this user cannot write in without an administrator (`C:\Program Files`), or that is where settings and sessions are kept, is refused with the reason. An update goes where the install is, and does not offer the choice. Or extract the whole zip to a folder of your own and start `dogmind-app.exe`.
+To run a model on this PC it takes an NVIDIA GPU with a current driver, and about 76 GB free on a drive (75 GB to download; 70 GB stay). Without one, use another computer, a service, Codex or Claude.
+*Settings > Models on this PC* lists what Straydog can set up here. A model that needs more free graphics memory than the card has now is listed too, greyed and marked not recommended with what it needs, for whoever wants to try it.
+For Qwen3.8, *Faster-writing data* fetches its drafter (about 5 GB to download, 0.9 GB kept), whatever the graphics memory; turned on for a model that is set up already, it fetches the drafter alone while the engine keeps running, and the engine starts again with it once no work is going on.
+The first run asks how to reach a model and where to work; `/setup` goes through it again. Type `/` for the commands and `@` for the workspace's files. Enter sends, Shift+Enter starts a new line, Esc stops; Ctrl+N
+starts a session, Ctrl+, opens the settings, Ctrl+Shift+C copies the last answer. A right click on a session renames or
+deletes it.
+
+To connect an MCP server already set up in Claude or Codex, type `/mcp candidates` in the conversation.
+Copy a name from the list and type `/mcp import NAME` to start that server. For example, if the list shows
+`Project Files`, type `/mcp import Project Files`. To add all available servers at once, use `/mcp import`.
+If an expected name is missing, check its spelling in the source settings. Import skips empty names, names with leading or trailing whitespace, and names containing line breaks.
+Use `/mcp` to check the connection. If a configured server disconnected or failed to start, fix the cause and run `/mcp import NAME` to retry it. Once connected, its tools are available in the open conversation.
+To add a server manually, open *Settings > Tools > MCP servers > Add a server*.
+For a local server that opens scripts or data by a relative path, enter its folder in *Working directory (optional)*. You can also edit this field on an existing server.
+When `CODEX_HOME` is set, preview and import use the `config.toml` in that directory.
+New imports from Codex keep its `enabled_tools` and `disabled_tools` lists. Existing Dogmind entries keep their saved settings when imported again.
+
+While the model works, Enter puts what you type into the work before its next step, and Ctrl+Enter keeps it for after the work. Each
+waiting message has buttons to send it into the work now, to edit it, or to discard it. Each message shows its time; an answer's
+branch button starts a new session with the conversation up to that answer, to go on from there another way. From the second turn,
+a rail at the transcript's right edge has a mark for each of your messages: the one you are reading is longer, and a click goes to it.
+
+Some steps come as cards in the conversation. When the agent asks you something, a card holds the question with a button for
+each choice (its suggestion marked) and a field for your own answer, and the session shows *Waiting* until you answer. In plan
+mode (`/plan`) it puts its plan up as a card with *Carry it out* and *Change...*: nothing is changed until you carry it out. Under
+an answer that changed files, a card lists them with the lines added and removed: a click opens that file's diff, and its other
+button opens the file or shows it in Explorer. When the agent sends a long look to a helper (`explore`), a card shows the helper's task, the step
+it is on ("Step 7 of 20"), the last three things it read or searched, and its time and tokens, with a *Stop* button that stops that helper alone:
+the agent is told that you stopped it, and goes on with what it has. Once the helper is over, the card says how it ended (done, stopped, or could
+not finish) with the time, the steps and the files it read, and *Show its steps* opens the helper's conversation, read only, in the panel on the
+right (its close button goes back to what the panel showed). The cards stay when a session is opened again. `/goal TEXT` keeps a goal for the
+session, shown as a thin bar under the title and told to the model again after a compaction, and `/goal clear` ends it.
+`/trajectory` shows where a session's time went, turn by turn. A request that plainly asks for no changes ("just look", "don't
+change anything") makes that turn read-only, and a line says so before anything is refused; a phrase with an object ("without
+changing the tests") only limits that object. Keys and tokens that a tool brings back are hidden on screen; the model still gets
+them as they were.
+
+The panel on the right (the button at the right of the title, or `/panel`) has *Overview* and *Files*. *Files* shows the workspace
+as a tree, folders first, with the files this session changed marked, and follows the disk as it changes. A click previews a file
+beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as tables, an Excel workbook's first sheet), a double
+click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
+(`@path`). A helper's steps take the panel's place while they are shown, and a preview opened after them takes theirs.
+
+Once something has been said in a session, switch between *Conversation* and *Timeline* below its title. The timeline shows current
+activity and the session history.
+
+The terminal button in the title bar (or `/terminal`) opens your own shell in a panel under the conversation, which stays in view;
+the button closes the panel again, and its terminals go on running while it is closed. The shell is PowerShell: PowerShell 7 where it
+is installed, and Windows PowerShell otherwise. It starts in the session's folder (your own folder when there is none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
+underline, the cursor, wide Japanese characters, git, python, vim, a progress bar. The shell has your own environment, so a
+`NO_COLOR` in it (a variable some tools set for what they start) is the shell's too, and programs that honour it print plain text.
+Each terminal is a tab, up to 8 (the + beside the tabs, or Ctrl+`` ` ``, opens
+another): double click a tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind
+does; closing the last one closes the panel. A terminal goes on running while the panel is closed or you open another session. A shell that has ended stays on the
+screen with its exit code and a *New terminal* button, and never starts again by itself. While it has the keys, every key is the
+shell's (Tab, the arrows, F-keys, Ctrl and Alt with a letter) except Ctrl+`` ` `` (another terminal), Ctrl+Tab and Ctrl+1 to 9 (the
+sessions) and F6, which leaves the terminal for the message box. Ctrl+C copies what is selected, and otherwise is the shell's ^C;
+Ctrl+V, Ctrl+Shift+V and Shift+Insert paste (as a paste, where the shell asks for that); a drag selects (a double click a word, a
+triple click a line), the wheel and Shift+PgUp go back through the last 10,000 lines, and a right click offers copy, paste and select
+all. An IME's result goes in as text, with its window at the cursor. Its colours and its face (Cascadia Mono, or Consolas) follow
+the theme, and a reader of the screen finds a document called Terminal, with the text in view and the cursor's line.
+**What you do there is yours, not the agent's.** The commands run with your own rights and none of the agent's permissions
+or limits apply to them, and nothing a terminal shows is sent to the model.
+
+## Encrypting conversations
+
+Conversations are kept as plain JSON lines in `%LOCALAPPDATA%\DogmindApp\sessions`, and are not encrypted unless you turn that on in *Settings > Privacy*. Off is the default, and it costs nothing.
+
+- **What is encrypted.** Every message of a conversation, one line at a time (AES-256-GCM; a line cannot be moved to another file or another place, and a line changed by a byte is reported as damage, never dropped without a word); the pictures of a conversation, each whole; each `explore` helper's conversation, in its file beside the session; the notes the model keeps for later sessions, and the ones it forgot; the index of a session's undo points, which holds the first words of what you asked. An encrypted session still begins with one plain line that says it is encrypted, with the file's random id and a fingerprint of the key, and nothing of the conversation. Writing stays one appended line at a time, so the disk is written no more than before.
+- **What is not.** The files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are, whatever is chosen). The timing record beside each session (`.trajectory.jsonl`: counts, times, names, outcomes and short hashes, never what was said; it does name the files a tool touched and a command's first word, and holds the one line a server said of a failure). The settings. A picture you open in the panel beside the conversation, and the copies of attached pictures that commands can read, are put in plain in `attachments`, which is emptied at every start of the app.
+- **Turning it on.** You type a passphrase twice and are shown a recovery code, once; the box *Remember on this PC* is ticked unless you clear it. Then the conversations you already have are encrypted one at a time, with progress: each is written whole beside the old file and renamed over it, so that a crash or a power cut leaves every file either all old or all new, and the next start finishes what is left. New conversations are encrypted as they begin, and plain ones still open as they are. Nothing is changed while a conversation is at work.
+- **The key.** A random 256-bit key encrypts the conversations. It is kept only wrapped (AES-256-GCM) in `conversation-key.json`, under a key made with scrypt from your passphrase, under a key made with scrypt from the recovery code (about 160 bits), and, if *Remember on this PC* is ticked, under Windows' DPAPI for your Windows user. Either the passphrase or the recovery code opens the conversations, on this PC, on another, or after Windows is installed again; the DPAPI copy opens them on this PC for you alone, and with it the app asks nothing when it starts. Without it, a dialog asks for the passphrase (or the recovery code, and then a new passphrase), and until it is answered no conversation is opened or written.
+- **Changing it.** *Settings > Privacy* changes the passphrase (the conversations are not touched), makes a new recovery code (the old one stops working), turns *Remember on this PC* on or off, and turns encryption off, which writes every conversation back as plain text and removes the key file, after one confirmation.
+- **If you lose both the passphrase and the recovery code, the conversations cannot be read, by anyone, you included.** There is no other way in. Write the recovery code down when it is shown: it is shown once and kept nowhere. A copy of the app's folder, with its `conversation-key.json`, stays sealed.
+- **What it costs.** Measured on this PC with a folder of 200 test sessions (157 MiB, the largest 24 MiB): unlocking takes 38 ms with the passphrase and 0.2 ms with the copy for this PC; opening the largest session takes 60 ms instead of 42 ms; appending a line takes 4 us instead of 3 us; listing every session takes 233 ms instead of 126 ms, and searching all of them 0.6 s instead of 0.4 s. The files are a third larger (base64 and a tag on each line), and encrypting the whole folder the first time took 2.8 s.
+
+## Keeping the conversation for the engine's next start
+
+When the engine starts again (an update of the app, a change of settings that restarts it), the next message of a long conversation makes it read the whole conversation again: on a small graphics card a conversation of 36,000 tokens took 84 seconds before the first word. *Settings > Privacy > Keep the conversation's state for the next start* turns that off. It is **off by default**, and with it off nothing here changes.
+
+- **What is kept.** The engine's own state of the conversation it held last, at the place where its last reply began: the same numbers it would work out by reading the conversation again (not the text of the conversation, which the app keeps as it always does). A conversation with a picture in it is not kept, nor one under 1024 tokens.
+- **Where, and sealed how.** In the engine's data folder, `conversation` (one file for a model, a new one replacing the old), sealed with AES-256-GCM under a random key that Windows' DPAPI wraps for your Windows account: the same sealing as the engine's other saved state (the system prompt's). Another Windows user cannot open it, and a changed byte refuses it. The file is about 28 KB for each token of the conversation, a little more with the faster-writing drafter (1.0 GB for 36,000 tokens).
+- **When it is written.** Once, when the engine stops on purpose, and at no other time: nothing is written while you work, and not after each message, so the drive sees one write when the app is closed. The app asks the engine to stop over a pipe that only the app holds, and waits for it to end, at most 20 seconds, then ends it as it always did. This covers quitting the app, an update, a change of settings that restarts the engine, and Windows logging off or shutting down (the app tells Windows why it waits). A state too large for the drive's free room or the memory is not written, and the engine's log says so in one line.
+- **At the next start.** The engine reads the file only for the first message that goes on from that conversation, and the log's line for it says `reused 36100 from kept, loaded in 3.2 s`. A message that does not go on from it leaves the file as it is, for a later one. A file of another build of the engine, or one that does not open, is deleted; so is the file, at the engine's start, if the option has been turned off.
+- **With encrypted conversations.** The state is sealed for your Windows account, which opens it without your passphrase. So when the conversations are encrypted and *Remember on this PC* is off, the option is off and cannot be turned on (the page says why), and turning that combination on turns the option off. With *Remember on this PC* ticked, Windows opens the conversations' key for your account in the same way, and the state is no more readable than the key is.
+
+## Updating, removing, and when something goes wrong
+
+New versions are published at [Releases](https://github.com/rewroy/dogmind-app/releases). The app asks GitHub for the newest release
+(a pre-release too) every six hours, and again when its window comes back from the tray if the last look is an hour old; *Settings > About* has *Check for updates*, and a switch (*Update automatically*) to turn these looks off. The request carries
+nothing about you but the app's version. A copy that the installer put in its folder also downloads the newer release's setup in the background (not on a metered connection, unless you press
+*Check for updates*), and only if GitHub lists it with its size and SHA-256: the download is kept as `.partial` in the `updates` folder of the app's data until its size and hash are those GitHub published, and deleted if they are not, or if you cancel it
+(*Settings > About* shows its progress and a *Cancel*). Then a card at the top of the main screen, whatever page is open, says the update is ready, with *Update now (Dogmind restarts)* and *Later* (while the window is hidden, the tray says so once for each new version): only that press, when no work is going on or when it ends, runs the setup
+(`DogmindSetup-VERSION.exe --update --dir FOLDER --wait-pid PID`, which asks nothing, waits for the app to end, updates the folder, puts back what was there if it fails, and starts the app again). A copy unpacked from the zip
+is only told, with a button that opens the release's page. To update by hand, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
+
+To update a closed installation and leave Dogmind closed, run `DogmindSetup-VERSION.exe --update --dir "FOLDER" --no-launch` with the installation folder in place of `FOLDER`.
+
+The setup that is downloaded is not always all of it. A release also has `DogmindSetup-VERSION.parts` beside its setup, which says where each file is in it, and the installer writes down, in the manifest of the install, the hash, size and last-write time of each file it put there (an install made before 0.1.5 has none, and its first update downloads the whole setup, and reads every file of the folder once). When the release lists the `.parts` file with its size and SHA-256 as well and the manifest has those records, the app downloads only the program and the files that are new or have changed, by HTTP ranges, and puts a setup together in the `updates` folder that leaves the other files to the install. The `.parts` file is checked by the size and SHA-256 GitHub published for it, and each part by what it says: the program by its hash, each file by inflating it and comparing its size and SHA-256. The installer finds the files left out in the folder, by their records, or by their hashes where a file's time is not the one written down, and if one is not as it was it changes nothing and says to download the full setup from the release page. Whatever is not as it should be on the way, the whole setup is downloaded as above, and nothing more is said of it. The installer trusts those records only on the app's own update (`--update`): a file that still has the size and time written down for it is not read again. Running the setup yourself checks every file, and is the way to repair an install.
+
+To remove it, *Settings > General > Remove this app from this PC* takes away the settings, sessions, logs, its keys in Credential Manager, what was opened to the sandbox and its AppContainer
+profile, and the model unless you keep it. In its data folder it takes only what it made there, by name: anything else stays, and it says what. Straydog's own sandbox profile stays, as the engine also runs as a server of its own. Installed apps opens the same page, and closing it then takes away the program and its entries: only the files its installer put there, and a folder only once it is empty. From a zip, delete the folder it runs from. Workspaces stay as they are.
+
+A crash leaves a text file in `%LOCALAPPDATA%\DogmindApp\crashes`, and the next start says so. `/report`, or *About > Write a problem report*, writes `report.txt` in `%LOCALAPPDATA%\DogmindApp`, with no key, server address or
+conversation in it, and says where it is. It does hold the last line an engine or a server said of a failure (the line shown under the app's own sentence), with any key or header in it hidden. Read it, and attach it to an [issue](https://github.com/rewroy/dogmind-app/issues) with what you were doing. Nothing is sent by itself. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
+Please report a security problem privately, as [SECURITY.md](../SECURITY.md) says, and not in a public issue.
+
+The app is not signed yet. Windows shows *Windows protected your PC* for it (*More info > Run anyway*), and with Smart App Control on, Windows will not run it at all.
+
+## Licenses
+
+The icon is `assets/app.ico`, made from the artwork `assets/app.png` by `scripts/make_icon.py`.
+
+This repository is MIT (`LICENSE`). The icons in `assets/lucide/` are Lucide's (ISC, `assets/lucide/LICENSE`).
+
+`scripts/package.py` puts one `LICENSE.txt` beside the executable, with this app's (MIT), Straydog's (MIT),
+Lucide's (ISC), BIZ UDGothic's (SIL OFL 1.1), the CUDA toolkit's, the WebView2 SDK's, the bundled tools' and every Rust crate in the app and in `straydog.exe` with its license's words. After a dependency changes, here or in Straydog, run `python scripts/licenses.py`.
+
+## Building
+
+```bat
+set "RUSTFLAGS=-C target-feature=+crt-static --remap-path-prefix=%USERPROFILE%=~"
+cargo build --release -p dogmind-app -p dogmind-setup
+```
+
+A release is built so: a panic's message names the path of its source, and without the remap the builder's user folder is in
+every one. `RUSTFLAGS` takes the place of `.cargo/config.toml`'s flags, so the static C runtime is said again.
+
+`python -I scripts\package.py` then makes `dist\DogmindApp`, its zip and `dist\DogmindSetup-VERSION.exe`. The installer is `crates/dogmind-setup` and no tool besides: the package is on the end of that one executable, deflated file by file, and read as a stream. To try one in a scratch folder, `DogmindSetup.exe --test --dir FOLDER`: it writes no Start menu entry or registry key, only what they would say, in that folder. Without `--test`, `--dir FOLDER` only chooses the folder the first page starts with.
+
+Work goes on the next version's branch, `dev/X.Y.Z`, and `main` holds released versions only. To release: raise `version` in the workspace's `Cargo.toml` on `dev/X.Y.Z`, build and package as above, merge `dev/X.Y.Z` into `main` through a pull request with a merge commit (never a squash), and publish a GitHub pre-release tagged
+`vVERSION` (as `v0.1.0`) on that merge commit with `dist\DogmindSetup-VERSION.exe`, `dist\DogmindSetup-VERSION.parts` (an app fetches an update by its parts only with that; without it, the whole setup) and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
+update check offers the newest release by its tag's version, pre-releases included, and never a draft; a tag that is not a version is passed over.
+
+No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`.
+
+A package also has `tools\` beside the exe, so that a person installs nothing and a command does the same on every machine: Python with common modules, Node.js with npm and npx, and Git, first on every sandboxed command's PATH, ahead of anything installed. `python -I scripts/fetch_tools.py` fetches them by the hashes pinned in `scripts/tools.lock.json`, into a cache outside this tree, and `python -I scripts/package.py` puts them together and adds their licenses. A development build with no `tools\` beside it uses what the machine has, or the folder `DOGMIND_TOOLS` names.
+
+## The agent
+
+Its tools read, search, create and edit files (`read_file`, `list_files`, `find_files`, `search_files`, `create_file`,
+`apply_patch`), run commands (`execute_command`), show what changed (`show_diff`), keep a to-do list, check a web page in a
+browser, and search and read the web when that is turned on. Edits and commands ask first, as the mode says (*default*,
+*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. Once web content is in a conversation (a
+search, a page, or what an MCP server you have not trusted returns), what it may have asked for needs your word every time, whatever
+the mode and the saved rules say: a command that uses the network, an MCP tool, a note kept or dropped, and an address that neither you nor
+the web gave. A command that does not use the network is weighed as it was before. A long session is compacted in three
+stages, and every session is kept in a file of its own. A project's `DOGMIND.md` (or its `AGENTS.md` or `CLAUDE.md`) says how it
+wants to be worked on. What the model reads is kept as small as a local model needs it: the system prompt is in
+`crates/dogmind-agent/src/prompt.rs` and the tool schemas in `tools.rs`.
+
+It can ask you a question with choices (`ask_user`), and in plan mode it puts its plan up for your approval (`submit_plan`) and
+carries it out once you approve.
+
+For a long look, `explore` hands a question to a helper with a context of its own and only the looking tools, and only its
+answer joins the conversation. The helper's own conversation (its requests, the tools it called and what they brought back) is kept beside the
+session as `<session>.helper-N.jsonl`, encrypted with it when *Settings > Privacy* has that on; a branch of the session takes the helper files of what it
+keeps, and deleting the session deletes them. A file of more than 800 lines read with no place in it comes as its outline, a turn is told at
+each 96 KB of files it has read, and any long tool result (a command's output, a search, an edit's report, a diff, an MCP tool's answer) is kept whole in
+`%TEMP%\dogmind-output` for a week, its report saying where to read the rest; so is what a compaction trims of an old output. A command left running in the background shows, at each `command_status`, what it has printed since the
+last look: a dev server's ready line among it.
+
+`execute_command` runs in an AppContainer, `DogmindApp.Exec`: a command can write only in the workspace, read
+that, the per-user toolchains on PATH and what every app may read, and has no network unless it was approved for it, each
+time. What it starts ends with it. What cannot be contained does not run: there is no fallback, and a workspace that is a
+whole drive or holds your user folder cannot run commands at all (it still reads and edits, and says so when it starts).
+
+AppContainers work by ACEs, so the first command in a workspace writes one on that folder and its tree, and on the toolchain
+folders, and these stay. To take them away: `icacls <folder> /remove <the profile's SID> /t`. The app's own file tools run
+outside the container and pass through the approvals instead.
+
+## Background work
+
+A command started with `background: true` goes on while the agent does other things, or ends its turn. When it ends, any way it ends, the session wakes itself: the app writes a notice, which the
+transcript shows as a row of its own and the model reads as the app's word, not yours (what the command printed in it is data, never instructions), and one turn runs with nobody sending anything.
+`wake_on`, a regular expression, wakes it once, at the first line the command prints that matches (`Listening on` for a server), and the command goes on. `wake_at` wakes it later, after 60 seconds
+to a day with a note, with at most five waits open; `command_stop` ends a command or cancels a wait, and that wakes nothing. A notice that comes during a turn waits for its end, and notices that come
+together are one turn.
+
+So that nothing runs away, a session wakes itself at most 30 times in a row with no word from you, and 60 times in an hour; past either it stops and the window says why (a message from you lets it
+go on after the first, the hour's passing after the second). Your Stop ends the turn, and the commands and waits of that session. A woken turn asks as any turn does and waits for you: the taskbar
+button flashes until you look, the tray says so when the window is hidden, and nothing approves for it. The panel on the right lists what is waiting, each with a stop of its own, and the list of
+sessions marks one that has something waiting. Closing the window leaves all of it going, in the tray; Quit from the tray ends it. Commands and waits do not outlive the app, and nothing watches
+files or listens for anything from outside it.
+
+## Straydog
+
+The app shares no code with Straydog, which moves on its own. It starts `straydog.exe`, runs `straydog setup`, reads the bundles
+from `fetch --help`, and speaks HTTP: all of that is in `crates/dogmind-app/src/engine.rs`, so that following Straydog is mostly
+reading.
+
+## Privacy
+
+Dogmind sends no conversation or file to its developers, and it has no telemetry. It reaches the network only for these:
+
+- **The connection you chose.** With Straydog on this PC, the conversation stays on this PC. With another machine, an
+  OpenAI-compatible service, Codex or Claude, the conversation goes there (under that service's terms).
+- **Web search and reading (on by default).** Search words go to DuckDuckGo (then Bing, or Brave with a Brave key), and a page read
+  comes from its site. Turn it off with *Web search and reading* in the settings.
+- **Update checks (on by default).** Every six hours the app asks GitHub for a new version, sending only its own version; updates and
+  the engine are downloaded from GitHub too. *Update automatically* (the app) and *Update bundled Straydog automatically* (the engine) in *Settings > About* stop them.
+- **Getting a model for this PC.** The engine downloads it from Hugging Face.
+- **Page checks.** The libraries a checked page uses are fetched from well-known CDNs, even with web search and reading off.
+- **The bundled guidance CLI.** The CLI that looks up web-building guidance fetches its package from the npm registry the first
+  time it is used (without asking).
+- **MCP servers you add, and commands you allow the network.**

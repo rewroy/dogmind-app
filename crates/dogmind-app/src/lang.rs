@@ -358,6 +358,7 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::safety::REASON_WEB_FORGET, "この会話にはウェブの内容が含まれていて、メモを消すとこの先のすべてのセッションが変わります"),
     (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
     (dogmind_agent::safety::REASON_CARGO_OUTSIDE, "このワークスペースはサンドボックスの中の cargo では読めないため、サンドボックスの読み込みの制限を外して実行します。あなたが読めるファイルはすべて読め、ネットワークも止められません"),
+    (dogmind_agent::safety::REASON_TOO_LARGE_TO_KEEP, "このファイルは 256 MB より大きいため、巻き戻し用のコピーを取りません。書き換えたり消したりすると元に戻せません: {0}"),
     (dogmind_agent::safety::REASON_CARGO_CONFIG_RUNS, "ここの cargo の設定は {0} も実行し、同じ範囲に届きます"),
     (dogmind_agent::safety::REASON_OUTSIDE_SANDBOX, "サンドボックスの外で、あなたとして実行します。あなたが読み書きできるファイルはすべて読み書きでき、ネットワークにも届きます"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),
@@ -448,6 +449,7 @@ const JA: &[(&str, &str)] = &[
     ("Unpin", "ピン留めを外す"),
     ("Pin this session to the top of the sidebar, or unpin it", "このセッションをサイドバーの上にピン留め、または解除"),
     ("Trust what it returns", "返す内容を信頼する"),
+    ("Describe tools", "ツールの説明を取得"),
     ("What a trusted server returns no longer makes later commands ask. Its own tools still ask.", "信頼したサーバーの返す内容を理由に、以後のコマンドが確認することはなくなります。サーバー自身のツールは引き続き確認します。"),
     ("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data.", "このサーバーの返す内容は Web の内容として扱われなくなり、それを理由に以後のコマンドが確認することはなくなります。ツール自体は引き続き確認し、すでに Web の内容がある会話では確認を続けます。返す内容は引き続きデータとして扱います。"),
     ("Needs an NVIDIA GPU. Downloads a model of about 75 GB", "NVIDIA の GPU が必要です。約 75 GB のモデルをダウンロードします"),
@@ -906,6 +908,8 @@ const JA: &[(&str, &str)] = &[
     ("Always allows this file, for this session: {0}", "常に許可: このセッションの間、このファイル: {0}"),
     ("Always allows this on the network, for this session: {0}", "常に許可: このセッションの間、次のネットワーク利用: {0}"),
     ("Always allows each part of this line (sites for this session): {0}", "常に許可: この行の部分ごとに(サイトはこのセッションの間): {0}"),
+    ("Always trusts what {0} returns, from now on. Settings > Tools turns it off.", "常に許可: 以後、{0} の返す内容を信頼します。設定 > ツール でオフにできます。"),
+    ("Always allows this tool, whatever it is given, for this session.", "常に許可: このセッションの間、このツール (引数を問わず)。"),
     ("Always cannot be used for this line.", "この行には常に許可を使えません。"),
     ("Folders commands can read", "コマンドが読めるフォルダー"),
     ("Commands can read everything in these folders, and that includes any keys or passwords kept there. They cannot write there, and the network stays off unless you approve it. Files that look like keys are left out only if they are there when you add the folder, not ones made later.", "コマンドはこれらのフォルダーの中身をすべて読めます。そこに置かれた鍵やパスワードも読めます。書き込みはできず、ネットワークも許可しない限り使えません。鍵に見えるファイルを除外するのは、追加したときに既にあったものだけで、後から作られたものは除外されません。"),
@@ -1022,6 +1026,10 @@ const JA: &[(&str, &str)] = &[
     ("Unlock", "ロック解除"),
     ("Use the passphrase instead", "パスフレーズを使う"),
     ("Use the recovery code instead", "回復コードを使う"),
+    ("Use the copy", "コピーを使う"),
+    (dogmind_agent::sandbox::MOVED, "このフォルダーは、アプリが準備した後で別の場所へのリンクに変わっています(コマンドが変えることがあります)。そのため、そこでは何も実行も許可もしていません。フォルダーそのものをワークスペースとしてもう一度開いてください。"),
+    ("{0} It is conversation-key.json in {1}. The copy of it that Dogmind keeps beside it opens: open your conversations with that copy? The damaged file is kept as conversation-key.json.damaged.",
+     "{0} 対象は {1} の conversation-key.json です。Dogmind が横に保存しているコピーなら開けます。このコピーで会話を開きますか？ 壊れたファイルは conversation-key.json.damaged として残します。"),
     ("The two passphrases are not the same.", "2 つのパスフレーズが一致しません。"),
     ("A conversation is at work. Let it finish or stop it first: the files are written to while it goes.", "会話が作業中です。先に終わらせるか止めてください。作業中はファイルに書き込まれます。"),
     ("Encrypting {0} of {1}...", "{1} 件中 {0} 件を暗号化しています..."),
@@ -1467,7 +1475,7 @@ N / P\t次と前の変更 (変更の画面で)
 貼り付けたキーは Windows の資格情報マネージャーにだけ保存します。
 画像: クリップのボタン、/attach、貼り付け、ドロップ。PNG、JPEG、WebP、GIF。
 スキル: プロジェクトとホームの .claude/skills、.agents/skills、.codex/skills、.dogmind/skills。/スキル名 で始めます。
-MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。返す内容を信頼することもできます。呼び出しのたびに確認します。
+MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。自分で追加したプログラムの返す内容は信頼します (そこでオフにできます)。URL のサーバーの返す内容は、オンにしたときだけ信頼します。呼び出しのたびに確認し、常に許可はそのセッションの間、そのツールに効きます。
 Web: 返ってきた内容はデータとして扱い、会話に入ると以後のコマンドはすべて確認します。
 カスタム指示 (設定) は全セッション共通、DOGMIND.md はそのプロジェクト用です。/init でモデルに書かせることもできます。
 ターミナル: 右側のパネルの「ターミナル」は、あなた自身のシェルです。コマンドはエージェントの権限とは別に、あなた自身の権限で動き、そこに表示される内容はモデルには送られません。キーはすべてシェルに渡ります。Ctrl+C は選択があるときはコピー、ないときは実行中のものを止め、Ctrl+V は貼り付けです。

@@ -1,4 +1,4 @@
-//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]] [--key-file FILE] [--code-mode]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
+//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]] [--key-file FILE] [--code-mode] [--sandbox-profile NAME]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
 //!
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
@@ -6,6 +6,8 @@
 //! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for;
 //! `--limit` is of the whole run, the turns it wakes itself for with the rest.
 //! The session, and the trajectory beside it (`dogmind-app --trajectory`), are in `--data\sessions`. It never touches the app's own data folder.
+//! To run as the app does, it has the app's `tools` folder beside it (a copy: the sandbox writes its grants on what it uses), and `--sandbox-profile` gives its commands a container
+//! of their own, as what they make stays in the container they ran in.
 
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -39,8 +41,11 @@ fn main() {
     let (mut instructions, mut language, mut skills_off): (Option<PathBuf>, String, Vec<String>) = (None, "auto".to_string(), Vec::new());
     // `--web`: web search and reading are offered, as with the person's setting on.
     let mut web = false;
+    // `--sandbox-profile NAME`: the commands run in a container of that name, not in the one of the app the person uses on this PC, where what they make would stay.
+    let mut sandbox_profile: Option<String> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--sandbox-profile" => sandbox_profile = args.next(),
             "--refuse" => refuse = true,
             "--code-mode" => code_mode = true,
             "--effort" => effort = args.next().filter(|level| !level.is_empty()),
@@ -70,6 +75,14 @@ fn main() {
         return;
     }
     assert!(!server.is_empty() && workspace.is_dir() && !data.as_os_str().is_empty() && turns.is_file(), "--server, --workspace (a folder that is there), --data and --turns are needed");
+    if let Some(name) = &sandbox_profile {
+        dogmind_agent::sandbox::use_profile(name).expect("a container for the commands");
+    }
+    // (with no tools folder beside it, as the app has one, the commands run the PC's own Python, node and git, which the person's app does not: said, for the run's log)
+    match dogmind_agent::bundled::root() {
+        Some(tools) => println!("bundled tools: {}", tools.display()),
+        None => println!("bundled tools: none (the PC's own python, node and git)"),
+    }
     std::fs::create_dir_all(&data).unwrap();
     let mode = match mode.as_str() {
         "default" => Mode::Default,

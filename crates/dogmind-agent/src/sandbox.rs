@@ -26,6 +26,23 @@ use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
 
+/// The container a program that runs the agent for a check of its own (a measurement's driver) chose for its commands ([`use_profile`]).
+static CHOSEN_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Commands run in the container of this name, and not the person's, for a program that runs the agent for a check: a measurement whose commands would leave what they
+/// make in the container of the app the person uses on the same PC. Before the first command, once. The app never calls it, and nothing the person sets, nor a variable, reaches
+/// it: a release of the app keeps its commands in their container whatever its environment says.
+pub fn use_profile(name: &str) -> Result<(), String> {
+    // (a name Windows takes for a container: 64 characters at most, of letters, digits, `.`, `-` and `_`)
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return Err(format!("{name:?} is no name for a container"));
+    }
+    if PROFILE_SID.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some() {
+        return Err("a command has run already, in the container it had".to_string());
+    }
+    CHOSEN_PROFILE.set(name.to_string()).map_err(|_| "a container was chosen already".to_string())
+}
+
 /// The container commands run in. The tests have one of their own: what their runs leave (the grants on its temp folder, what their commands leave in it) was in the
 /// container of the app the person uses on the same PC, which is not a place for tests; 667 grants their restricted commands had left there were inherited by all in it.
 /// A development build is given another by `DOGMIND_SANDBOX_PROFILE`, for a run of the app that is a check (a dogfood run, a measurement) and not the person's own: their
@@ -35,6 +52,9 @@ fn profile_name() -> &'static str {
     return "DogmindApp.Exec.Tests";
     #[cfg(not(test))]
     {
+        if let Some(chosen) = CHOSEN_PROFILE.get() {
+            return chosen;
+        }
         #[cfg(debug_assertions)]
         {
             static NAMED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -444,8 +464,19 @@ pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Resul
 }
 
 /// The per-user folders to make readable: PATH's under the home, and the toolchain homes. Never the home itself.
+/// The home's folders that hold too much of the rest of it to be a toolchain's.
+const TOOLCHAIN_TOO_WIDE: [&str; 3] = ["appdata", "appdata\\local", "appdata\\roaming"];
+
+/// Whether a folder may be opened to commands as a toolchain's, as written and as `entry` (the key of where it really is): in the home and not the home
+/// itself, none of `TOOLCHAIN_TOO_WIDE`, and no folder of keys, in one, or holding one.
+fn a_toolchain_place(written: &Path, entry: &str, home_key: &str) -> bool {
+    let wide = entry.strip_prefix(&format!("{home_key}\\")).is_some_and(|inside| TOOLCHAIN_TOO_WIDE.contains(&inside));
+    let real = Path::new(entry);
+    entry != home_key && under(entry, home_key) && !wide && !entry.contains("\\.ssh")
+        && !crate::safety::keys_folder(written) && !crate::safety::keys_folder(real) && !crate::safety::holds_keys_folder(real)
+}
+
 pub fn toolchain_folders(path_variable: &str, home: &Path) -> Vec<PathBuf> {
-    const TOO_WIDE: [&str; 3] = ["appdata", "appdata\\local", "appdata\\roaming"];
     let home_key = key(&real(home));
     let mut folders: Vec<PathBuf> = std::env::split_paths(path_variable)
         .filter(|folder| {
@@ -454,8 +485,7 @@ pub fn toolchain_folders(path_variable: &str, home: &Path) -> Vec<PathBuf> {
                 return false;
             }
             let entry = key(&real(&folder.components().collect::<PathBuf>()));
-            let wide = entry.strip_prefix(&format!("{home_key}\\")).is_some_and(|inside| TOO_WIDE.contains(&inside));
-            entry != home_key && under(&entry, &home_key) && !wide && !crate::safety::keys_folder(folder) && !entry.contains("\\.ssh")
+            a_toolchain_place(folder, &entry, &home_key)
         })
         .collect();
     folders.extend(TOOLCHAIN_HOMES.iter().map(|name| home.join(name)));
@@ -594,11 +624,13 @@ pub fn ready_workspace(workspace: &Path) -> Result<(), String> {
     }
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let root = writable_root(workspace, workspace, home.as_deref())?;
+    // (the folder as the person named it, looked at before anything is written down of it: one a command has made a link since is refused)
+    readied(workspace)?;
     // SAFETY: the capability lives as long as the process, and the call below is given nothing else.
     unsafe {
         let capability = workspace_capability(&root)?;
         let _one = crate::workspace_grants::before_grant(&root, capability)?;
-        grant(&root, capability, READ_WRITE_EXECUTE, true)
+        grant_in_place(workspace, capability, READ_WRITE_EXECUTE)
     }
 }
 
@@ -672,7 +704,7 @@ fn capability_name(place: &str) -> String {
 }
 
 /// FNV-1a, 64 bits: a short name made from a long one, the same each time.
-fn fnv(text: &str) -> u64 {
+pub(crate) fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 
@@ -788,12 +820,13 @@ unsafe fn restricted_token(writer: PSID) -> Result<Handle, String> {
 /// What a command run with a restricted token needs before it starts: write for its SID in the workspace and in the temp folder its environment names (its own,
 /// `restricted_temp`, made here), and the workspace's repositories guarded for that SID as for the container's (no new config or hooks). Nothing to read is opened: it
 /// reads as the person does.
-unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+/// `named` is the workspace's root as the app names it (`workspace` is where it really is): it is granted as it was ([`grant_in_place`]).
+unsafe fn prepare_restricted(workspace: &Path, named: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
-    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
+    grant_in_place(named, writer, READ_WRITE_EXECUTE)?;
     if let Some(temp) = temp {
         std::fs::create_dir_all(temp).map_err(|error| format!("{}: the temp folder of the command could not be made: {error}", temp.display()))?;
-        grant(temp, writer, READ_WRITE_EXECUTE, true)?;
+        grant_in_place(temp, writer, READ_WRITE_EXECUTE)?;
     }
     times.grant += began.elapsed();
     let began = Instant::now();
@@ -838,7 +871,7 @@ pub fn with_a_restricted_token() -> bool {
 }
 
 /// Whether this process runs in an AppContainer itself (`in_the_sandbox`).
-fn in_a_container() -> bool {
+pub(crate) fn in_a_container() -> bool {
     static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN.get_or_init(|| {
         // SAFETY: the token is this process's own, opened for asking and closed here; the answer is a 32-bit value.
@@ -994,6 +1027,11 @@ impl Dacl {
 
     pub(crate) fn protected(&self) -> bool {
         self.control & SE_DACL_PROTECTED != 0
+    }
+
+    /// The SIDs this list lets in, as text.
+    unsafe fn allowed_sids(&self) -> Vec<String> {
+        self.aces.iter().filter(|ace| ace.len() > 8 && u32::from(ace[0]) == ACCESS_ALLOWED_ACE_TYPE).map(|ace| sid_text(ace.as_ptr().add(8) as PSID)).collect()
     }
 
     /// Whether this one allows `sid` exactly this, with exactly these flags, and was not inherited.
@@ -1266,6 +1304,18 @@ unsafe fn account_name(sid: PSID) -> Option<String> {
 }
 
 /// A SID as its text (S-1-...); empty if the system cannot say it.
+/// Whether a folder is open to its owner alone, as Python makes one with mode 0o700 since 3.12.4 (`tempfile.mkdtemp`, `TemporaryDirectory`, pytest's `tmp_path`, pip):
+/// a list of its own that takes nothing from the folders above, with SYSTEM, the administrators and OWNER RIGHTS on it, and no container and no capability. A command in the
+/// sandbox cannot open it, the one that made it included: the container's SID, or a workspace's capability, has to be on a list as well as the person.
+pub(crate) fn open_to_its_owner_alone(path: &Path) -> bool {
+    // SAFETY: the list is copied out of the descriptor into memory of its own, and its SIDs are read within each entry.
+    unsafe {
+        let Ok(dacl) = Dacl::read(path) else { return false };
+        let sids = dacl.allowed_sids();
+        dacl.protected() && sids.iter().any(|sid| sid == "S-1-3-4") && !sids.iter().any(|sid| sid.starts_with("S-1-15-"))
+    }
+}
+
 pub(crate) unsafe fn sid_text(sid: PSID) -> String {
     let mut text: *mut u16 = std::ptr::null_mut();
     if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
@@ -1358,6 +1408,12 @@ fn refuse_links(paths: &[&Path]) -> Result<(), String> {
     paths.iter().find(|path| is_link(path)).map_or(Ok(()), |link| Err(link_refusal(link)))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test: what a command does between the look for links in a repository and its lists being written.
+    static AFTER_THE_LOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What a command must not change in a repository: a hook, or a line of config, runs outside the sandbox the next time a person or this app uses git there. Looked at before each
 /// command, as the person's own git writes `config` anew, inheriting. Commits, branches and the rest go on as they do. The folder itself cannot be deleted or renamed by the
 /// container either, or a command could put another in its place. What a command makes of a repository it has just created is not seen until the next command starts.
@@ -1366,9 +1422,20 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
     // A link is not gone through: an ACE would land on whatever it leads to, the person's own `config` or `hooks` anywhere, and that would be opened to commands.
     refuse_links(&[git, &git.join("config"), &git.join("hooks")])?;
     // A worktree's or a submodule's: one line, which says where git's folder is. A command that rewrites it has a repository of its own making, hooks and all.
+    // (its folder held, so that the list is written where the file was looked at: see `held_way`)
     if !what.is_dir() {
+        let _way = crate::held_way::hold(root, git.parent().unwrap_or(root), false)?;
         return limit_to(root, git, sid, &[(READ_EXECUTE, 0)], Walk::No);
     }
+    // (the git folder and its hooks held, and each kept from being made a mount point, from here to the last list written: by their names alone, a
+    // command could put a junction to another repository of the person's in their place after the look for links, and its lists would be written)
+    let way = crate::held_way::hold(root, git, false)?;
+    let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
+    let hooks = git.join("hooks");
+    let hooks_way = if hooks.is_dir() { crate::held_way::hold(root, &hooks, false)? } else { None };
+    let _hooks_kept = crate::held_way::kept_full(hooks_way.as_ref()).map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    AFTER_THE_LOOK.with(|between| if let Some(between) = between.borrow().as_ref() { between() });
     // In a repository's own `.git` this has no business: only a worktree's folder under `worktrees` has one. It tells git to read its config and hooks from wherever it says, past all of this.
     // Taken away before each command: the folder has to stay open for git's own new files, so nothing can stop it being made.
     let elsewhere = git.join("commondir");
@@ -1492,6 +1559,11 @@ fn newly_made(root: &Path, found: &[PathBuf]) -> Vec<PathBuf> {
     let here = known.entry(key(root)).or_default();
     found.iter().filter(|git| here.insert(key(git)) && !first_look).cloned().collect()
 }
+
+/// Repositories a command made whose disarming did not come to an end (a folder held open by another program, a thing put where the app's file goes): each
+/// look disarms them again, as a command's, whatever else ran, and no command runs in their workspace until it has. Known as there at the look that found
+/// them, they would otherwise be taken for the person's at the next.
+static NOT_YET_DISARMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// The app itself has just made this one, and what it writes there after this has been asked about.
 pub fn note_made_by_the_app(root: &Path, folder: &Path) {
@@ -1673,7 +1745,11 @@ fn write_down_link(room: Option<&Path>, link: &Path, name: &str) {
 
 /// What is taken out of one git folder, put aside inside it as it is: its hooks other than the samples, and its config as it was, before it is written again without what names a program.
 /// A link where a hook or the config should be is taken away, and where it led is written down beside the rest.
-fn disarm_folder(folder: &Path, taken: &mut Taken) {
+fn disarm_folder(root: &Path, folder: &Path, taken: &mut Taken) -> Result<(), String> {
+    // (the git folder, and the folders on the way to it, held from the first look to the last write, and it kept from being made a mount point by a file of
+    // the app's in it, as an empty one can be: see `held_way`)
+    let way = crate::held_way::hold(root, folder, false)?;
+    let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
     // (made when first needed: a folder with nothing taken out of it gets none)
     let mut room: Option<Option<PathBuf>> = None;
     let mut room_for = |taken: &mut Taken| -> Option<PathBuf> {
@@ -1692,10 +1768,12 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
         if remove_link(&hooks) {
             taken.names.push("a link in place of its hooks".to_string());
         }
-    } else {
+    } else if std::fs::symlink_metadata(&hooks).is_ok() {
+        let held = crate::held_way::hold(root, &hooks, false)?;
+        let kept = crate::held_way::kept_full(held.as_ref()).map_err(|error| error.to_string())?;
         for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".sample") {
+            if name.ends_with(".sample") || kept.is(&name) {
                 continue;
             }
             // (an entry's own type, which is a link's own and not what it leads to; the links in a folder are taken away before it is moved, and not gone through)
@@ -1726,13 +1804,13 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
         if remove_link(&config) {
             taken.names.push("a link in place of its config".to_string());
         }
-        return;
+        return Ok(());
     }
     // (git does not ask that it be UTF-8)
-    let Ok(bytes) = std::fs::read(&config) else { return };
+    let Ok(bytes) = std::fs::read(&config) else { return Ok(()) };
     let (kept, gone) = config_without_programs(&String::from_utf8_lossy(&bytes));
     if gone.is_empty() {
-        return;
+        return Ok(());
     }
     // The config as it was, byte for byte, on the disk before it is written again; and the new one whole, as a power cut leaves the old or the new, and never zeros.
     let saved = room_for(taken).is_some_and(|room| {
@@ -1745,6 +1823,7 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
             taken.names.extend(gone.into_iter().map(|name| format!("{name} (removed: the config could not be put aside)")));
         }
     }
+    Ok(())
 }
 
 /// Takes out of a repository a command made what would run as the person the next time git is used there: its hooks, and what its config names. Guarding it first would keep later commands from
@@ -1758,15 +1837,14 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
 fn disarm_repository(git: &Path, root: &Path, known: &HashSet<String>, taken: &mut Taken) -> Result<(), String> {
     refuse_links(&[git])?;
     if git.is_dir() {
-        disarm_folder(git, taken);
-        return Ok(());
+        return disarm_folder(root, git, taken);
     }
     // A worktree's or a submodule's: the folder it points to, and for a worktree, the repository that says it is part of.
     let Some(folder) = git_folder_of(git, root)? else { return Ok(()) };
     let common = common_folder_of(&folder, root);
-    disarm_folder(&folder, taken);
+    disarm_folder(root, &folder, taken)?;
     if let Some(common) = common?.filter(|common| !known.contains(&key(common))) {
-        disarm_folder(&common, taken);
+        disarm_folder(root, &common, taken)?;
     }
     Ok(())
 }
@@ -1782,6 +1860,12 @@ unsafe fn guard_with_what_it_leads_to(root: &Path, git: &Path, sid: PSID) -> Res
                 common_folder_of(&folder, root)?;
             } else {
                 refuse_links(&[&folder, &folder.join("config"), &folder.join("hooks")])?;
+                // (held as a repository's own git folder is: see `guard_repository`)
+                let way = crate::held_way::hold(root, &folder, false)?;
+                let _kept = crate::held_way::kept_full(way.as_ref()).map_err(|error| error.to_string())?;
+                let hooks = folder.join("hooks");
+                let hooks_way = if hooks.is_dir() { crate::held_way::hold(root, &hooks, false)? } else { None };
+                let _hooks_kept = crate::held_way::kept_full(hooks_way.as_ref()).map_err(|error| error.to_string())?;
                 let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
                 limit_to(root, &folder.join("config"), sid, &[(READ_EXECUTE, 0)], Walk::No)?;
                 limit_to(root, &folder.join("hooks"), sid, &[(READ_EXECUTE, everything)], Walk::Yes)?;
@@ -1811,11 +1895,30 @@ unsafe fn look_after_repositories(root: &Path, sid: PSID, when: Look) -> Looked 
     let new = newly_made(root, &found);
     let by_a_command = commands_since_the_last_look(root) || when == Look::AfterACommand;
     let mut looked = Looked { said: Vec::new(), refused: None };
-    if by_a_command && !new.is_empty() {
-        let known: HashSet<String> = found.iter().filter(|git| !new.contains(git)).map(|git| key(git)).collect();
-        for git in &new {
+    let mut to_disarm = if by_a_command { new } else { Vec::new() };
+    {
+        let not_yet = NOT_YET_DISARMED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let not_yet = not_yet.as_ref();
+        for git in &found {
+            if not_yet.is_some_and(|not_yet| not_yet.contains(&key(git))) && !to_disarm.contains(git) {
+                to_disarm.push(git.clone());
+            }
+        }
+    }
+    if !to_disarm.is_empty() {
+        let known: HashSet<String> = found.iter().filter(|git| !to_disarm.contains(git)).map(|git| key(git)).collect();
+        for git in &to_disarm {
             let mut taken = Taken::default();
             let result = disarm_repository(git, root, &known, &mut taken);
+            {
+                let mut not_yet = NOT_YET_DISARMED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let not_yet = not_yet.get_or_insert_with(HashSet::new);
+                if result.is_ok() {
+                    not_yet.remove(&key(git));
+                } else {
+                    not_yet.insert(key(git));
+                }
+            }
             if !taken.names.is_empty() {
                 let shown = git.parent().and_then(|folder| folder.strip_prefix(root).ok()).map_or(String::new(), |place| place.display().to_string());
                 looked.said.push(taken.said_of(&if shown.is_empty() { "the workspace folder itself".to_string() } else { shown }));
@@ -1875,20 +1978,128 @@ pub(crate) unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> 
     Ok(())
 }
 
-/// Folders commands may read and run from besides the toolchains: a skill's scripts, once it is in use.
-static ALSO_READABLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Folders commands may read and run from besides the toolchains: a skill's scripts, once it is in use. Each with where it really was when it was
+/// opened: one that leads elsewhere since, a junction a program put in its place or on its way, would take the grant of the next command to its end.
+static ALSO_READABLE: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
 pub fn also_readable(folder: &Path) {
+    let Some(real) = crate::safety::real_path(folder) else { return };
     let mut folders = ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !folders.iter().any(|known| key(known) == key(folder)) {
-        folders.push(folder.to_path_buf());
+    if !folders.iter().any(|(known, _)| key(known) == key(folder)) {
+        folders.push((folder.to_path_buf(), real));
     }
 }
 
+/// What a command is told when its workspace's folder, or its temp folder, has become a link since the app made it ready.
+pub const MOVED: &str = "this folder has become a link to another place since the app made it ready (a command can make it one), so nothing was run or granted there: open the folder itself as the workspace again";
+
+/// Where each folder commands write in (a workspace's root, a restricted command's temp folder) really was when the app first made it ready in this
+/// process. A command can make such a folder a mount point to a place outside since: with a restricted token, which Windows does not count as a
+/// sandbox's, to a place it cannot write itself (tried: the root of a workspace made one to a folder of the person's). A grant by the folder's name
+/// would then land at that place, for every later command.
+static READIED: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+/// Where `named` really is, where it is no link or junction itself and leads where it did when it was first made ready here; an error that says
+/// so otherwise.
+pub(crate) fn readied(named: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(named).is_ok_and(|found| leads_elsewhere(&found)) {
+        return Err(format!("{}: {MOVED}", named.display()));
+    }
+    let real = crate::safety::real_path(named).ok_or_else(|| format!("{}: it cannot be found", named.display()))?;
+    let mut readied = READIED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let then = readied.get_or_insert_with(HashMap::new).entry(key(named)).or_insert_with(|| real.clone());
+    if *then != real {
+        return Err(format!("{}: {MOVED}", named.display()));
+    }
+    Ok(real)
+}
+
+/// `grant` of a folder commands write in, inherited by what is in it: where it is as it was ([`readied`]), and by a handle on the folder as named,
+/// which is looked at once more as it is granted ([`grant_where_it_was`]).
+unsafe fn grant_in_place(named: &Path, sid: PSID, mask: u32) -> Result<(), String> {
+    let real = readied(named)?;
+    grant_where_it_was(named, &real, sid, mask)
+}
+
+/// The path a handle has, as `safety::real_path` spells one: with no `\\?\` in front.
+unsafe fn final_path(handle: HANDLE) -> Option<PathBuf> {
+    let mut text = vec![0u16; 4096];
+    let length = GetFinalPathNameByHandleW(handle, text.as_mut_ptr(), text.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) as usize;
+    if length == 0 || length >= text.len() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&text[..length]);
+    Some(PathBuf::from(match path.strip_prefix("\\\\?\\UNC\\") {
+        Some(share) => format!("\\\\{share}"),
+        None => path.strip_prefix("\\\\?\\").unwrap_or(&path).to_string(),
+    }))
+}
+
+/// `grant` of a folder opened to commands, inherited by what is in it, by a handle opened on the folder itself, with no link or junction followed:
+/// granted only where that handle is no link or junction and is where the folder really was when it was opened (`real`). Between the look and the
+/// grant there is no other way then for it to lead, as there was by its name.
+unsafe fn grant_where_it_was(folder: &Path, real: &Path, sid: PSID, mask: u32) -> Result<(), String> {
+    let memo = (format!("{}|{}", sid_text(sid), key(folder)), mask, true);
+    if GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashSet::new).contains(&memo) {
+        return Ok(());
+    }
+    let name = wide_path(folder);
+    if !has_grant(&name, sid, mask, true) {
+        let handle = Handle(CreateFileW(name.as_ptr(), WRITE_DAC | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()));
+        if handle.0 == INVALID_HANDLE_VALUE {
+            return Err(last_error(&folder.display().to_string()));
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(handle.0, &mut info) == 0 {
+            return Err(last_error(&folder.display().to_string()));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("{}: a link or a junction", folder.display()));
+        }
+        if final_path(handle.0).as_deref() != Some(real) {
+            return Err(format!("{}: it leads elsewhere than when it was opened", folder.display()));
+        }
+        let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let read = GetSecurityInfo(handle.0, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor);
+        if read != 0 {
+            return Err(format!("{}: its access list cannot be read (error {read})", folder.display()));
+        }
+        let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        access.grfAccessPermissions = mask;
+        access.grfAccessMode = GRANT_ACCESS;
+        access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        access.Trustee.ptstrName = sid as *mut u16;
+        let mut new: *mut ACL = std::ptr::null_mut();
+        let merged = SetEntriesInAclW(1, &access, old, &mut new);
+        let written = if merged != 0 { merged } else { SetSecurityInfo(handle.0, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), new, std::ptr::null()) };
+        if !new.is_null() {
+            LocalFree(new as HLOCAL);
+        }
+        LocalFree(descriptor as HLOCAL);
+        if written != 0 {
+            return Err(format!("{}: access could not be set (error {written})", folder.display()));
+        }
+    }
+    GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashSet::new).insert(memo);
+    Ok(())
+}
+
+/// Whether a folder opened to commands is still where it was when it was opened: the same place through links, and no link or junction on its way.
+fn still_where_it_was(folder: &Path, real: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let leads_elsewhere = |place: &Path| std::fs::symlink_metadata(place).is_ok_and(|found| found.file_type().is_symlink() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+    crate::safety::real_path(folder).as_deref() == Some(real) && !folder.ancestors().any(leads_elsewhere)
+}
+
 /// What of the app's folder stays closed to commands, whatever of it is opened ([`records_readable`]): the settings, which may hold a key, and what was set aside of them,
-/// the folders the person has granted and opened, the engine's own settings, and the person's notes, instructions and attachments. Nothing opens these; a test reads each
+/// the folders the person has granted and opened, the engine's own settings, the person's notes, instructions and attachments, the MCP servers' list (their headers and their
+/// programs' environments), and the key of the conversations wrapped, with its copies. Nothing opens these; a test reads each
 /// from a command once the records are open, and is refused.
-pub const HELD_CLOSED: [&str; 10] = ["settings.json", "settings.json.broken", "workspace-grants.json", "read-folders.json", "engine.toml", "engine.toml.old", "instructions.md", "memory", "attachments", "updates"];
+pub const HELD_CLOSED: [&str; 14] = ["settings.json", "settings.json.broken", "workspace-grants.json", "read-folders.json", "engine.toml", "engine.toml.old", "instructions.md", "memory", "attachments", "updates",
+    // (what holds keys too: the servers' headers and the environments of their programs, and the key of the conversations wrapped, which a passphrase can be tried against)
+    "mcp.json", "conversation-key.json", "conversation-key.json.copy", "conversation-key.json.damaged"];
 
 /// Dogmind's own records that commands may read, besides the workspace: its conversations, each with its trajectory, and the engine's log.
 static RECORDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -1903,6 +2114,82 @@ pub fn records_readable(records: &[PathBuf]) {
             known.push(record.clone());
         }
     }
+}
+
+/// The name of the app's folder for what it writes for commands and the check's browser to read ([`app_folder_for_sandbox`]), in its data folder.
+pub const FOR_SANDBOX: &str = "for-sandbox";
+
+/// The app's own folder for what it writes for commands and the check's browser to read: the copies of a page a check opens and their frames, the CDN files and the
+/// frames extension the browser loads, the pictures it takes, the copies of attached pictures, long outputs kept whole. These were in the sandbox's temp folder, where a
+/// program in the sandbox can write too: a folder on the way made a junction, or a name a link, and the app, which is not in the sandbox, would write where the program
+/// could not. This folder has a list of its own, which nothing above it adds to: the person, the system and the administrators, and the container to read and to run, so
+/// that no command writes in it, nor makes a junction or a file there. None where the app has no folder of its own (a test's) or runs in the sandbox itself (it can write
+/// no list then); an error where the folder could not be made so, and nothing is to be written for commands then.
+pub(crate) fn app_folder_for_sandbox() -> Result<Option<PathBuf>, String> {
+    static MADE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if in_the_sandbox() {
+        return Ok(None);
+    }
+    let Some(data) = crate::workspace_grants::data_folder() else { return Ok(None) };
+    let folder = data.join(FOR_SANDBOX);
+    let mut made = MADE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let made = made.get_or_insert_with(HashSet::new);
+    // (made once a process; and looked at each time, as a folder another took away and put a junction in place of is no longer this one)
+    if made.contains(&key(&folder)) && std::fs::symlink_metadata(&folder).is_ok_and(|metadata| metadata.is_dir() && !leads_elsewhere(&metadata)) {
+        return Ok(Some(folder));
+    }
+    // SAFETY: the SID lives as long as the process.
+    unsafe { made_for_sandbox(&folder, profile_sid()?)? };
+    made.insert(key(&folder));
+    Ok(Some(folder))
+}
+
+/// Where the app writes what commands and the check's browser read: its own folder for them ([`app_folder_for_sandbox`]), or the sandbox's temp folder where it has
+/// none (in the sandbox itself, it writes only where it could anyway). None where its own could not be made: nothing is written for them then.
+pub(crate) fn for_sandbox_folder() -> Option<PathBuf> {
+    match app_folder_for_sandbox() {
+        Ok(Some(folder)) => Some(folder),
+        Ok(None) => temp_folder(),
+        Err(_) => None,
+    }
+}
+
+/// Whether what `metadata` is of is a link or a junction.
+fn leads_elsewhere(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || metadata.file_type().is_symlink()
+}
+
+/// A well-known SID, in a buffer of its own.
+unsafe fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<[usize; 12], String> {
+    let mut sid = [0usize; 12];
+    let mut size = std::mem::size_of_val(&sid) as u32;
+    if CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size) == 0 {
+        return Err(last_error("a well-known SID"));
+    }
+    Ok(sid)
+}
+
+/// `folder`, made if it is not there, with the list [`app_folder_for_sandbox`] says, written each time for what is made in it from then on to inherit, and the folders
+/// above it to pass through for `sid`. A folder there that is a link or a junction is not used.
+pub(crate) unsafe fn made_for_sandbox(folder: &Path, sid: PSID) -> Result<(), String> {
+    std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    let metadata = std::fs::symlink_metadata(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    if leads_elsewhere(&metadata) || !metadata.is_dir() {
+        return Err(format!("{} is a link or a junction", folder.display()));
+    }
+    let person = PersonSid::now().ok_or("the app's own SID")?;
+    let (mut system, mut administrators) = (well_known_sid(WinLocalSystemSid)?, well_known_sid(WinBuiltinAdministratorsSid)?);
+    let all = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+    let aces = vec![
+        Dacl::allowed_ace(person.sid(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(system.as_mut_ptr().cast(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(administrators.as_mut_ptr().cast(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(sid, READ_EXECUTE, all),
+    ];
+    Dacl { aces, revision: ACL_REVISION, control: SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED }.write_alone(folder)?;
+    grant_way_to(folder, sid);
+    Ok(())
 }
 
 /// Where the time of a command went apart from the program's own: what the app does before the process starts (`prepare`, in the parts of it that take time), the program from its start to its
@@ -2409,9 +2696,10 @@ pub fn take_timings() -> Vec<Timings> {
 }
 
 /// `sid` is the container's, `writer` the workspace's capability (`workspace_capability`).
-unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+/// `named` is the workspace's root as the app names it (`workspace` is where it really is): it is granted as it was ([`grant_in_place`]).
+unsafe fn prepare(workspace: &Path, named: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
-    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
+    grant_in_place(named, writer, READ_WRITE_EXECUTE)?;
     times.grant += began.elapsed();
     // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
     let began = Instant::now();
@@ -2423,8 +2711,14 @@ unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<
         return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also did this, in a repository made since the last command: {}", disarmed.join(" ")) });
     }
     let began = Instant::now();
-    for folder in ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
-        let _ = grant(folder, sid, READ_EXECUTE, true);
+    let mut opened = ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (one that leads elsewhere now than when it was opened is let go and not granted; one in the workspace is readable already)
+    opened.retain(|(folder, real)| still_where_it_was(folder, real));
+    for (folder, real) in opened.iter().filter(|(folder, _)| !crate::safety::inside(workspace, folder)) {
+        // (by a handle on the folder itself, looked at once more: between the look above and the grant, a program could put a junction in its place)
+        if grant_where_it_was(folder, real, sid, READ_EXECUTE).is_err() {
+            continue;
+        }
         for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
             let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
         }
@@ -2448,14 +2742,28 @@ unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<
     #[cfg(not(test))]
     if let (Some(path), Some(home)) = (std::env::var_os("PATH"), std::env::var_os("USERPROFILE")) {
         let began = Instant::now();
-        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid);
+        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid, Some(workspace));
         times.toolchains += began.elapsed();
     }
     Ok(())
 }
 
-pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID) {
-    for folder in toolchain_folders(path_variable, home) {
+/// A folder of PATH in `workspace`, as written or where it really is (a short name is in it too), is not opened: it is readable already, and a
+/// command could make it a junction to a place outside. Nor is one that is a link or a junction, or is reached through one (a folder above it is
+/// one): a link can lead on through another, as one into a workspace whose folder a command has made a junction to the person's documents, and
+/// every rule for where such a chain may go has had a way past it. nvm-windows' `C:\Program Files\nodejs` is one, and the bundled Node stands for
+/// it. The others are looked at as `toolchain_folders` looks at what is written, where they really are, and nothing is opened that is in a folder
+/// commands write in or the app writes for them (any workspace it remembers, the container's own folder, which holds the restricted commands' temp
+/// folders, and the folder for the sandbox); what is, is opened by a handle on the folder itself ([`grant_where_it_was`]).
+pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID, workspace: Option<&Path>) {
+    // (in it as written, or where both really are)
+    let in_workspace = |folder: &Path| workspace.is_some_and(|workspace| {
+        crate::safety::inside(workspace, folder) || crate::safety::real_path(workspace).zip(crate::safety::real_path(folder)).is_some_and(|(root, real)| crate::safety::inside(&root, &real))
+    });
+    let home_key = key(&real(home));
+    let remembered = crate::workspace_grants::data_folder().map(|data| crate::workspace_grants::still_granted(&data)).unwrap_or_default();
+    let written: Vec<PathBuf> = profile_folder(sid).into_iter().chain(remembered).chain(for_sandbox_folder()).filter_map(|place| crate::safety::real_path(&place)).collect();
+    for folder in toolchain_folders(path_variable, home).into_iter().filter(|folder| !in_workspace(folder)) {
         // (a person's own Python or Node is not what runs when the bundle has its own, so nothing is opened for it; where the bundle lacks one, theirs is)
         let replaced = bundled.is_some_and(|present| {
             let folder_key = key(&folder);
@@ -2463,11 +2771,21 @@ pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: 
                 || (present.python && folder_key.contains("python"))
                 || (present.node && (folder_key.contains("npm") || folder_key.contains("nvm")))
         });
-        if folder.exists() && !replaced {
-            let _ = grant(&folder, sid, READ_EXECUTE, true);
-            hold_out_secrets(&folder, sid);
+        if folder.exists() && !replaced && !through_a_link(&folder) {
+            let Some(real) = crate::safety::real_path(&folder) else { continue };
+            if !a_toolchain_place(&folder, &key(&real), &home_key) || written.iter().any(|place| crate::safety::inside(place, &real)) {
+                continue;
+            }
+            if grant_where_it_was(&real, &real, sid, READ_EXECUTE).is_ok() {
+                hold_out_secrets(&real, sid);
+            }
         }
     }
+}
+
+/// Whether a folder, as written, is a link or a junction, or is reached through one: it, or a folder above it, is one (looked at, not gone through).
+fn through_a_link(written: &Path) -> bool {
+    written.ancestors().any(|place| std::fs::symlink_metadata(place).is_ok_and(|found| found.file_type().is_symlink()))
 }
 
 /// What reads as a secret directly in a toolchain's folder is not given with it: `.cargo\credentials.toml` holds a person's token for crates.io, and is written anew by `cargo login`, so
@@ -2520,7 +2838,7 @@ const OFFLINE: [(&str, &str); 10] = [
     ("PIP_NO_INDEX", "1"), ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
 ];
 
-/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the sandbox's own temp folder, put first on PYTHONPATH.
+/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the app's own for the sandbox, put first on PYTHONPATH.
 const PYTHON_SHIM_FOLDER: &str = "dogmind-python";
 /// The sitecustomize a command's Python starts with, whichever Python it is (a person's own has none of the bundled one's): see its own words.
 const PYTHON_SHIM: &str = r#"# Dogmind's, for a command in its sandbox. On Windows, Python 3.13 and later make a folder of mode 0o700 (tempfile.mkdtemp, TemporaryDirectory,
@@ -2555,16 +2873,17 @@ def _dogmind_next_sitecustomize():
 _dogmind_next_sitecustomize()
 "#;
 
-/// `PYTHON_SHIM` in the sandbox's temp folder, written where it is not there as it is. A command can read it there, and nothing a command does to it outlasts the next.
-fn put_python_shim(temp: &str) {
-    if temp.is_empty() {
-        return;
-    }
-    let file = Path::new(temp).join(PYTHON_SHIM_FOLDER).join("sitecustomize.py");
+/// `PYTHON_SHIM` in the app's own folder for the sandbox, which a command reads and cannot write (`for_sandbox_folder`), written where it is not there as
+/// it is: the folder to put on PYTHONPATH. It was in the command's temp folder, which a command writes: one that made the shim's folder there a junction
+/// had the app write sitecustomize.py as the person wherever it led, over a person's own in their Python's site-packages.
+fn put_python_shim() -> Option<String> {
+    let base = for_sandbox_folder()?;
+    let folder = base.join(PYTHON_SHIM_FOLDER);
+    let file = folder.join("sitecustomize.py");
     if std::fs::read_to_string(&file).ok().as_deref() != Some(PYTHON_SHIM) {
-        let _ = std::fs::create_dir_all(file.parent().expect("a folder"));
-        let _ = std::fs::write(&file, PYTHON_SHIM);
+        crate::temp_writes::write(&base, &file, PYTHON_SHIM).ok()?;
     }
+    Some(folder.display().to_string())
 }
 
 /// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
@@ -2572,10 +2891,8 @@ fn put_python_shim(temp: &str) {
 fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: bool, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    if !as_person {
-        put_python_shim(&temp);
-    }
-    let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
+    let shim = if as_person { None } else { put_python_shim() };
+    let mut block = environment_block(block, crate::bundled::root().as_deref(), shim, temp, workspace, build_tools);
     // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
     if as_person {
         block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL", POWERSHELL_POLICY.0, NO_ZONE_CHECKS.0].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
@@ -2614,7 +2931,7 @@ fn their_git_first(block: &mut [(String, String)], inherited: &str, bundled: Opt
 /// A command's environment from what it inherits. The PATH comes out as the bundled tools and the folder `npm install -g` fills, then what the machine has (without a person's own Python,
 /// Node or Git, and without a folder of MSYS or Cygwin programs, which cannot start here and would stand in for Windows' own `find` and `sort`), and last the folders of Visual Studio's
 /// compiler when `build_tools` finds them: nothing that is earlier on it can be shadowed by a later one.
-fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
+fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, shim: Option<String>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
     crate::msvc::add_to(&mut block, build_tools);
     // (before anything is made of it, with a bundle or without: `path_of` leaves the same ones off)
     if let Some((_, path)) = block.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case("PATH")) {
@@ -2629,8 +2946,8 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     // Where git looks for its per-user files: the person's profile is closed to a command, and it would warn on every run.
     block.push(("XDG_CONFIG_HOME".to_string(), temp.clone()));
     // (its sitecustomize first, for any Python: a folder of mode 0o700 made under the container is one the container cannot open, see PYTHON_SHIM)
-    if !temp.is_empty() {
-        block.push(("PYTHONPATH".to_string(), format!("{temp}\\{PYTHON_SHIM_FOLDER}")));
+    if let Some(shim) = shim {
+        block.push(("PYTHONPATH".to_string(), shim));
     }
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
@@ -2719,6 +3036,14 @@ pub fn run_live_as_person(line: &str, cwd: &Path, workspace: &Path, timeout: Dur
     run_limited(line, cwd, workspace, true, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Person)
 }
 
+/// As `run_live`, started in `start_in` rather than in the workspace: a folder of the app's that commands can read and not write (`for_sandbox_folder`), for the
+/// guidance CLI (`tools::guidance_cli_line`), which a workspace's npm settings would otherwise have a say in. It is given to the process as its folder to start in:
+/// cmd's `cd` there was refused in the container, as it lists each folder on the way to get their names' case, and the folders above the app's are only to pass through.
+/// What it may write is what any command of the workspace may.
+pub fn run_live_from(line: &str, start_in: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    run_limited_in(line, workspace, workspace, Some(start_in), network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Container)
+}
+
 /// What a command runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
@@ -2743,6 +3068,12 @@ pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, 
 
 #[allow(clippy::too_many_arguments)]
 fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
+    run_limited_in(line, cwd, workspace, None, network, timeout, cancel, ui_limits, memory_cap, closed_stdin, live, token)
+}
+
+/// `run_limited`, the process started in `start_in` where one is given, and in `cwd` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn run_limited_in(line: &str, cwd: &Path, workspace: &Path, start_in: Option<&Path>, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
     let asked_at = Instant::now();
     // (what it makes from here is what is looked for after it: see `programs_to_medium`)
     let began_at = std::time::SystemTime::now();
@@ -2784,11 +3115,14 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let mut times = Timings::default();
         // (as the person, nothing is to be granted: it can do what they can)
         if token != Token::Person && !nested {
+            // (the root as the app names it, the workspace or the folder a command runs in, looked at before anything is written down of it)
+            let named = if crate::safety::real_path(workspace).is_some_and(|real| key(&real) == key(&root)) { workspace } else { cwd };
+            readied(named)?;
             let _one = crate::workspace_grants::before_grant(&root, grantee)?;
             if let Some(writer) = &writer {
-                prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
+                prepare_restricted(&root, named, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
             } else {
-                prepare(&root, sid, grantee, &mut disarmed, &mut times)?;
+                prepare(&root, named, sid, grantee, &mut disarmed, &mut times)?;
                 // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
                 if let Some(folder) = crate::workspace_grants::data_folder() {
                     crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
@@ -2897,7 +3231,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it)
         let block = environment(temp.as_deref().filter(|_| token != Token::Person), &root, writer.is_some() && !network, token == Token::Person, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         times.env = env_began.elapsed();
-        let place = wide_path(cwd);
+        let place = wide_path(start_in.unwrap_or(cwd));
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         times.prepare = asked_at.elapsed();
         let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | if nested { CREATE_SUSPENDED } else { 0 };
@@ -3889,6 +4223,382 @@ mod tests {
         assert!(made.status != Some(0) && !sessions.join("c.jsonl").exists(), "nothing is made among them");
     }
 
+    /// The app's folder for what it writes for commands (`app_folder_for_sandbox`): a command reads what the app put there, and writes nothing, nor makes a folder or a
+    /// junction there, in the container and with the restricted token. It is made here in a workspace, whose list gives commands all it has, and keeps its own list.
+    #[test]
+    fn a_command_reads_the_apps_folder_for_it_and_writes_nothing_there() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, outside) = (work_folder("for-sandbox-work"), work_folder("for-sandbox-outside"));
+        let folder = work.join("data").join(FOR_SANDBOX);
+        // SAFETY: the SID lives as long as the process.
+        unsafe { made_for_sandbox(&folder, profile_sid().unwrap()) }.unwrap();
+        std::fs::create_dir_all(folder.join("cdn")).unwrap();
+        let file = folder.join("cdn").join("a.js");
+        std::fs::write(&file, "FOR-SANDBOX\n").unwrap();
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None).unwrap();
+        let read = format!("type \"{}\"", file.display());
+        let out = command(&read, &work, false);
+        assert!(decode(&out.stdout).contains("FOR-SANDBOX"), "{:?} {}", out.status, decode(&out.stderr));
+        let out = restricted(&read);
+        assert!(decode(&out.stdout).contains("FOR-SANDBOX"), "with the restricted token: {:?} {}", out.status, decode(&out.stderr));
+        let lines = [
+            format!("echo x> \"{}\"", folder.join("b.txt").display()),
+            format!("echo x>> \"{}\"", file.display()),
+            format!("md \"{}\"", folder.join("c").display()),
+            format!("mklink /J \"{}\" \"{}\"", folder.join("j").display(), outside.display()),
+            format!("mklink /J \"{}\" \"{}\"", folder.join("cdn").join("j").display(), outside.display()),
+        ];
+        for line in &lines {
+            let done = command(line, &work, false);
+            assert_ne!(done.status, Some(0), "{line}: {}", decode(&done.stdout));
+            let done = restricted(line);
+            assert_ne!(done.status, Some(0), "{line} with the restricted token: {}", decode(&done.stdout));
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "FOR-SANDBOX\n");
+        assert!(["b.txt", "c", "j"].iter().all(|name| !folder.join(name).exists()) && !folder.join("cdn").join("j").exists());
+        // A junction where the folder would be is not used.
+        let link = work.join("data2").join(FOR_SANDBOX);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        // SAFETY: as above.
+        assert!(unsafe { made_for_sandbox(&link, profile_sid().unwrap()) }.is_err());
+    }
+
+    /// A skill's folder opened to commands, made a junction to a place outside since (as a program in the sandbox could): the next commands, in the
+    /// container and with the restricted token, are not granted its end, and the folder is let go. Its scripts are read as before until then. And the
+    /// grant by the handle itself refuses a junction, and a folder that leads elsewhere than it did.
+    #[test]
+    fn a_folder_opened_to_commands_and_made_a_junction_since_is_not_granted() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, skill, target) = (work_folder("opened-swap-work"), outside_folder("opened-swap-skill"), outside_folder("opened-swap-target"));
+        std::fs::write(skill.join("script.txt"), "SKILL-SCRIPT\n").unwrap();
+        std::fs::write(target.join("secret.txt"), "SECRET\n").unwrap();
+        also_readable(&skill);
+        let out = command(&format!("type \"{}\"", skill.join("script.txt").display()), &work, false);
+        assert!(decode(&out.stdout).contains("SKILL-SCRIPT"), "{:?} {}", out.status, decode(&out.stderr));
+        std::fs::remove_dir_all(&skill).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&skill).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let out = command(&format!("type \"{}\"", skill.join("secret.txt").display()), &work, false);
+        assert!(!decode(&out.stdout).contains("SECRET"), "read through the junction: {}", decode(&out.stdout));
+        let _ = run_live_restricted("echo x", &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None).unwrap();
+        // SAFETY: the SID lives as long as the process; the list is read and let go.
+        let sid = unsafe { profile_sid() }.unwrap();
+        let list = unsafe { Dacl::read(&target) }.unwrap();
+        assert!(!list.aces.iter().any(|ace| unsafe { Dacl::is_allowed_for(ace, sid) }), "no grant at the junction's end");
+        assert!(!ALSO_READABLE.lock().unwrap().iter().any(|(folder, _)| key(folder) == key(&skill)), "let go");
+        // SAFETY: as above.
+        // (a junction granted nothing before, and so not in the memo of what was granted, which never writes again)
+        let link = outside_folder("opened-swap-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        unsafe {
+            assert!(grant_where_it_was(&link, &target, sid, READ_EXECUTE).is_err(), "a junction, even to where it was");
+            let other = outside_folder("opened-swap-other");
+            assert!(grant_where_it_was(&other, &target, sid, READ_EXECUTE).is_err(), "a folder that is not where it was");
+            assert!(grant_where_it_was(&other, &other, sid, READ_EXECUTE).is_ok(), "and one that is");
+        }
+    }
+
+    /// A workspace whose root a command has made a link to a place outside since (as a command with a restricted token can, to a place it cannot write)
+    /// is refused, in the container and with the restricted token: nothing runs and nothing is granted at the place. So is a restricted command's
+    /// temp folder made one. A workspace as it was runs as before.
+    #[test]
+    fn a_folder_commands_write_in_made_a_link_since_is_refused_and_not_granted() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, target) = (work_folder("readied-root"), outside_folder("readied-target"));
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        assert_eq!(command("echo here", &work, false).status, Some(0));
+        let temp = decode(&restricted("echo %TEMP%").unwrap().stdout).trim().to_string();
+        assert!(!temp.is_empty());
+        let before = dacl_text(&target).unwrap();
+        // (what the command could have done itself: the root a mount point to the place)
+        std::fs::remove_dir_all(&work).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&work).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let refused = run("echo x> there.txt", &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false)).err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        let refused = restricted("echo x> there.txt").err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        assert!(!target.join("there.txt").exists());
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        // (nor within it, for the tools: a root that is a link holds nothing)
+        assert!(!crate::safety::within(&work, &work.join("there.txt")));
+        std::fs::remove_dir(&work).unwrap();
+        // The restricted command's temp folder made one too: refused, and nothing granted.
+        let work = work_folder("readied-root");
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        let temp = PathBuf::from(decode(&restricted("echo %TEMP%").unwrap().stdout).trim());
+        std::fs::remove_dir_all(&temp).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&temp).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let refused = restricted("echo x> there.txt").err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        std::fs::remove_dir(&temp).unwrap();
+        assert_eq!(restricted("echo again").map(|out| out.status).unwrap_or_default(), Some(0), "its own temp folder made again, as it was");
+        // A remembered workspace that has become a link is refused as it is made ready, before anything is written down of it.
+        let link = work_folder("readied-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        assert!(ready_workspace(&link).is_err_and(|error| error.contains(MOVED)));
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    /// PATH's folders: one in the workspace, written by its short name, is not opened. Nor is one that is a junction or a link, or is reached through
+    /// one: to a folder outside (as nvm-windows makes `nodejs`), into the workspace, on from there to the person's documents or keys, to the home.
+    /// A plain one opens as before, and what is in it runs.
+    #[test]
+    fn a_toolchain_folder_in_the_workspace_or_through_a_link_is_not_opened() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let home = outside_folder("toolchains-home");
+        let work = home.join("project-with-a-long-name");
+        let (plain, real_tools, junction, link) = (home.join("tools"), home.join("real-tools"), home.join("tools-junction"), home.join("tools-link"));
+        let (inner, into_work) = (work.join("inner"), home.join("into-work"));
+        // (a link into the workspace whose folder a command has made a junction to the person's documents, one so to the keys of `.aws`, and one to
+        // the home itself)
+        let (documents, documents_in_work, to_documents) = (home.join("Documents"), work.join("documents"), home.join("to-documents"));
+        let (keys, keys_in_work, to_keys, to_home) = (home.join(".aws"), work.join("keys"), home.join("to-keys"), home.join("to-home"));
+        for folder in [work.join(".venv").join("Scripts"), plain.clone(), real_tools.join("bin"), inner.clone(), keys.clone(), documents.clone()] {
+            std::fs::create_dir_all(&folder).unwrap();
+        }
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        for folder in [&real_tools, &plain] {
+            std::fs::copy(system.join("cmd.exe"), folder.join("node.exe")).unwrap();
+        }
+        let junctions = [(&junction, &real_tools), (&into_work, &inner), (&documents_in_work, &documents), (&to_documents, &documents_in_work), (&keys_in_work, &keys), (&to_keys, &keys_in_work), (&to_home, &home)];
+        for (made_at, to) in junctions {
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(made_at).arg(to).output().unwrap();
+            assert!(made.status.success(), "{}", decode(&made.stdout));
+        }
+        // (a symbolic link wants developer mode or an administrator: where neither is, the junctions stand for it)
+        let linked = std::os::windows::fs::symlink_dir(&real_tools, &link).is_ok();
+        // (the short name Windows has for the workspace's folder, where the volume keeps them)
+        let scripts = work.join(".venv").join("Scripts");
+        let short = {
+            let name = wide_path(&scripts);
+            let mut text = vec![0u16; 1024];
+            // SAFETY: the buffers live through the call, which is told the length of the one it writes.
+            let length = unsafe { GetShortPathNameW(name.as_ptr(), text.as_mut_ptr(), text.len() as u32) } as usize;
+            assert!(length > 0 && length < text.len());
+            PathBuf::from(String::from_utf16_lossy(&text[..length]).trim_start_matches("\\\\?\\").to_string())
+        };
+        // (one link, one folder below one, and the chains)
+        let mut entries = vec![short.clone(), plain.clone(), junction.clone(), junction.join("bin"), into_work.clone(), to_documents.clone(), to_keys.clone(), to_home.clone()];
+        if linked {
+            entries.push(link.clone());
+        }
+        let path = std::env::join_paths(entries).unwrap();
+        // SAFETY: the SID lives as long as the process.
+        let sid = unsafe { profile_sid() }.unwrap();
+        unsafe { open_toolchains(&path.to_string_lossy(), &home, None, sid, Some(&work)) };
+        let id = profile_sid_text();
+        assert!(!dacl_text(&scripts).unwrap().contains(&id), "in the workspace, by {}", short.display());
+        for (what, folder) in [("a junction", &real_tools), ("a folder below one", &real_tools.join("bin")), ("into the workspace", &inner), ("on to the documents", &documents), ("on to the keys", &keys), ("to the home", &home)] {
+            assert!(!dacl_text(folder).unwrap().contains(&id), "{what}: {}", folder.display());
+        }
+        assert!(dacl_text(&plain).unwrap().contains(&id), "a plain one is opened");
+        let ws = work_folder("toolchains-run");
+        let through = |folder: &Path| command(&format!("\"{}\" /c echo ran", folder.join("node.exe").display()), &ws, false);
+        let ran = through(&plain);
+        assert_eq!((ran.status, decode(&ran.stdout).trim()), (Some(0), "ran"), "{}", decode(&ran.stderr));
+        assert_ne!(through(&junction).status, Some(0), "nothing through the junction");
+        if !linked {
+            eprintln!("no symbolic link could be made here (no developer mode): the junctions stood for it");
+        }
+        for made_at in [&junction, &into_work, &link, &to_documents, &documents_in_work, &to_keys, &keys_in_work, &to_home] {
+            let _ = std::fs::remove_dir(made_at);
+        }
+    }
+
+    /// A command that puts a junction to a repository of the person's in the place of a repository's `.git` just after the app has looked for links there
+    /// cannot: the folder is held, and the person's lists are as they were.
+    #[test]
+    fn a_git_folder_cannot_be_swapped_between_the_look_and_the_lists() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        let their_git = theirs.path().join(".git");
+        for place in [git.clone(), their_git.clone()] {
+            std::fs::create_dir_all(place.join("hooks")).unwrap();
+            std::fs::write(place.join("config"), "[core]
+	bare = false
+").unwrap();
+        }
+        let lists = || (dacl_text(&their_git).unwrap(), dacl_text(&their_git.join("config")).unwrap(), dacl_text(&their_git.join("hooks")).unwrap());
+        let before = lists();
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let (git, their_git, swapped) = (git.clone(), their_git.clone(), swapped.clone());
+            AFTER_THE_LOOK.with(|between| *between.borrow_mut() = Some(Box::new(move || {
+                if std::fs::rename(&git, git.with_file_name("aside")).is_ok() {
+                    swapped.set(crate::held_way::swapping::mount_point(&{ std::fs::create_dir(&git).unwrap(); git.clone() }, &their_git));
+                }
+            })));
+        }
+        // SAFETY: the profile's SID lives as long as the process.
+        let guarded = unsafe { guard_repository(&root, &git, profile_sid().unwrap()) };
+        AFTER_THE_LOOK.with(|between| *between.borrow_mut() = None);
+        assert!(!swapped.get(), "the held folder could not be set aside");
+        assert!(guarded.is_ok(), "{guarded:?}");
+        assert!(lists() == before, "the person's lists are as they were");
+    }
+
+    /// While a loop swaps a repository's `.git` for a junction to a repository of the person's outside and back, the app guards it many times: the lists of
+    /// the person's config and hooks are as they were.
+    #[test]
+    fn while_a_git_folder_is_swapped_for_a_junction_the_persons_lists_are_not_changed() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        for place in [git.clone(), theirs.path().join(".git")] {
+            std::fs::create_dir_all(place.join("hooks")).unwrap();
+            std::fs::write(place.join("config"), "[core]\n\tbare = false\n").unwrap();
+            std::fs::write(place.join("hooks").join("pre-commit.sample"), "sample").unwrap();
+        }
+        let their_git = theirs.path().join(".git");
+        let lists = || (dacl_text(&their_git).unwrap(), dacl_text(&their_git.join("config")).unwrap(), dacl_text(&their_git.join("hooks")).unwrap());
+        let before = lists();
+        // SAFETY: the profile's SID lives as long as the process.
+        let sid = unsafe { profile_sid() }.unwrap();
+        let swapping = crate::held_way::swapping::Swapping::start(&git, &their_git, |_| {});
+        let mut guarded = 0;
+        for _ in 0..60 {
+            // SAFETY: as above.
+            guarded += usize::from(unsafe { guard_repository(&root, &git, sid) }.is_ok());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        assert!(lists() == before, "the person's lists are as they were");
+        assert!(swaps > 0 && guarded > 0, "{swaps} swaps, {guarded} guarded");
+    }
+
+    /// Folders put where the app's file used to go (its name was the app's process id) do not stop a new repository being disarmed: its name is not known
+    /// before it is made.
+    #[test]
+    fn a_folder_where_the_apps_file_went_does_not_stop_the_disarming() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let git = dir.path().join("repo").join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n").unwrap();
+        std::fs::write(git.join("hooks").join("pre-commit"), "evil").unwrap();
+        for place in [git.clone(), git.join("hooks")] {
+            std::fs::create_dir_all(place.join(format!("{}{}", crate::held_way::KEPT_MARK, std::process::id()))).unwrap();
+        }
+        let mut taken = Taken::default();
+        disarm_repository(&git, dir.path(), &HashSet::new(), &mut taken).unwrap();
+        assert!(!git.join("hooks").join("pre-commit").exists(), "the hook is taken out: {:?}", taken.names);
+        assert!(!std::fs::read_to_string(git.join("config")).unwrap().contains("fsmonitor"));
+    }
+
+    /// A new repository whose disarming cannot be done (here: another program holds its `.git` open to delete it) refuses the command, and stays to be
+    /// disarmed: the next look, with no command since, still refuses while it cannot, and disarms it once it can, and the commands go on.
+    #[test]
+    fn a_repository_whose_disarming_failed_is_disarmed_at_the_next_look() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // (it gives the repository's folders a list of the app's own, which a command, in a container or with a restricted token, may not)
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
+        let root = dir.path();
+        assert!(look_between_commands(root).refused.is_none(), "the first look takes what is there as it is");
+        let git = root.join("repo").join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n").unwrap();
+        std::fs::write(git.join("hooks").join("pre-commit"), "evil").unwrap();
+        let held = std::fs::OpenOptions::new().access_mode(DELETE | 0x80).share_mode(7).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&git).unwrap();
+        assert!(look(root).refused.is_some(), "refused while it cannot be disarmed");
+        assert!(git.join("hooks").join("pre-commit").exists());
+        assert!(look_between_commands(root).refused.is_some(), "and at the next look, with no command since");
+        drop(held);
+        let looked = look_between_commands(root);
+        assert!(!git.join("hooks").join("pre-commit").exists(), "disarmed once it can be");
+        assert!(looked.refused.is_none(), "{:?}", looked.refused);
+    }
+
+    /// While a loop swaps a new repository's `.git` for a junction to a repository of the person's outside and back, arming it again each time, the app
+    /// takes out of it what would run, many times: the person's repository keeps its config and its hooks, and nothing is put aside in it.
+    #[test]
+    fn while_a_git_folder_is_swapped_for_a_junction_the_persons_repository_is_not_changed() {
+        let (dir, theirs) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let root = dir.path().to_path_buf();
+        let git = root.join("repo").join(".git");
+        let arm = |git: &Path| {
+            let _ = std::fs::create_dir_all(git.join("hooks"));
+            let _ = std::fs::write(git.join("config"), "[core]\n\tfsmonitor = evil.exe\n");
+            let _ = std::fs::write(git.join("hooks").join("pre-commit"), "evil");
+        };
+        arm(&git);
+        let their_git = theirs.path().join(".git");
+        arm(&their_git);
+        let before = (std::fs::read(their_git.join("config")).unwrap(), std::fs::read(their_git.join("hooks").join("pre-commit")).unwrap());
+        let swapping = crate::held_way::swapping::Swapping::start(&git, &their_git, arm);
+        let mut taken_out = 0;
+        for _ in 0..60 {
+            let mut taken = Taken::default();
+            let _ = disarm_repository(&git, &root, &HashSet::new(), &mut taken);
+            taken_out += usize::from(!taken.names.is_empty());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let swaps = swapping.stop();
+        let after = (std::fs::read(their_git.join("config")).unwrap(), std::fs::read(their_git.join("hooks").join("pre-commit")).unwrap());
+        assert!(after == before, "the person's config and hooks are as they were");
+        let aside: Vec<_> = std::fs::read_dir(&their_git).unwrap().flatten().map(|entry| entry.file_name()).filter(|name| name.to_string_lossy().starts_with("dogmind-disarmed")).collect();
+        assert!(aside.is_empty(), "put aside in theirs: {aside:?}");
+        assert!(swaps > 0 && taken_out > 0, "{swaps} swaps, {taken_out} taken out");
+    }
+
+    /// The Python shim is in the app's folder for the sandbox, which commands read and cannot write, and is on PYTHONPATH from there: its old place in a
+    /// restricted command's temp folder made a junction to a person's site-packages leaves their sitecustomize.py as it was, and the command still runs.
+    /// (The container's own temp folder is every test's, and is left as it is.)
+    #[test]
+    fn the_python_shim_is_not_written_through_a_commands_temp_folder() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let data = outside_folder("shim-data");
+        crate::workspace_grants::use_test_folder(&data);
+        let site = outside_folder("shim-site-packages");
+        std::fs::write(site.join("sitecustomize.py"), "theirs").unwrap();
+        let work = work_folder("shim-temp");
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        let restricted_temp = PathBuf::from(decode(&restricted("echo %TEMP%").unwrap().stdout).trim());
+        let old = restricted_temp.join(PYTHON_SHIM_FOLDER);
+        if let Ok(found) = std::fs::symlink_metadata(&old) {
+            if found.file_type().is_symlink() { std::fs::remove_dir(&old).unwrap() } else { std::fs::remove_dir_all(&old).unwrap() }
+        }
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&old).arg(&site).output().unwrap();
+        assert!(made.status.success(), "{}: {}{}", old.display(), decode(&made.stdout), decode(&made.stderr));
+        let said = restricted("echo %PYTHONPATH%").unwrap();
+        assert_eq!(said.status, Some(0));
+        let shim = PathBuf::from(decode(&said.stdout).trim());
+        assert!(crate::safety::inside(&data, &shim), "on PYTHONPATH from the app's folder: {}", shim.display());
+        assert_eq!(std::fs::read_to_string(shim.join("sitecustomize.py")).unwrap(), PYTHON_SHIM);
+        let ran = command("echo %PYTHONPATH%", &work, false);
+        assert_eq!((ran.status, PathBuf::from(decode(&ran.stdout).trim())), (Some(0), shim), "the container's too");
+        assert_eq!(std::fs::read_to_string(site.join("sitecustomize.py")).unwrap(), "theirs");
+        std::fs::remove_dir(&old).unwrap();
+    }
+
     #[test]
     fn a_timeout_ends_all_a_command_started() {
         let folder = work_folder("timeout");
@@ -4626,7 +5336,7 @@ mod tests {
     #[test]
     fn a_commands_powershell_runs_scripts_and_the_persons_keeps_their_policy() {
         let place = crate::in_container::tempdir().unwrap();
-        let block = environment_block(Vec::new(), None, place.path().display().to_string(), place.path(), || None);
+        let block = environment_block(Vec::new(), None, None, place.path().display().to_string(), place.path(), || None);
         assert!(block.iter().any(|(name, value)| name == POWERSHELL_POLICY.0 && value == "Bypass"), "{block:?}");
         assert!(block.iter().any(|(name, value)| name == NO_ZONE_CHECKS.0 && value == "1"), "no question nobody can answer: {block:?}");
         let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None)).to_ascii_lowercase();
@@ -4720,6 +5430,11 @@ mod tests {
         let folder = work_folder("python-temp");
         let script = "import os, shutil, tempfile; made = []\nfor where in (None, os.getcwd()):\n    with tempfile.TemporaryDirectory(dir=where) as d:\n        open(os.path.join(d, 'a.txt'), 'w').write('x')\n        made.append(os.path.basename(d))\nd = tempfile.mkdtemp(dir=os.getcwd()); open(os.path.join(d, 'b.txt'), 'w').write('y'); shutil.rmtree(d)\nprint('ok', len(made))";
         std::fs::write(folder.join("probe.py"), script).unwrap();
+        // (the sitecustomize it is about is written to the tests' own container's folder, which a command in another container, the one this run is in, cannot write:
+        // its Python then starts without it. A restricted token's commands can, and run it)
+        if crate::in_container::cannot_run_in_a_container(crate::in_container::OTHER_CONTAINER) {
+            return;
+        }
         let done = command("python probe.py", &folder, false);
         let (said, errors) = (decode(&done.stdout), decode(&done.stderr));
         // (in the tests' own container, a person's Python is not opened to commands: only the bundle's is, where `DOGMIND_TOOLS` names one)
@@ -4872,23 +5587,23 @@ mod tests {
         let inherited = std::env::join_paths([&own_node, &other]).unwrap().to_string_lossy().into_owned();
         let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
         let temp = dir.path().display().to_string();
-        let made = environment_block(start(), Some(&root), temp.clone(), &work, || Some(build_tools()));
+        let made = environment_block(start(), Some(&root), None, temp.clone(), &work, || Some(build_tools()));
         // (and where `npm install -g` puts its commands, in the sandbox's folder, after the bundled tools)
         let global = PathBuf::from(&temp).join("npm-global");
         assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), global.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
         // The PATH alone, for a question about a name, is the same one (without the folder of the commands that were installed, which no question about a name of the project's own is about).
         let without_global: Vec<PathBuf> = path_folders(&made).into_iter().filter(|folder| *folder != global).collect();
         assert_eq!(path_of(start(), Some(&root), || Some(build_tools())), without_global);
-        assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, temp.clone(), &work, || Some(build_tools()))));
-        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None)).into_iter().filter(|folder| *folder != global).collect::<Vec<_>>());
+        assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, None, temp.clone(), &work, || Some(build_tools()))));
+        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), None, temp.clone(), &work, || None)).into_iter().filter(|folder| *folder != global).collect::<Vec<_>>());
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!(value("LIB"), Some("C:\\vs\\lib\\x64;C:\\kits\\um\\x64"));
         assert_eq!(value("INCLUDE"), Some("C:\\vs\\include;C:\\kits\\ucrt"));
         // Without the bundled tools: the machine's PATH, and then the same.
-        let plain = environment_block(start(), None, temp.clone(), &work, || Some(build_tools()));
+        let plain = environment_block(start(), None, None, temp.clone(), &work, || Some(build_tools()));
         assert_eq!(path_folders(&plain), [own_node.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
         // On a machine with none found, PATH is what it was.
-        let none = environment_block(start(), Some(&root), temp, &work, || None);
+        let none = environment_block(start(), Some(&root), None, temp, &work, || None);
         assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), global, other]);
         assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
     }
@@ -4914,10 +5629,10 @@ mod tests {
         let global = PathBuf::from(&temp).join("npm-global");
         let bundled = [root.join("python"), root.join("node"), root.join("git\\cmd")];
         // Without a bundle: the machine's PATH, minus the two.
-        assert_eq!(path_folders(&environment_block(start(), None, temp.clone(), &work, || None)), [plain.clone()]);
+        assert_eq!(path_folders(&environment_block(start(), None, None, temp.clone(), &work, || None)), [plain.clone()]);
         assert_eq!(path_of(start(), None, || None), [plain.clone()]);
         // With one: the same, after its own, and `path_of` says what `environment_block` gives.
-        let made = path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None));
+        let made = path_folders(&environment_block(start(), Some(&root), None, temp.clone(), &work, || None));
         assert_eq!(made, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), global.clone(), plain.clone()]);
         assert_eq!(path_of(start(), Some(&root), || None), made.iter().filter(|folder| **folder != global).cloned().collect::<Vec<_>>());
         // (and Visual Studio's still come last)
@@ -4949,7 +5664,7 @@ mod tests {
         }
         let dir = crate::in_container::tempdir().unwrap();
         let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("LIB".to_string(), "C:\\dev\\lib".to_string()), ("INCLUDE".to_string(), "C:\\dev\\include".to_string()), ("LIBPATH".to_string(), "C:\\dev\\libpath".to_string())];
-        let made = environment_block(start, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
+        let made = environment_block(start, None, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!((value("PATH"), value("LIB"), value("INCLUDE"), value("LIBPATH")), (Some("C:\\a"), Some("C:\\dev\\lib"), Some("C:\\dev\\include"), Some("C:\\dev\\libpath")));
     }
@@ -4961,7 +5676,7 @@ mod tests {
         let root = dir.path().join("tools");
         for bundled in [None, Some(root.as_path())] {
             let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("disable_telemetry".to_string(), "0".to_string())];
-            let made = environment_block(start, bundled, dir.path().display().to_string(), dir.path(), || None);
+            let made = environment_block(start, bundled, None, dir.path().display().to_string(), dir.path(), || None);
             let set: Vec<&str> = made.iter().filter(|(name, _)| name.eq_ignore_ascii_case("DISABLE_TELEMETRY")).map(|(_, value)| value.as_str()).collect();
             assert_eq!(set, ["1"], "{bundled:?}");
         }

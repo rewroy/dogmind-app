@@ -26,6 +26,10 @@ const PENDING: &str = "awaiting-ready.txt";
 const FAILED: &str = "failed.txt";
 const MOST_RELEASES: usize = 4 << 20;
 const MOST_EXE: u64 = 128 << 20;
+/// How long a new engine's `--check-model` may take. Its first run is the first time Windows sees the program and its cuBLAS libraries (568 MB), and Defender
+/// looks at them then: copies of a downloaded release, on a PC with Defender on, took 0.6 to 1.8 s the first time and once 5.2 s, against 0.1 s after (Linux
+/// 0.19 s). It was 5 s. A check that runs out of time is no verdict on the engine: the update stays where it is and is checked again at the next look.
+const MODEL_CHECK_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -215,6 +219,20 @@ fn version(path: &Path) -> Option<String> {
     plain_version(version).then(|| version.to_string())
 }
 
+/// `MODEL_CHECK_LIMIT`, or a test's own, shorter one.
+fn model_check_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(limit) = TEST_CHECK_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MODEL_CHECK_LIMIT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CHECK_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
 fn check_model(exe: &Path, settings: &Settings, data: &Path) -> std::result::Result<(), String> {
     if !engine::is_set_up(data) {
         return Ok(());
@@ -246,7 +264,7 @@ fn check_model(exe: &Path, settings: &Settings, data: &Path) -> std::result::Res
         {
             break;
         }
-        if start.elapsed() >= Duration::from_secs(5) {
+        if start.elapsed() >= model_check_limit() {
             let _ = child.kill();
             let _ = child.wait();
             return Err(t("The new Straydog model check timed out.").into());
@@ -751,15 +769,7 @@ fn worker_sid() -> std::result::Result<String, String> {
 
 #[cfg(windows)]
 fn system_icacls() -> std::result::Result<PathBuf, String> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buffer = [0u16; 32768];
-    // SAFETY: buffer is writable for the given length; Windows returns its UTF-16 length.
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if length == 0 || length >= buffer.len() {
-        return Err(t("Cannot locate the Windows system directory.").into());
-    }
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("icacls.exe"))
+    crate::machine::system_program("icacls.exe").ok_or_else(|| t("Cannot locate the Windows system directory.").into())
 }
 
 #[cfg(windows)]
@@ -1210,6 +1220,75 @@ mod tests {
         assert!(check_model(&unknown, &settings, data.path())
             .unwrap_err()
             .contains("Straydog"));
+    }
+
+    /// A new engine whose model check runs out of time (Defender looking at it the first time it runs) is not selected, and nothing holds it against
+    /// the engine: it stays where it was put, no failure is kept for its version, and the next look checks it again and selects it.
+    #[cfg(windows)]
+    #[test]
+    fn a_model_check_that_runs_out_of_time_is_tried_again_at_the_next_look() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let data = crate::in_container::tempdir().unwrap();
+        let source = data.path().join("slow.rs");
+        fs::write(&source, r#"
+            fn main() {
+                let args: Vec<String> = std::env::args().collect();
+                if args.iter().any(|arg| arg == "--version") { println!("straydog 0.1.11"); return }
+                if args.iter().any(|arg| arg == "--check-model") {
+                    let at = args.iter().position(|arg| arg == "--config").unwrap();
+                    if std::fs::read_to_string(&args[at + 1]).unwrap().contains("slow") {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    println!("Straydog model ready: Qwen3.8-Flash-Next / ISTA-DASLab / IQ2_XS in C:\\models (3 files)"); return;
+                }
+                if args.iter().any(|arg| arg == "--dlls") { println!("cublas64_13.dll cublasLt64_13.dll"); }
+            }
+        "#).unwrap();
+        let candidate_exe = data.path().join("slow.exe");
+        assert!(Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into())).arg(&source).arg("-o").arg(&candidate_exe).status().unwrap().success());
+        let old = data.path().join("installed");
+        fs::create_dir(&old).unwrap();
+        let running = old.join("straydog.exe");
+        fs::copy(&candidate_exe, &running).unwrap();
+        // (the libraries it names, beside the engine that runs, as an update copies them from there)
+        for name in ["cublas64_13.dll", "cublasLt64_13.dll"] {
+            fs::write(old.join(name), b"MZ").unwrap();
+        }
+        let hash = sha256(&candidate_exe).unwrap();
+        let sums = format!("{hash}  {EXE}\n");
+        let release = Candidate {
+            version: "0.1.11".into(),
+            exe: Setup { url: EXE.into(), size: fs::metadata(&candidate_exe).unwrap().len(), sha256: hash, parts: None },
+            sums: Setup { url: SUMS.into(), size: sums.len() as u64, sha256: format!("{:x}", Sha256::digest(sums.as_bytes())), parts: None },
+            zip: None,
+        };
+        let settings = Settings::default();
+        let stop = AtomicBool::new(false);
+        TEST_CHECK_LIMIT.with(|limit| limit.set(Some(Duration::from_secs(1))));
+        fs::write(engine::config_path(data.path()), "model = 'slow'\n").unwrap();
+        let mut fetched = |asset: &Setup, path: &Path, _: &AtomicBool| {
+            if asset.url == SUMS {
+                fs::write(path, &sums).unwrap()
+            } else {
+                fs::copy(&candidate_exe, path).unwrap();
+            }
+            Ok(())
+        };
+        let started = Instant::now();
+        let outcome = stage_with(&release, &running, &settings, data.path(), &stop, &mut fetched);
+        assert!(matches!(&outcome, Result::ModelNotReady(reason) if reason == t("The new Straydog model check timed out.")), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(4), "ended at its limit: {:?}", started.elapsed());
+        assert!(selected(data.path()).is_none());
+        assert!(root(data.path()).join("v0.1.11/straydog.exe").is_file(), "the update stays where it was put");
+        assert!(!root(data.path()).join(FAILED).exists(), "nothing is held against the engine");
+        // (the next look: the program is there and checked again, in its time now)
+        fs::write(engine::config_path(data.path()), "model = 'ready'\n").unwrap();
+        let mut no_download = |_: &Setup, _: &Path, _: &AtomicBool| -> std::result::Result<(), updates::Failed> { panic!("the update put in place should be checked again") };
+        assert_eq!(stage_with(&release, &running, &settings, data.path(), &stop, &mut no_download), Result::Ready("0.1.11".into()));
+        TEST_CHECK_LIMIT.with(|limit| limit.set(None));
+        assert_eq!(model_check_limit(), Duration::from_secs(30));
     }
 
     #[cfg(windows)]

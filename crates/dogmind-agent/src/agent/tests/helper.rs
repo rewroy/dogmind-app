@@ -292,7 +292,7 @@ fn a_branch_carries_the_helpers_of_the_messages_it_keeps_and_leaves_the_rest() {
         let (parent, [first, second]) = parent_with_helpers(folder.path(), encrypted.then_some(&key));
         let before = (std::fs::read(&parent).unwrap(), std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
         // through the first helper's result (the system prompt, the person's words, the call, its result)
-        let branch = session::fork(&parent, 3, Some("a branch")).unwrap();
+        let branch = session::fork(&parent, 3, Some("a branch"), &crate::conversation_key::Policy::default()).unwrap();
         let carried = helpers_of(&branch);
         assert_eq!(carried.iter().map(|(number, _)| *number).collect::<Vec<_>>(), [1], "only the helper whose result the branch keeps (encrypted: {encrypted})");
         assert_eq!(std::fs::read(&carried[0].1).unwrap(), before.1, "as it was, line for line");
@@ -301,7 +301,7 @@ fn a_branch_carries_the_helpers_of_the_messages_it_keeps_and_leaves_the_rest() {
         // the original is as it was
         assert_eq!((std::fs::read(&parent).unwrap(), std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap()), before);
         // the whole of it carries both
-        let whole = session::fork(&parent, 6, None).unwrap();
+        let whole = session::fork(&parent, 6, None, &crate::conversation_key::Policy::default()).unwrap();
         assert_eq!(helpers_of(&whole).len(), 2);
         let titles: Vec<String> = session::list(folder.path()).into_iter().map(|summary| summary.title).collect();
         assert_eq!(titles.len(), 3, "three sessions, and no helper among them: {titles:?}");

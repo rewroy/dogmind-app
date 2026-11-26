@@ -583,7 +583,7 @@ A command can write only in the session's folder, and has no network unless you 
 Keys you paste go to Windows Credential Manager, and nowhere else.
 Pictures: the paperclip, /attach, a paste or a drop. PNG, JPEG, WebP and GIF.
 Skills: .claude/skills, .agents/skills, .codex/skills and .dogmind/skills, in the project and in your home. /name starts one.
-MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL), and can trust what one returns. Each call asks.
+MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL). What a program you added returns is trusted, unless you turn that off there; what a server at a URL returns, only when you turn it on. Each call asks, and Always covers that tool for the session.
 Web: what comes back is marked as data, and once it is in a conversation every command asks.
 Your instructions (Settings) go for every session; a DOGMIND.md for its project. /init has the model write one.
 Terminal: the panel on the right has your own shell. Its commands run with your rights, apart from the agent's, and what it shows is not sent to the model. Every key goes to the shell: Ctrl+C copies when something is selected and otherwise stops what runs, and Ctrl+V pastes.
@@ -682,6 +682,7 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
         Some(AlwaysScope::Folders(folders)) => folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(", "),
         Some(AlwaysScope::Network(reach)) => reach.clone(),
         Some(AlwaysScope::Parts(parts)) => parts.join(", "),
+        Some(AlwaysScope::Servers(servers)) => servers.join(", "),
         None => String::new(),
     }
 }
@@ -834,6 +835,8 @@ enum Note {
     ReadFolderDone(String, bool),
     /// A workspace's grant for commands, begun when it was opened (`ready_folder`), has been given.
     FolderReady(PathBuf),
+    /// That workspace's folder has become a link since the app made it ready, and commands are refused there (`sandbox::MOVED`).
+    FolderMoved(PathBuf),
     /// How many conversations and notes are changed, of how many.
     CryptProgress(usize, usize),
     CryptDone(CryptOutcome),
@@ -1141,6 +1144,8 @@ struct PictureBlock {
     /// The pictures a call gave the model, with whether they are shown: a line with their number stands over them, and they are put away until it is pressed. None: a
     /// message's or an answer's, shown as they are.
     fold: Option<bool>,
+    /// How wide the line that says how many is, in twips, as `pictures_row_width` takes it: 0 without one.
+    words: i32,
     /// Where its row is in the transcript, and what it was made with, to make it again at another height.
     span: (i32, i32),
     width: i32,
@@ -1172,8 +1177,17 @@ fn user_card_width(column: i32, dpi: u32, words: i32, sizes: &[(i32, i32)]) -> i
     wanted.max(pictures).clamp(800, most)
 }
 
-/// How wide the row of a call's pictures is while they are put away: room for the line that says how many, and no more.
-const PICTURES_SHUT_WIDTH: i32 = 1800;
+/// The room after the words of the line over a call's pictures, in design pixels: as much as the chevron has before it, so the shade under the line is even at its ends.
+const PICTURES_LINE_END: i32 = 10;
+
+/// How wide the row of a call's pictures is, and the line over them that says how many, in twips. `words`: the line's chevron, words and room after them. Shut, the row
+/// is the line and its padding, and no more; open, it is the pictures' `width`, or the line's where that is wider. No row is wider than the `column`, and the line is cut to
+/// the inside of its row: the shade under it never goes past the card.
+fn pictures_row_width(width: i32, words: i32, open: bool, column: i32) -> (i32, i32) {
+    let least = words + 2 * PICTURES_ACROSS;
+    let row = if open { width.max(least) } else { least }.min(column);
+    (row, words.min(row - 2 * PICTURES_ACROSS).max(0))
+}
 
 /// A small copy, and when it was last asked for.
 struct KeptThumb {
@@ -2743,6 +2757,8 @@ struct Crypt {
     cipher: Option<Arc<Cipher>>,
     /// The key file is there and cannot be read: said at the start, and nothing is opened.
     damaged: Option<String>,
+    /// And its copy beside it reads: the person is asked whether to open the conversations with it.
+    copy: bool,
     /// At the unlock page: the recovery code is typed, with a new passphrase, in place of the passphrase.
     by_code: bool,
     work: Option<CryptWork>,
@@ -2763,11 +2779,13 @@ struct Crypt {
 impl Crypt {
     /// What the data folder says: no key file, conversations as they are; one, and the key is asked for unless Windows has it for this user.
     fn open(folder: &Path) -> (Crypt, Arc<Policy>) {
-        let mut crypt = Crypt { keystore: None, cipher: None, damaged: None, by_code: false, work: None, said: String::new(), said_is_a_problem: false, code: None, remember: true, resume: None, back: Panel::Chat, sweep_due: false };
+        let mut crypt = Crypt { keystore: None, cipher: None, damaged: None, copy: false, by_code: false, work: None, said: String::new(), said_is_a_problem: false, code: None, remember: true, resume: None, back: Panel::Chat, sweep_due: false };
         let policy = match Keystore::load(folder) {
             Err(KeyError::Missing) => Policy::off(),
             Err(error) => {
-                crypt.damaged = Some(error.to_string());
+                // (damaged in words the page has in each language; another failure as it is)
+                crypt.damaged = Some(if matches!(error, KeyError::Corrupt(_)) { conversation_key::KEYSTORE_DAMAGED.to_string() } else { error.to_string() });
+                crypt.copy = Keystore::copy_opens(folder);
                 Policy::locked()
             }
             Ok(keystore) => {
@@ -2937,7 +2955,7 @@ fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Optio
     // Keep the saved transport spelling and fields the editor cannot display. A different config restarts the connection.
     let mut config = previous.cloned().unwrap_or_else(|| mcp::ServerConfig {
         kind: if url.is_some() { "http".into() } else { String::new() },
-        trusted: was.is_some_and(|config| config.trusted),
+        trusted: was.and_then(|config| config.trusted),
         tool_selection: was.map(|config| config.tool_selection.clone()).unwrap_or_default(),
         ..Default::default()
     });
@@ -4377,7 +4395,7 @@ impl App {
         let same_before = self.answers[..at].iter().filter(|(_, other, _)| other.trim() == words.trim()).count();
         // (one with no name yet is named by its first message, as the original is)
         let title = (!self.session_title.trim().is_empty()).then(|| tf("{0} (branch)", &[&self.session_title.trim()]));
-        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref()) {
+        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref(), &self.policy) {
             Ok(Some(branch)) => {
                 self.refresh_sessions();
                 self.open_session(branch);
@@ -4940,10 +4958,11 @@ impl App {
         let fold = folds.then(|| self.pictures_opened.contains(&paths));
         let height = self.pictures_height(&tiles, alone, fold);
         let back = if right { theme::user_back() } else { theme::code_back() };
-        let shown_width = if fold == Some(false) { width.min(PICTURES_SHUT_WIDTH) } else { width };
+        let words = if folds { self.pictures_words(paths.len()) } else { 0 };
+        let shown_width = fold.map_or(width, |open| pictures_row_width(width, words, open, self.text_twips).0);
         let span = self.insert_rtf_span(rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), right), None);
         let start = text_start(self.transcript, span.0);
-        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, span, width, alone, right });
+        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, words, span, width, alone, right });
         // (a message's card begins at its pictures, whether words follow them or not)
         if alone || right {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
@@ -4965,6 +4984,13 @@ impl App {
         line + shown + if alone { 2 * PICTURES_DOWN } else { PICTURES_DOWN }
     }
 
+    /// How wide the line over `count` pictures a call gave the model is, in twips: its chevron, its words as they are drawn, and the room after them.
+    unsafe fn pictures_words(&self, count: usize) -> i32 {
+        let pixels = scale(self.dpi, ds::size::ICON) + scale(self.dpi, ds::space::S) + text_width(self.fonts.small, &tf("{0} pictures", &[&count])) + scale(self.dpi, PICTURES_LINE_END);
+        // (rounded up, so the line made again in pixels is not narrower than its words)
+        ((i64::from(pixels) * 1440 + i64::from(self.dpi) - 1) / i64::from(self.dpi)) as i32
+    }
+
     /// A call's pictures shown or put away where they stand. The row is made again at its new height in its place: it is as many characters as it was, so that
     /// nothing after it moves in the text, and the view stays where it is.
     unsafe fn toggle_pictures(&mut self, at: usize) {
@@ -4979,7 +5005,7 @@ impl App {
         let block = &self.picture_blocks[at];
         let height = self.pictures_height(&block.tiles, block.alone, Some(open));
         let back = if block.right { theme::user_back() } else { theme::code_back() };
-        let shown_width = if open { block.width } else { block.width.min(PICTURES_SHUT_WIDTH) };
+        let shown_width = pictures_row_width(block.width, block.words, open, self.text_twips).0;
         let row = rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), block.right);
         let (first, last) = block.span;
         let edit = self.transcript;
@@ -5676,8 +5702,11 @@ impl App {
             }
             // (a call's: the line that says how many, and the pictures under it when they are shown)
             let line = if block.fold.is_some() { (i64::from(PICTURES_LINE) * i64::from(dpi) / 1440) as i32 } else { 0 };
-            if block.fold.is_some() {
-                found.push(OverlayHit { area: picture_area(point, (0, 0), (scale(dpi, 160), line), dpi), key: OverlayKey::Pictures(at) });
+            if let Some(open) = block.fold {
+                // (as wide as its words, inside its row's padding: the shade under it stays in the card)
+                let words = pictures_row_width(block.width, block.words, open, self.text_twips).1;
+                let across = (i64::from(words) * i64::from(dpi) / 1440) as i32;
+                found.push(OverlayHit { area: picture_area(point, (0, 0), (across, line), dpi), key: OverlayKey::Pictures(at) });
             }
             if block.fold == Some(false) {
                 continue;
@@ -6574,8 +6603,10 @@ impl App {
         InvalidateRect(self.window, &self.status_area, 0);
         let poster = self.poster.clone();
         std::thread::spawn(move || {
-            // (what goes wrong is said by the command that needs it, which gives it again)
-            let _ = dogmind_agent::sandbox::ready_workspace(&folder);
+            // (what goes wrong is said by the command that needs it, which gives it again; a folder that has become a link is said now, as it is opened)
+            if dogmind_agent::sandbox::ready_workspace(&folder).is_err_and(|error| error.contains(dogmind_agent::sandbox::MOVED)) {
+                poster.send(Note::FolderMoved(folder.clone()));
+            }
             poster.send(Note::FolderReady(folder));
         });
     }
@@ -8018,7 +8049,13 @@ impl App {
             }
             Panel::Unlock => {
                 if let Some(why) = &self.crypt.damaged {
-                    form.note(&tf("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", &[&t(why), &self.folder.display()]), theme::bad());
+                    if self.crypt.copy {
+                        form.note(&tf("{0} It is conversation-key.json in {1}. The copy of it that Dogmind keeps beside it opens: open your conversations with that copy? The damaged file is kept as conversation-key.json.damaged.", &[&t(why), &self.folder.display()]), theme::bad());
+                        form.y += s(ds::space::XS);
+                        form.buttons(0, &[self.buttons[0]]);
+                    } else {
+                        form.note(&tf("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", &[&t(why), &self.folder.display()]), theme::bad());
+                    }
                 } else if !self.crypt.by_code {
                     form.note(t("Your conversations are encrypted. Type your passphrase to open them."), theme::muted());
                     form.field(t("Passphrase"), self.fields[0]);
@@ -9541,7 +9578,8 @@ impl App {
                 set_text(self.buttons[1], if self.crypt.by_code { t("Use the passphrase instead") } else { t("Use the recovery code instead") });
                 self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Link]);
                 if self.crypt.damaged.is_some() {
-                    show(self.buttons[0], false);
+                    set_text(self.buttons[0], t("Use the copy"));
+                    show(self.buttons[0], self.crypt.copy);
                     show(self.buttons[1], false);
                 }
             }
@@ -10996,7 +11034,7 @@ impl App {
         let Some(exe) = self.builds.first().map(|(path, _)| path.clone()) else { return };
         let mut command = std::process::Command::new(&exe);
         if self.workspace.is_dir() && self.workspace != Path::new(".") {
-            command.arg(&self.workspace);
+            command.arg(&self.workspace).arg("--remembered");
         }
         command.arg("--after").arg(std::process::id().to_string());
         if let Some(session) = &self.current_session {
@@ -12170,6 +12208,9 @@ impl App {
 
     unsafe fn crypt_unlock(&mut self) {
         if self.crypt.damaged.is_some() {
+            if self.crypt.copy {
+                self.crypt_use_copy();
+            }
             return;
         }
         let by_code = self.crypt.by_code;
@@ -12196,6 +12237,25 @@ impl App {
                 set_text(self.fields[0], "");
                 self.problem_in_panel(t(&error.to_string()));
             }
+        }
+    }
+
+    /// The key file was damaged and its copy opens, and the person chose it: the copy takes its place, the damaged one is kept beside it, and the key is
+    /// asked for as at a start (or is here at once, where Windows keeps it for this user).
+    unsafe fn crypt_use_copy(&mut self) {
+        match Keystore::restore_copy(&self.folder) {
+            Ok(keystore) => {
+                self.crypt.damaged = None;
+                self.crypt.copy = false;
+                self.crypt.remember = keystore.is_remembered();
+                let remembered = keystore.unlock_remembered().ok();
+                self.crypt.keystore = Some(keystore);
+                match remembered {
+                    Some(cipher) => self.unlocked(cipher),
+                    None => self.set_panel(Panel::Unlock),
+                }
+            }
+            Err(error) => self.problem_in_panel(t(&error.to_string())),
         }
     }
 
@@ -14090,6 +14150,9 @@ impl App {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Folders(_))) => tf("Always allows this folder, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Network(_))) => tf("Always allows this on the network, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Parts(_))) => tf("Always allows each part of this line (sites for this session): {0}", &[&always_places(&approval.scope)]),
+                    // (what such a server returned is why it asks: Always takes that away, where the person can see it and turn it back)
+                    (_, true) if matches!(approval.scope, Some(AlwaysScope::Servers(_))) => tf("Always trusts what {0} returns, from now on. Settings > Tools turns it off.", &[&always_places(&approval.scope)]),
+                    (None, true) if approval.tool.starts_with("mcp__") => t("Always allows this tool, whatever it is given, for this session.").to_string(),
                     (Some(rule), true) => tf("Always saves: {0}", &[&t(&rule.label())]),
                     // (in its place, why there is none)
                     _ => approval.no_always.as_deref().map_or(String::new(), |why| t(why).to_string()),
@@ -14389,6 +14452,8 @@ impl App {
         let at = dogmind_agent::trajectory::now();
         if let Some(began) = self.connect_began.take() {
             let _ = self.agent.commands.send(Command::Connection { at: at.clone(), what: "connect".into(), ms: began.elapsed().as_millis() as u64, outcome: outcome.into() });
+            // (which app it was and what it talked to, for a run read later: a trajectory said neither, and whether a build had a change in it could not be told)
+            let _ = self.agent.commands.send(Command::Connection { at: at.clone(), what: "app".into(), ms: 0, outcome: app_line(self.settings.active_provider().map(|provider| provider.kind), &self.model) });
         }
         if let Some(waiting) = self.connect_waiting_since.take() {
             let _ = self.agent.commands.send(Command::Connection { at, what: "loading_wait".into(), ms: waiting.elapsed().as_millis() as u64, outcome: outcome.into() });
@@ -14596,6 +14661,7 @@ impl App {
                 }
             }
             Note::CryptDone(outcome) => self.crypt_finished(outcome),
+            Note::FolderMoved(folder) => self.warn(&format!("{}: {}", folder.display(), t(dogmind_agent::sandbox::MOVED))),
             Note::FolderReady(folder) => {
                 if self.readying.as_ref() == Some(&folder) {
                     self.readying = None;
@@ -15031,8 +15097,9 @@ impl App {
         });
     }
 
+    /// A folder the person chooses: where it really leads, if it is a link (`settings::as_chosen`).
     unsafe fn browse_folder(&mut self) -> Option<PathBuf> {
-        preview::choose_folder(self.window as isize, t("Choose a folder"))
+        preview::choose_folder(self.window as isize, t("Choose a folder")).map(settings::as_chosen)
     }
 
     unsafe fn copy_to_clipboard(&mut self, text: &str) -> bool {
@@ -17914,6 +17981,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "check_page" => "Check a page",
         "explore" => "Look into",
         "run_code" => "Run a program",
+        "describe_tools" => "Describe tools",
         other => other,
     }
 }
@@ -18131,6 +18199,8 @@ pub struct Restart {
     pub resume: Option<PathBuf>,
     /// It was in the tray, out of sight, and this one stays there too.
     pub hidden: bool,
+    /// The folder given is the workspace the older copy had open, and not one the person has just chosen: it opens as it is (`settings::starting_folder`).
+    pub remembered: bool,
 }
 
 /// Waits, at most this long, for a process to end. One that is gone already, or cannot be looked at, is not waited for.
@@ -18214,7 +18284,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         lang::set(&saved.display_language);
         // (before the transcript and the composer are made, whose first format takes it)
         TEXT_SCALE.store(saved.text_percent(), Ordering::Relaxed);
-        let chosen = folder_argument.filter(|path| path.is_dir()).or_else(|| saved.workspace.clone().filter(|path| path.is_dir()));
+        let chosen = settings::starting_folder(folder_argument, restart.remembered || restart.after.is_some(), saved.workspace.clone());
         let needs_folder = chosen.is_none();
         // Until a folder is chosen the start panel stays over the chat, and nothing can be sent.
         let workspace = chosen.unwrap_or_else(|| Path::new(".").to_path_buf());
@@ -18919,6 +18989,25 @@ fn tray_speaks(word: TrayWord, shown: bool, in_front: bool) -> bool {
     }
 }
 
+/// The trajectory's line of which app a connection was made by and to what: its version, the source it was built from (with a mark where the tree had
+/// changes) and the day, then the provider's kind and the model.
+fn app_line(kind: Option<Kind>, model: &str) -> String {
+    let to = kind.map_or("no provider".to_string(), |kind| format!("{kind:?}"));
+    format!("{}; {to}{}", crate::crash::version_line(), if model.is_empty() { String::new() } else { format!(" {model}") })
+}
+
+#[cfg(test)]
+mod app_line_tests {
+    /// A trajectory says which build of the app made a connection, and to what.
+    #[test]
+    fn a_connection_says_which_build_of_the_app_and_what_it_talked_to() {
+        let line = super::app_line(Some(super::Kind::Codex), "gpt-5.5");
+        assert!(line.starts_with(&format!("Dogmind {} (", env!("CARGO_PKG_VERSION"))) && line.contains(env!("DOGMIND_APP_BUILD").split(',').next().unwrap()), "{line}");
+        assert!(line.ends_with("; Codex gpt-5.5"), "{line}");
+        assert!(super::app_line(None, "").ends_with("; no provider"));
+    }
+}
+
 #[cfg(test)]
 mod tray_tests {
     use super::*;
@@ -19070,16 +19159,16 @@ mod tests {
     fn a_server_of_the_older_transport_edited_in_settings_stays_one() {
         use dogmind_agent::mcp::ServerConfig;
         let at = |url: &str| (Some(url.to_string()), url.to_string());
-        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
+        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: Some(true), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/sse");
         let edited = mcp_config_of_form(Some(&older), url, target, "", "", Default::default());
-        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
+        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", Some(true)));
         let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/mcp");
         assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", "", Default::default()).kind, "http");
         assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
         let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
-        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", Some(true)));
     }
 
     #[test]
@@ -19314,6 +19403,26 @@ mod tests {
         assert_eq!(waiting_words("a\nb", 0), "a");
         assert_eq!(waiting_words("a", 2), format!("a  ·  {}", tf("{0} pictures", &[&2])));
         assert_eq!(waiting_words("", 1), tf("{0} pictures", &[&1]));
+    }
+
+    #[test]
+    fn the_line_over_a_call_s_pictures_stays_inside_its_row() {
+        let (words, column) = (1500, 9000);
+        // Shut, the row is the line and its padding: the line's shade ends where the row's padding begins.
+        assert_eq!(pictures_row_width(5000, words, false, column), (words + 2 * PICTURES_ACROSS, words));
+        // Open, the row is the pictures' width, or the line's where a small picture is narrower than the line.
+        assert_eq!(pictures_row_width(5000, words, true, column), (5000, words));
+        assert_eq!(pictures_row_width(800, words, true, column), (words + 2 * PICTURES_ACROSS, words));
+        // In a column narrower than the line, the row is the column and the line is cut to its inside.
+        assert_eq!(pictures_row_width(800, words, false, 1200), (1200, 1200 - 2 * PICTURES_ACROSS));
+        assert_eq!(pictures_row_width(800, words, false, 300), (300, 0));
+        // A line of any width, shut or open, is inside its row's padding.
+        for words in [0, 400, 1400, 2600, 8800] {
+            for open in [false, true] {
+                let (row, line) = pictures_row_width(2000, words, open, column);
+                assert!(line + 2 * PICTURES_ACROSS <= row, "{words} {open}: {line} in {row}");
+            }
+        }
     }
 
     #[test]
@@ -20352,11 +20461,13 @@ mod crypt_tests {
         keystore.set_remembered(&cipher, false).unwrap();
         assert!(Crypt::open(data.path()).0.is_locked());
 
-        // a file that cannot be read is locked, and says why
+        // a file that cannot be read is locked, and says why; its copy, which opens, is offered
         std::fs::write(conversation_key::path_in(data.path()), "{not a key file").unwrap();
         let (crypt, policy) = Crypt::open(data.path());
-        assert!(crypt.is_locked() && crypt.damaged.is_some() && crypt.keystore.is_none());
+        assert!(crypt.is_locked() && crypt.damaged.as_deref() == Some(conversation_key::KEYSTORE_DAMAGED) && crypt.keystore.is_none() && crypt.copy);
         assert!(policy.writer().is_err());
+        std::fs::write(data.path().join(conversation_key::KEYSTORE_COPY), "{not a copy either").unwrap();
+        assert!(!Crypt::open(data.path()).0.copy, "a copy that does not read is not offered");
     }
 
     /// Remove takes the key file with the conversations it was for, and the page's words are in both languages.
@@ -20366,9 +20477,12 @@ mod crypt_tests {
         std::fs::write(data.path().join("settings.json"), r#"{"providers": []}"#).unwrap();
         std::fs::create_dir_all(data.path().join("sessions")).unwrap();
         Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();
+        // (and what the sandbox's commands are given of the app's: its folder for them, and the workspaces' SIDs)
+        std::fs::create_dir_all(data.path().join(dogmind_agent::sandbox::FOR_SANDBOX)).unwrap();
+        std::fs::write(data.path().join("workspace-sids.txt"), "S-1-5-21-1-2-3-4\tc:\\w\n").unwrap();
         let mut taken: Vec<String> = settings::what_remove_takes(data.path(), None, None).unwrap().into_iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         taken.sort();
-        assert_eq!(taken, ["conversation-key.json", "sessions", "settings.json"]);
+        assert_eq!(taken, ["conversation-key.json", "conversation-key.json.copy", "for-sandbox", "sessions", "settings.json", "workspace-sids.txt"]);
         assert!(settings::what_remove_leaves(data.path(), None).is_empty());
     }
 }

@@ -296,21 +296,82 @@ fn language_fact(language: Option<&str>) -> Option<String> {
 /// The heading the tools that came after a conversation began are told of under (see `tools_added`).
 pub const TOOLS_ADDED: &str = "## Tools Added";
 
-/// The tools that came after a conversation began, as the model is told of them where the conversation is: each with what its server says it is and
-/// its arguments' schema, and, with run_code, as a program calls it.
-pub fn tools_added(tools: &[serde_json::Value], code_mode: bool) -> String {
-    let mut text = format!("{TOOLS_ADDED}\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way:");
+/// What one MCP server's tools may take to be told of in full at a time, in characters (some 8,000 tokens). Past it they are told by name and a line, and
+/// `describe_tools` gives the rest of one when it is used: a game editor's server, its 196 tools told in full twice over, put 44,000 tokens in one message,
+/// and a served DeepSeek took 28 seconds to its first token.
+pub const SERVER_TOOLS_BUDGET: usize = 24_000;
+
+/// The tool that gives what a tool told by name only is, and its arguments.
+pub const DESCRIBE_TOOLS: &str = "describe_tools";
+
+/// A tool told of in full: what its server says it is, and its arguments' schema.
+fn told_in_full(tool: &serde_json::Value) -> String {
+    let function = &tool["function"];
+    format!("- `{}`: {} Arguments (JSON Schema): {}", function["name"].as_str().unwrap_or(""), function["description"].as_str().unwrap_or("").trim(), function["parameters"])
+}
+
+/// The server an MCP tool is of, as its description names it (`mcp::schema_of` begins it so).
+fn server_named(tool: &serde_json::Value) -> Option<&str> {
+    tool.pointer("/function/description")?.as_str()?.strip_prefix("From the MCP server ")?.split_once(". ").map(|(server, _)| server)
+}
+
+/// The tools of these to tell of by name only: all those of each MCP server whose tools, told in full, would pass [`SERVER_TOOLS_BUDGET`].
+pub fn told_by_name(tools: &[serde_json::Value]) -> std::collections::HashSet<String> {
+    let mut sizes: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for tool in tools {
-        let function = &tool["function"];
-        let about = function["description"].as_str().unwrap_or("").trim();
-        text.push_str(&format!("\n- `{}`: {about} Arguments (JSON Schema): {}", function["name"].as_str().unwrap_or(""), function["parameters"]));
+        if let Some(server) = server_named(tool) {
+            *sizes.entry(server).or_default() += told_in_full(tool).chars().count();
+        }
     }
-    let calls = crate::code_mode::declarations(&serde_json::Value::Array(tools.to_vec()));
-    if code_mode && !calls.is_empty() {
-        text.push_str("\nIn run_code, a program calls them as:\n");
-        text.push_str(&calls.join("\n"));
+    tools.iter().filter(|tool| server_named(tool).is_some_and(|server| sizes[server] > SERVER_TOOLS_BUDGET)).filter_map(|tool| tool.pointer("/function/name")?.as_str().map(str::to_string)).collect()
+}
+
+/// A tool told of by name: its name and the first sentence of what its server says it is.
+pub(crate) fn told_by_its_name(tool: &serde_json::Value) -> String {
+    let about = tool.pointer("/function/description").and_then(serde_json::Value::as_str).unwrap_or("");
+    let about = about.strip_prefix("From the MCP server ").and_then(|rest| rest.split_once(". ")).map_or(about, |(_, rest)| rest).trim();
+    let first = about.split_inclusive(". ").next().unwrap_or(about).lines().next().unwrap_or("").trim();
+    let first: String = if first.chars().count() > 120 { format!("{}…", first.chars().take(119).collect::<String>()) } else { first.to_string() };
+    format!("- `{}`: {first}", tool.pointer("/function/name").and_then(serde_json::Value::as_str).unwrap_or(""))
+}
+
+/// The tools that came after a conversation began, as the model is told of them where the conversation is: each once, with what its server says it is
+/// and its arguments' schema; those of a server past [`SERVER_TOOLS_BUDGET`] by name and a line, with how to get the rest (`describe_tools`, itself one of
+/// the tools then, and not listed).
+pub fn tools_added(tools: &[serde_json::Value], code_mode: bool, call_added: bool) -> String {
+    let by_name = told_by_name(tools);
+    let how = if code_mode {
+        ", directly or from run_code as `await tools.<name>({...})` (`tools[\"<name>\"]` for a name with `-` in it)"
+    } else if call_added {
+        ", or as `call_added_tool({name: \"<name>\", arguments: {...}})`"
+    } else {
+        ""
+    };
+    let mut text = format!("{TOOLS_ADDED}\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way{how}:");
+    let name = |tool: &serde_json::Value| tool.pointer("/function/name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    // (what each server says its tools are, it says as it likes: data in a block, as its answers are, and the note's own words are the app's alone)
+    let in_full: String = tools.iter().filter(|tool| !by_name.contains(&name(tool)) && name(tool) != DESCRIBE_TOOLS).map(|tool| format!("{}\n", told_in_full(tool))).collect();
+    if !in_full.is_empty() {
+        text.push('\n');
+        text.push_str(&crate::web::envelope(crate::web::MCP_DESCRIPTIONS, &in_full));
+    }
+    if !by_name.is_empty() {
+        text.push_str(&format!("\nThese are told by name, as their servers say a lot about them: `{DESCRIBE_TOOLS}({{names: [...]}})` gives what each one is and its arguments. Ask for a tool's before its first call."));
+        let lines: String = tools.iter().filter(|tool| by_name.contains(&name(tool))).map(|tool| format!("{}\n", told_by_its_name(tool))).collect();
+        text.push('\n');
+        text.push_str(&crate::web::envelope(crate::web::MCP_DESCRIPTIONS, &lines));
     }
     text
+}
+
+/// MCP tools as `mcp::schema_of` makes them, for tests: `count` of a server's, each with a description and arguments of about `size` characters in all.
+#[cfg(test)]
+pub(crate) fn server_tools(server: &str, count: usize, size: usize) -> Vec<serde_json::Value> {
+    (0..count).map(|at| {
+        let about = format!("Tool {at} of {server}. {}", "It does a thing in the editor, with options. ".repeat(size / 90));
+        let properties: serde_json::Map<String, serde_json::Value> = (0..size / 90).map(|field| (format!("field_{field}"), serde_json::json!({"type": "string", "description": "What this field is for."}))).collect();
+        serde_json::json!({"type": "function", "function": {"name": format!("mcp__{server}__tool_{at}"), "description": format!("From the MCP server {server}. {about}"), "parameters": {"type": "object", "properties": properties}}})
+    }).collect()
 }
 
 pub fn app_facts(now: &str, language: Option<&str>, notes: &[String]) -> String {
@@ -619,7 +680,7 @@ pub const SUGGESTION_NOTICE: &str = "Read as a suggestion: no files will be chan
 /// The phrase of a suggestion put as a question, if what the person typed is one and asks for nothing to be done: 「〜したほうがよくない?」, 「〜はどう?」, 「〜したらどうかな」,
 /// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted. A て or
 /// で that asks ends its clause (。, !, a space, the end): one with a comma after it is as often a particle (「ログ画面で、…したほうがよくない?」).
-/// (Told in the system prompt that such a suggestion is a question, the Homelab's DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
+/// (Told in the system prompt that such a suggestion is a question, a served DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
 /// のだから、キャッシュヒット率も表示したほうがよくないかなあ。」, where the owner had answered it by asking for it themselves.)
 pub fn suggestion_phrase(text: &str) -> Option<String> {
     static RULES: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
@@ -688,6 +749,37 @@ pub fn typed_text(message: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A server's tools told of after a conversation began: each once; a server whose tools would pass the budget in full by name and a line, with
+    /// how to get the rest; one within it in full. The two of a game editor's size and a small one's: a fifth of the characters told in full twice.
+    #[test]
+    fn tools_are_told_of_once_and_a_big_servers_by_name() {
+        let (big, small) = (super::server_tools("editor", 196, 700), super::server_tools("modeler", 10, 1500));
+        let mut tools: Vec<serde_json::Value> = big.iter().chain(&small).cloned().collect();
+        tools.push(crate::tools::describe_tools_schema());
+        let told = super::tools_added(&tools, true, false);
+        for tool in &tools[..tools.len() - 1] {
+            let name = tool["function"]["name"].as_str().unwrap();
+            assert_eq!(told.matches(&format!("`{name}`")).count(), 1, "{name} told of once");
+        }
+        assert!(told.contains("`mcp__modeler__tool_3`: From the MCP server modeler. Tool 3 of modeler.") && told.matches("Arguments (JSON Schema)").count() == 10, "the small one in full");
+        assert!(told.contains("- `mcp__editor__tool_7`: Tool 7 of editor.\n"), "the big one by name and its first sentence");
+        assert!(told.contains("`describe_tools({names: [...]})`") && !told.contains("- `describe_tools`"), "how to get the rest, and not itself listed");
+        let before: usize = tools[..tools.len() - 1].iter().map(|tool| super::told_in_full(tool).chars().count() + crate::code_mode::declarations(&serde_json::Value::Array(vec![tool.clone()])).concat().chars().count()).sum();
+        assert!(told.chars().count() * 5 < before, "{} characters against {before} told in full twice", told.chars().count());
+    }
+
+    /// What the servers say their tools are is in blocks, in full and by name; the note's own words, before them, are the app's.
+    #[test]
+    fn the_servers_words_of_their_tools_are_in_blocks() {
+        let (big, small) = (super::server_tools("editor", 196, 700), super::server_tools("modeler", 3, 300));
+        let tools: Vec<serde_json::Value> = big.iter().chain(&small).cloned().collect();
+        let told = super::tools_added(&tools, false, false);
+        assert_eq!(told.matches("<untrusted_web_content").count(), 2, "one for those in full, one for those by name: {}", &told[..400]);
+        let first_block = told.find("<untrusted_web_content").unwrap();
+        assert!(told[..first_block].starts_with(super::TOOLS_ADDED) && !told[..first_block].contains("mcp__"), "the app's words come first, and no server's");
+        assert!(told.contains("The block above came from the MCP servers, as what their tools are"));
+    }
 
     /// The project's instruction files come with a word on whose rules they are; with none, neither comes.
     #[test]

@@ -116,13 +116,14 @@ pub const REASON_WEB_FORGET: &str = "web content is in this conversation, and fo
 pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
 pub const REASON_CARGO_OUTSIDE: &str = "cargo cannot read this workspace inside the sandbox, so it would run with the sandbox's read limits lifted: it can read every file you can, and its network cannot be stopped";
 pub const REASON_CARGO_CONFIG_RUNS: &str = "cargo's config here also runs {0}, with the same reach";
+pub const REASON_TOO_LARGE_TO_KEEP: &str = "this file is larger than 256 MB, so no copy of it is kept for a rewind: written over or taken away, it cannot be brought back: {0}";
 pub const REASON_OUTSIDE_SANDBOX: &str = "this runs outside the sandbox, as you: it can read and change every file you can, and reach the network";
 
 /// Every reason a card can give, for the test that each has its Japanese in the app.
-pub const REASONS: [&str; 18] = [
+pub const REASONS: [&str; 19] = [
     REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
     REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED, REASON_CARGO_OUTSIDE, REASON_CARGO_CONFIG_RUNS,
-    REASON_OUTSIDE_SANDBOX,
+    REASON_OUTSIDE_SANDBOX, REASON_TOO_LARGE_TO_KEEP,
 ];
 
 /// `dir` or `type`, which cmd runs itself: nothing else is started.
@@ -338,6 +339,17 @@ pub(crate) fn keys_folder(path: &Path) -> bool {
     SECRET_FOLDERS.iter().any(|mark| text.contains(mark) || text.ends_with(mark.trim_end_matches('/')))
 }
 
+/// Whether a folder holds one of those folders a level or more down, as `C:\Users\x\.config` holds `.config\gcloud` and `AppData\Local\Google`
+/// holds Chrome's: opened with what is in it, it would open that. (One right in a folder, as `.ssh` in the home, is the caller's to know.)
+pub(crate) fn holds_keys_folder(path: &Path) -> bool {
+    let text = as_opened(&path.to_string_lossy().replace('\\', "/").to_lowercase());
+    let text = text.trim_end_matches('/');
+    SECRET_FOLDERS.iter().any(|mark| {
+        let mark = mark.trim_end_matches('/');
+        mark.match_indices('/').skip(1).any(|(at, _)| text.ends_with(&mark[..at]))
+    })
+}
+
 /// A path as the system gives it, as a person would write it. A mapped drive comes back as `\\?\UNC\server\share`, which is `\\server\share`: with only the `\\?\` off it would read as a relative
 /// path, and a network folder would no longer be known for one.
 fn without_verbatim(text: &str) -> String {
@@ -363,6 +375,20 @@ pub(crate) fn real_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether what `found` is of is a reparse point (a junction or a mount point that `is_symlink` may not say).
+fn reparse_point(found: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        found.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = found;
+        false
+    }
+}
+
 /// What "Always" would allow, for the rest of a session, of a call that asks for a reason that a rule never answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlwaysScope {
@@ -374,6 +400,8 @@ pub enum AlwaysScope {
     Network(String),
     /// A line of several commands (see [`LineParts`]): what "always" allows of each one that would ask alone, as it is shown. The sites for this session, the rest as rules.
     Parts(Vec<String>),
+    /// What these MCP servers returned is why it asks, and nothing else: "always" trusts them, from now on and in their file (Settings turns it back).
+    Servers(Vec<String>),
 }
 
 /// What a card says in place of "always", where a line's parts cannot each be allowed (see [`LineParts`]).
@@ -737,6 +765,9 @@ pub struct Gate {
     pub secrets: Vec<PathBuf>,
     /// Dogmind's own records in its folder, which are not kept secret: its conversations with their trajectories, and the engine's log (`records`).
     pub records: Vec<PathBuf>,
+    /// The app's folder for what it writes for commands to read (a check's pictures, long outputs, copies of attachments), which is not kept secret either: what is in it
+    /// was the model's already.
+    pub for_sandbox: Option<PathBuf>,
     denied: RegexSet,
     safe: Regex,
     look: Regex,
@@ -762,6 +793,7 @@ impl Gate {
         Gate {
             secrets: Vec::new(),
             records: Vec::new(),
+            for_sandbox: None,
             // Never, whoever asks.
             denied: set(&[
                 r"^\s*sudo\b", r"\bmkfs", r"\bformat\s+[a-z]:", r"\bdd\b.*\bof=/dev/", r":\(\)\s*\{", r"\b(curl|wget|iwr|irm|invoke-webrequest)\b.*\|\s*(sh|bash|cmd|powershell|pwsh|iex)\b",
@@ -849,8 +881,10 @@ impl Gate {
         let command = command.replace('^', "");
         // (a word alone can be about them, in `git log --grep=credentials`, but not to a program that prints a file)
         let prints_files = ["type", "more", "findstr"].iter().any(|program| command.trim_start().get(..program.len()).is_some_and(|start| start.eq_ignore_ascii_case(program)));
-        // (cmd's own separators are a `,` too. In `HEAD:.env` what follows the `:` is the path, and in `C:\x` the whole word is.)
-        command.split(separates_words).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
+        // (cmd's own separators are a `,` too. In `HEAD:.env` what follows the `:` is the path, and in `C:\x` the whole word is. What is in quotes is one word as well,
+        // spaces and all: the stores of browsers are in `User Data`, which split at its space is no store.)
+        let quoted = ['"', '\''].into_iter().flat_map(|quote| command.split(quote).skip(1).step_by(2));
+        quoted.chain(command.split(separates_words)).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
             let path = Path::new(word);
             let rooted = |path: &Path| if path.is_absolute() { path.to_path_buf() } else { Path::new("/").join(path) };
             let after_a_revision = word.rsplit_once(':').map(|(_, path)| Path::new(path));
@@ -860,7 +894,7 @@ impl Gate {
 
     /// Under a place that holds keys, as the app's folder does, and not one of the records in it.
     fn kept_secret(&self, path: &Path) -> bool {
-        self.secrets.iter().any(|secret| inside(secret, path)) && !self.records.iter().any(|record| inside(record, path))
+        self.secrets.iter().any(|secret| inside(secret, path)) && !self.records.iter().chain(&self.for_sandbox).any(|record| inside(record, path))
     }
 
     /// A place secrets are kept, as it is spelled or where it really leads: `..`, a link, a junction and a short name all end up here.
@@ -918,6 +952,8 @@ impl Gate {
             }
             // (it runs a page's scripts in the sandbox with no network, where they can read and print and little else: it stays in the workspace itself)
             "show_diff" | "todo" | "present" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "wake_at" | "check_page" | "ask_user" | "submit_plan" | "set_goal" | "goal_status" | "finish_goal" => Verdict::Allow,
+            // (what the servers said of their tools, which the hub holds)
+            crate::prompt::DESCRIBE_TOOLS => Verdict::Allow,
             // (its own calls are each through this gate, and it has only the looking ones)
             "explore" => Verdict::Allow,
             // (so are a program's: it does nothing but call tools, and each call is judged on its own)
@@ -986,24 +1022,38 @@ impl Gate {
         }
     }
 
+    /// Every path a call writes is looked at: one that is refused refuses the call, whatever comes before it, and otherwise the card asks at the
+    /// highest risk among them with every reason, each once. (The first path that was asked about was the answer: a call that wrote outside the
+    /// workspace and where keys are kept was asked about the first, and once allowed, wrote the second too.)
     fn write_verdict<'a>(&self, workspace: &Path, paths: impl Iterator<Item = &'a str>) -> Verdict {
+        let (mut risk, mut reasons): (Risk, Vec<String>) = (Risk::Low, Vec::new());
         for path in paths {
             let full = resolve(workspace, path);
-            if reaches_out(&full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE_AND_OFF_THIS_PC, &[&full.display().to_string()])) };
-            }
             if self.is_secret(&full) {
                 return Verdict::Deny(format!("writes to a place secrets are kept: {}", full.display()));
             }
-            if !within(workspace, &full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE, &[&full.display().to_string()])) };
-            }
+            let shown = full.display().to_string();
+            let asked = if reaches_out(&full) {
+                Some((Risk::High, reason_of(REASON_OUTSIDE_AND_OFF_THIS_PC, &[&shown])))
+            } else if !within(workspace, &full) {
+                Some((Risk::High, reason_of(REASON_OUTSIDE, &[&shown])))
             // A hook or a line of config there runs outside the sandbox, the next time a person uses git here.
-            if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_GIT_FOLDER, &[&full.display().to_string()])) };
+            } else if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
+                Some((Risk::High, reason_of(REASON_GIT_FOLDER, &[&shown])))
+            // A file too large for a rewind to keep a copy of: written over or taken away, it cannot be brought back, and the person is told so.
+            } else if std::fs::metadata(&full).is_ok_and(|found| found.is_file() && found.len() > crate::checkpoint::MOST_KEPT) {
+                Some((Risk::Medium, reason_of(REASON_TOO_LARGE_TO_KEEP, &[&shown])))
+            } else {
+                None
+            };
+            if let Some((at, reason)) = asked {
+                risk = risk.max(at);
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
             }
         }
-        Verdict::Ask { risk: Risk::Low, reason: None }
+        Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
     }
 }
 
@@ -1127,6 +1177,10 @@ fn command_path() -> Vec<PathBuf> {
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
 pub(crate) fn within(workspace: &Path, path: &Path) -> bool {
+    // (a workspace's root made a link since, by a command, leads wherever it likes: nothing is in it then)
+    if std::fs::symlink_metadata(workspace).is_ok_and(|found| found.file_type().is_symlink() || reparse_point(&found)) {
+        return false;
+    }
     inside(workspace, path) && match (real_path(workspace), real_path(path)) {
         (Some(root), Some(real)) => inside(&root, &real),
         _ => true,
@@ -1140,8 +1194,8 @@ pub fn covered(scope: &AlwaysScope, files: &[PathBuf], folders: &[PathBuf], netw
         AlwaysScope::File(file) => files.iter().any(|known| same(known, file)),
         AlwaysScope::Folders(wanted) => wanted.iter().all(|folder| folders.iter().any(|known| inside(known, folder))),
         AlwaysScope::Network(reach) => networks.contains(reach),
-        // (its parts are each looked at on their own, as they come)
-        AlwaysScope::Parts(_) => false,
+        // (its parts are each looked at on their own, as they come; a server's trust is in its file, and what it returns is no longer a reason)
+        AlwaysScope::Parts(_) | AlwaysScope::Servers(_) => false,
     }
 }
 
@@ -1162,6 +1216,22 @@ pub fn delegated(mode: Mode, tool: &str, risk: Risk, reason: Option<&str>, safe_
         Mode::AcceptEdits => matches!(tool, "create_file" | "apply_patch"),
         Mode::Auto => true,
         Mode::Plan => false,
+    }
+}
+
+#[cfg(test)]
+mod keys_folders {
+    use super::holds_keys_folder;
+    use std::path::Path;
+
+    #[test]
+    fn a_folder_that_holds_a_folder_of_keys_is_known() {
+        for holder in ["C:\\Users\\x\\.config", "C:\\Users\\x\\AppData\\Local\\Google", "C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\", "C:\\Users\\x\\.dogmind"] {
+            assert!(holds_keys_folder(Path::new(holder)), "{holder}");
+        }
+        for plain in ["C:\\Users\\x\\.cargo\\bin", "C:\\Users\\x\\AppData\\Roaming\\nvm\\v20.11.0", "C:\\Users\\x\\.ssh"] {
+            assert!(!holds_keys_folder(Path::new(plain)), "{plain}");
+        }
     }
 }
 
@@ -2027,8 +2097,51 @@ mod tests {
             for tool in READS {
                 assert!(matches!(gate.check(tool, &json!({"path": path}), root), Verdict::Ask { risk: Risk::High, reason: Some(_) }), "{tool} {path}");
             }
+            // (and a command's, the path in quotes as one with spaces must be)
+            for line in [format!("type \"{path}\""), format!("findstr x \"{path}\""), format!("mklink /H here \"{path}\""), format!("Get-Content '{path}'")] {
+                assert_eq!(gate.command_risk(&line, None), Ok(Risk::High), "{line}");
+            }
             assert!(matches!(gate.check("create_file", &json!({"path": path, "content": ""}), root), Verdict::Deny(_)), "written: {path}");
         }
+    }
+
+    /// An edit that writes over or takes away a file larger than a rewind keeps a copy of is asked about with that said, which no rule, "always" or mode
+    /// answers; a smaller one, and a new one, as before.
+    #[test]
+    fn an_edit_of_a_file_too_large_to_keep_is_asked_with_that_said() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("large.bin")).unwrap().set_len(300 << 20).unwrap();
+        std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+        for arguments in [json!({"path": "large.bin", "content": "x"}), json!({"path": "small.txt", "content": "y"}), json!({"path": "new.txt", "content": "z"})] {
+            let verdict = gate.check("create_file", &arguments, dir.path());
+            if arguments["path"] == "large.bin" {
+                assert!(matches!(&verdict, Verdict::Ask { reason: Some(reason), .. } if reason.contains("larger than 256 MB")), "{verdict:?}");
+            } else {
+                assert_eq!(verdict, Verdict::Ask { risk: Risk::Low, reason: None }, "{arguments}");
+            }
+        }
+        let patch = json!({"edits": [{"path": "large.bin", "old_string": "a", "new_string": "b"}], "expected_files": ["large.bin"]});
+        assert!(matches!(gate.check("apply_patch", &patch, dir.path()), Verdict::Ask { reason: Some(_), .. }));
+    }
+
+    /// Every path a call writes is looked at: a place keys are kept refuses the call wherever it comes in it, and otherwise the card asks at the highest
+    /// risk among them, with every reason once.
+    #[test]
+    fn every_path_an_edit_writes_is_weighed_and_a_refused_one_refuses_the_call() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("large.bin")).unwrap().set_len(300 << 20).unwrap();
+        let edit = |paths: &[&str]| json!({"edits": paths.iter().map(|path| json!({"path": path, "old_string": "a", "new_string": "b"})).collect::<Vec<_>>(), "expected_files": paths});
+        let secret = "C:\\Users\\me\\.ssh\\id_rsa";
+        for paths in [["large.bin", secret], ["C:\\elsewhere\\x.txt", secret], [secret, "small.txt"]] {
+            assert!(matches!(gate.check("apply_patch", &edit(&paths), dir.path()), Verdict::Deny(_)), "{paths:?}");
+        }
+        match gate.check("apply_patch", &edit(&["large.bin", ".git/config"]), dir.path()) {
+            Verdict::Ask { risk: Risk::High, reason: Some(reason) } => assert!(reason.contains("larger than 256 MB") && reason.contains("inside git's own folder") && reason.matches("; ").count() == 1, "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(gate.check("apply_patch", &edit(&["a.txt", "b.txt"]), dir.path()), Verdict::Ask { risk: Risk::Low, reason: None });
     }
 
     #[test]
@@ -2121,6 +2234,11 @@ mod tests {
         assert_eq!(read_verdict(&gate, "D:\\keys\\other.txt", root), Verdict::Allow);
         // (its records are not: they are read as any file outside the workspace is, by the tools and by a command, and the rest of the folder still asks)
         gate.records = vec![PathBuf::from("C:\\Data\\DogmindApp\\sessions"), PathBuf::from("C:\\Data\\DogmindApp\\engine.log")];
+        // (nor is what the app writes for commands to read: a check's pictures, long outputs)
+        gate.for_sandbox = Some(PathBuf::from("C:\\Data\\DogmindApp\\for-sandbox"));
+        assert!(!gate.is_secret(Path::new("C:\\Data\\DogmindApp\\for-sandbox\\dogmind-page-1-mobile.png")));
+        assert!(!gate.is_secret(Path::new("C:\\Data\\DogmindApp\\for-sandbox\\dogmind-output\\mcp-1.txt")));
+        assert!(gate.is_secret(Path::new("C:\\Data\\DogmindApp\\settings.json")));
         for path in ["C:\\Data\\DogmindApp\\sessions\\a.jsonl", "c:\\data\\dogmindapp\\SESSIONS\\a.trajectory.jsonl", "C:\\Data\\DogmindApp\\engine.log"] {
             assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
         }

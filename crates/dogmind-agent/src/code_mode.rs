@@ -39,6 +39,16 @@ const POLL: Duration = Duration::from_millis(20);
 const GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const GRACE: Duration = Duration::from_millis(300);
+/// The longest one wait of a program may be (`setTimeout`, `sleep`): a server that needs a moment after it starts (a game editor entering play mode, which
+/// a program wanted 6 s for), not a clock to keep. Longer is refused, and a program can wait again.
+pub const WAIT_MOST: Duration = Duration::from_secs(30);
+/// The most waits a program may have at once. What the host keeps of them is outside the program's memory limit, and a program a page led a
+/// model to write must not be able to grow the app's memory with it.
+pub const WAITS_MOST: usize = 10_000;
+/// How often a wait looks at the stop and the program's time limit: a person who stops the turn is not kept waiting for the rest of it.
+const WAIT_STEP: Duration = Duration::from_millis(20);
+/// The names a program is refused, which no tool is given as a global either.
+const REFUSED_GLOBALS: [&str; 12] = ["require", "std", "os", "process", "fetch", "XMLHttpRequest", "setInterval", "import", "__host", "host", "write", "scriptArgs"];
 /// The name the program's source has, in the engine's errors (the line numbers in them are the body's own).
 const PROGRAM_FILE: &str = "program.js";
 
@@ -66,7 +76,8 @@ impl Limits {
     /// [`TIME_LEAST`] and [`TIME_MOST`].
     pub fn with_timeout_seconds(mut self, seconds: Option<f64>) -> Self {
         if let Some(seconds) = seconds.filter(|seconds| seconds.is_finite()) {
-            self.time = Duration::from_secs_f64(seconds.max(0.0)).clamp(TIME_LEAST, TIME_MOST);
+            // (held as a number first: a Duration of 1e20 seconds is none, and making one panicked)
+            self.time = Duration::from_secs_f64(seconds.clamp(TIME_LEAST.as_secs_f64(), TIME_MOST.as_secs_f64()));
         }
         self
     }
@@ -236,7 +247,7 @@ impl Bridge {
 /// The program's side of `tools` and `console`, in JavaScript. `host(name, json)` answers a string whose first character says how the call went ("0" it gave its text,
 /// "1" it failed), so a failure throws an Error with the tool's own text in the program. The setup function is called once with what only Rust holds, and leaves
 /// `tools` and `console` as the globals; nothing else of it stays in reach of the program.
-const SETUP: &str = r#"(function (host, write, names) {
+const SETUP: &str = r#"(function (host, write, names, setTimer, clearTimer, waitMost, refused) {
     const shown = (value) => {
         if (typeof value === 'string') return value;
         try {
@@ -246,6 +257,41 @@ const SETUP: &str = r#"(function (host, write, names) {
             return String(value);
         }
     };
+    // The engine (quickjs-ng 0.16.2, rquickjs 0.14.0) frees a WeakMap's records wrongly when a symbol keys one (fixed in 0.18.0, #1844:
+    // a use-after-free any script can cause) and miscounts Promise.withResolvers' result on an error (0.17.0, #1692). Until it is 0.18 or
+    // later, a program keys no weak collection by a symbol and has no Promise.withResolvers; the originals stay in this function.
+    delete Promise.withResolvers;
+    // (what the guards call is taken now, before any program: a program can replace Function.prototype.call, Reflect's functions and
+    // the arrays' iterator, which would hand it the originals or change what is passed after the check; the arguments go by name)
+    const apply = Reflect.apply, construct = Reflect.construct;
+    const guard = (prototype, method, check) => {
+        const original = prototype[method];
+        Object.defineProperty(prototype, method, { value: check(original), writable: false, enumerable: false, configurable: false });
+    };
+    const noSymbol = (what) => what + ' takes no symbol here: use an object';
+    const setRefused = noSymbol('WeakMap.set'), addRefused = noSymbol('WeakSet.add'), registerRefused = noSymbol('FinalizationRegistry.register'),
+          refRefused = noSymbol('WeakRef');
+    guard(WeakMap.prototype, 'set', (original) => function set(key, value) {
+        if (typeof key === 'symbol') throw new TypeError(setRefused);
+        return apply(original, this, [key, value]);
+    });
+    guard(WeakSet.prototype, 'add', (original) => function add(value) {
+        if (typeof value === 'symbol') throw new TypeError(addRefused);
+        return apply(original, this, [value]);
+    });
+    guard(FinalizationRegistry.prototype, 'register', (original) => function register(target, held, token) {
+        if (typeof target === 'symbol' || typeof token === 'symbol') throw new TypeError(registerRefused);
+        return arguments.length < 3 ? apply(original, this, [target, held]) : apply(original, this, [target, held, token]);
+    });
+    const OriginalWeakRef = WeakRef;
+    const SafeWeakRef = function WeakRef(target) {
+        if (new.target === undefined) throw new TypeError("Constructor WeakRef requires 'new'");
+        if (typeof target === 'symbol') throw new TypeError(refRefused);
+        return construct(OriginalWeakRef, [target], new.target);
+    };
+    SafeWeakRef.prototype = OriginalWeakRef.prototype;
+    Object.defineProperty(OriginalWeakRef.prototype, 'constructor', { value: SafeWeakRef, writable: false, configurable: false });
+    Object.defineProperty(globalThis, 'WeakRef', { value: SafeWeakRef, writable: false, configurable: false });
     const tools = {};
     for (const name of names) {
         tools[name] = async function (args) {
@@ -261,6 +307,28 @@ const SETUP: &str = r#"(function (host, write, names) {
     const log = (...parts) => write(parts.map(shown).join(' '));
     globalThis.tools = Object.freeze(tools);
     globalThis.console = Object.freeze({ log, error: log, warn: log, info: log, debug: log });
+    // Waits, as a program writes them: the host keeps the clock, and runs the earliest timer when nothing else is left to do.
+    const timers = new Map();
+    globalThis.setTimeout = (fn, ms, ...args) => {
+        if (typeof fn !== 'function') throw new TypeError('setTimeout takes a function, like setTimeout(resolve, 1000)');
+        const id = setTimer(Number(ms) || 0);
+        if (id === -1) throw new RangeError('a wait is at most ' + waitMost + ' ms; to wait longer, wait again');
+        if (id < 0) throw new RangeError('at most ' + (-id) + ' waits at a time');
+        timers.set(id, () => fn(...args));
+        return id;
+    };
+    globalThis.clearTimeout = (id) => { timers.delete(id); clearTimer(Number(id) || 0); };
+    globalThis.sleep = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+    // A tool whose name is a plain identifier is callable without `tools.` too, where no global has its name and it is not one a program is refused.
+    const refuse = new Set(refused);
+    for (const name of names) {
+        if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) && !(name in globalThis) && !refuse.has(name)) globalThis[name] = tools[name];
+    }
+    return (id) => {
+        const due = timers.get(id);
+        timers.delete(id);
+        if (due) due();
+    };
 })"#;
 
 /// Runs `code`, the body of an async function, with `tools` callable as `tools.<name>(args)`, and answers each call by `call(name, args)` on this thread. `cancel` set ends the run
@@ -289,6 +357,7 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
     let mut in_calls = Duration::ZERO;
     let mut finished: Option<Outcome> = None;
     let mut abandoned = false;
+    let mut stopped_at: Option<Instant> = None;
     loop {
         match from_program.recv_timeout(POLL) {
             Ok(Message::Done(outcome)) => {
@@ -317,8 +386,15 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
             Err(RecvTimeoutError::Timeout) => {
                 if cancel.load(Ordering::SeqCst) {
                     shared.cancel.store(true, Ordering::SeqCst);
+                    stopped_at.get_or_insert_with(Instant::now);
                 }
-                // A program the engine's interrupt cannot reach (it is inside something that does not look at the interrupt) is left behind once it is well past its time.
+                // A program the engine's interrupt cannot reach (it is inside something that does not look at the interrupt) is left behind once it is well past its time,
+                // or the grace after a stop: the person who stopped the turn does not wait out the rest of its time, which can be ten minutes.
+                if stopped_at.is_some_and(|at| at.elapsed() > GRACE) {
+                    shared.stop(Stop::Cancelled);
+                    abandoned = true;
+                    break;
+                }
                 if started.elapsed().saturating_sub(in_calls) > limits.time + GRACE {
                     shared.stop(Stop::Time);
                     abandoned = true;
@@ -394,8 +470,46 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
             let log = log.clone();
             Function::new(ctx.clone(), move |line: String| log.borrow_mut().push(&line)).map_err(|error| describe_engine_error(&ctx, error))?
         };
+        // (the timers a program set, by when they are due, in a heap: each is taken in its turn. The program keeps what each one runs; the host keeps the
+        // ids still waiting, and one cleared is let go when it comes up, or when the heap is made again from the waiting ones)
+        let timers: Rc<RefCell<std::collections::BinaryHeap<std::cmp::Reverse<(Instant, u32)>>>> = Rc::default();
+        let waiting: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::default();
+        let set_timer = {
+            let (timers, waiting, next) = (timers.clone(), waiting.clone(), Cell::new(0u32));
+            Function::new(ctx.clone(), move |ms: f64| -> f64 {
+                let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
+                if ms > WAIT_MOST.as_secs_f64() * 1000.0 {
+                    return -1.0;
+                }
+                let (mut timers, mut waiting) = (timers.borrow_mut(), waiting.borrow_mut());
+                if waiting.len() >= WAITS_MOST {
+                    return -(WAITS_MOST as f64);
+                }
+                // (cleared ones piled up in the heap: it is made again of the waiting ones, so that it is never much more than they are)
+                if timers.len() >= 2 * WAITS_MOST {
+                    let kept: Vec<_> = timers.drain().filter(|std::cmp::Reverse((_, id))| waiting.contains(id)).collect();
+                    timers.extend(kept);
+                }
+                next.set(next.get() + 1);
+                timers.push(std::cmp::Reverse((Instant::now() + Duration::from_secs_f64(ms / 1000.0), next.get())));
+                waiting.insert(next.get());
+                f64::from(next.get())
+            })
+            .map_err(|error| describe_engine_error(&ctx, error))?
+        };
+        let clear_timer = {
+            let waiting = waiting.clone();
+            // (only a waiting one is let go: any other id does nothing)
+            Function::new(ctx.clone(), move |id: f64| {
+                if id >= 1.0 && id <= f64::from(u32::MAX) {
+                    waiting.borrow_mut().remove(&(id as u32));
+                }
+            })
+            .map_err(|error| describe_engine_error(&ctx, error))?
+        };
         let setup: Function = ctx.eval_with_options(SETUP, options("tools.js")).map_err(|error| describe_engine_error(&ctx, error))?;
-        setup.call::<_, ()>((host, write, names.to_vec())).map_err(|error| describe_engine_error(&ctx, error))?;
+        let wait_most = WAIT_MOST.as_secs_f64() * 1000.0;
+        let fire: Function = setup.call((host, write, names.to_vec(), set_timer, clear_timer, wait_most, REFUSED_GLOBALS.to_vec())).map_err(|error| describe_engine_error(&ctx, error))?;
         // (tests only: a wait the engine's interrupt does not reach, as nothing a program can do here is, for the way `run` leaves such a program behind)
         #[cfg(test)]
         {
@@ -404,7 +518,35 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
         }
         // The program's own time starts here, after the setup.
         let promise: Promise = ctx.eval_with_options(program, options(PROGRAM_FILE)).map_err(|error| describe_engine_error(&ctx, error))?;
-        let value: Value = promise.finish().map_err(|error| describe_engine_error(&ctx, error))?;
+        let value: Value = loop {
+            if let Some(result) = promise.result::<Value>() {
+                break result.map_err(|error| describe_engine_error(&ctx, error))?;
+            }
+            if ctx.execute_pending_job() {
+                continue;
+            }
+            // Nothing left to do but a timer: the earliest is waited for, and run.
+            let due = {
+                let (mut timers, mut waiting) = (timers.borrow_mut(), waiting.borrow_mut());
+                let mut due = None;
+                while let Some(std::cmp::Reverse((at, id))) = timers.pop() {
+                    if waiting.remove(&id) {
+                        due = Some((at, id));
+                        break;
+                    }
+                }
+                due
+            };
+            let Some((at, id)) = due else {
+                // (a program waiting for what never comes, as the engine says it)
+                return Err(describe_engine_error(&ctx, EngineError::WouldBlock));
+            };
+            if !wait_until(at, shared, &own_time, limits.time) {
+                // (the stop says why, and an error of the engine's is not shown with it)
+                return Err("interrupted".to_string());
+            }
+            fire.call::<_, ()>((f64::from(id),)).map_err(|error| describe_engine_error(&ctx, error))?;
+        };
         returned(&ctx, value)
     });
     let ms = millis(own_time());
@@ -425,8 +567,33 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
     if matches!(stopped, Some(Stop::Time | Stop::Calls | Stop::Cancelled)) {
         error = None;
     }
+    // Out of memory as it made its own error, the engine throws nothing it can name, as a program's own `throw null` does: "null" alone told a model
+    // neither (a program that set thousands of waits ran out so). Both are said.
+    if error.as_deref() == Some("null") {
+        error = Some(format!("null: the program threw null, or ran out of its memory ({} MiB) as the engine made the error", limits.memory.max(MEMORY_LEAST) >> 20));
+    }
     let hint = error.as_deref().filter(|error| error.starts_with("SyntaxError") && looks_like_typescript(code)).map(|_| TYPESCRIPT_HINT);
     Outcome { value, log, error, stopped, calls: Vec::new(), ms, hint }
+}
+
+/// Waits until `at`, in steps that look at the stop and the program's time limit: false when the run is to stop. The wait is the program's own time,
+/// as its running is (only its calls' waits are not).
+fn wait_until(at: Instant, shared: &Shared, own_time: &dyn Fn() -> Duration, time: Duration) -> bool {
+    loop {
+        if shared.should_stop() {
+            return false;
+        }
+        let used = own_time();
+        if used >= time {
+            shared.stop(Stop::Time);
+            return false;
+        }
+        let now = Instant::now();
+        if now >= at {
+            return true;
+        }
+        std::thread::sleep((at - now).min(time - used).min(WAIT_STEP));
+    }
 }
 
 fn options(file: &str) -> EvalOptions {
@@ -606,10 +773,10 @@ pub const NOT_CALLABLE: [&str; 8] = ["run_code", "submit_plan", "ask_user", "exp
 
 /// The rules the model reads before the tools it can call from a program. (What a call returns is said: DeepSeek, asked to show code mode in two runs,
 /// took `tools.list_files({})` and `tools.search_files` for arrays each time, and spent one or two programs on `typeof` before it used them.)
-const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws. To wait (a server that needs a moment after it starts), `await sleep(ms)` or `await new Promise(r => setTimeout(r, ms))`: 30 s at most a wait, counted in its running time.";
 /// The rules that push for programs, to measure whether a model can write them when it is told to (DOGMIND_CODE_MODE_EAGER=1): the
 /// default ones above left DeepSeek writing none in six runs, as it puts calls that do not depend on each other in one answer already.
-const RULES_EAGER: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Prefer it to calling tools one at a time whenever the work needs two or more calls: read, search, edit and run the tests in one program where you can, and decide in the program what to do with what a call returned. Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+const RULES_EAGER: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Prefer it to calling tools one at a time whenever the work needs two or more calls: read, search, edit and run the tests in one program where you can, and decide in the program what to do with what a call returned. Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws. To wait (a server that needs a moment after it starts), `await sleep(ms)` or `await new Promise(r => setTimeout(r, ms))`: 30 s at most a wait, counted in its running time.";
 /// The switch to [`RULES_EAGER`], read when the tools are made.
 pub const EAGER_VARIABLE: &str = "DOGMIND_CODE_MODE_EAGER";
 /// How much of a tool's first sentence its declaration keeps.
@@ -634,11 +801,16 @@ pub fn schema(offered: &Json) -> Json {
 /// [`schema`], with the rules that push for programs or the default ones.
 fn schema_with(offered: &Json, eager: bool) -> Json {
     let mut description = String::from(if eager { RULES_EAGER } else { RULES });
-    for tool in offered.as_array().into_iter().flatten() {
+    // (an MCP server's tool is in the list in full: it is told of once, there, and a program calls it as any other)
+    let server = |tool: &&Json| tool.pointer("/function/name").and_then(Json::as_str).is_some_and(|name| name.starts_with("mcp__"));
+    for tool in offered.as_array().into_iter().flatten().filter(|tool| !server(tool)) {
         if let Some(line) = declaration(tool) {
             description.push('\n');
             description.push_str(&line);
         }
+    }
+    if offered.as_array().into_iter().flatten().any(|tool| server(&tool)) {
+        description.push_str("\nThe MCP servers' tools in your list (`mcp__...`) are called the same way, as `await tools.<name>({...})` (`tools[\"<name>\"]` for a name with `-` in it) with the arguments their schemas give.");
     }
     let time = format!("Its own running time in seconds, not counting the calls' waits. Default {}, at most {}.", TIME_DEFAULT.as_secs(), TIME_MOST.as_secs());
     json!({"type": "function", "function": {"name": "run_code", "description": description, "parameters": {"type": "object", "properties": {
@@ -746,6 +918,41 @@ mod tests {
 
     fn go_alone(code: &str) -> Outcome {
         go(code, &[], |_, _| panic!("no call was expected"))
+    }
+
+    /// What the engine frees wrongly is out of a program's reach: a symbol keys no weak collection, Promise.withResolvers is gone, and
+    /// objects are kept weakly as before.
+    #[test]
+    fn a_weak_collection_takes_no_symbol_and_promise_has_no_with_resolvers() {
+        for code in ["new WeakMap().set(Symbol('a'), 1)", "new WeakMap([[Symbol('a'), 1]])", "new WeakSet().add(Symbol('a'))",
+                     "new WeakSet([Symbol('a')])", "new WeakRef(Symbol('a'))", "new FinalizationRegistry(() => {}).register(Symbol('a'), 1)",
+                     "new FinalizationRegistry(() => {}).register({}, 1, Symbol('a'))", "Promise.withResolvers()"] {
+            let outcome = go_alone(&format!("{code}; return 'kept';"));
+            assert!(outcome.error.as_deref().is_some_and(|error| error.contains("TypeError")), "{code}: {outcome:?}");
+        }
+        assert_eq!(go_alone("return typeof Promise.withResolvers;").value.as_deref(), Some("undefined"));
+        let kept = "const key = {}; const map = new WeakMap([[key, 1]]); new WeakSet().add(key); const ref = new WeakRef(key);
+                    new FinalizationRegistry(() => {}).register(key, 1); return [map.get(key), ref.deref() === key, ref instanceof WeakRef,
+                    ref.constructor === WeakRef];";
+        assert_eq!(go_alone(kept).value.as_deref(), Some("[1,true,true,true]"));
+        // (the guards hold: not replaced, not taken off the prototype, the originals nowhere in reach)
+        let tamper = "try { WeakMap.prototype.set = null; } catch (e) {} try { delete WeakMap.prototype.set; } catch (e) {}
+                      try { globalThis.WeakRef = null; } catch (e) {} new WeakMap().set(Symbol('a'), 1); return 'kept';";
+        assert!(go_alone(tamper).error.as_deref().is_some_and(|error| error.contains("TypeError")));
+        // (nor through what a guard calls: replaced, Function.prototype.call, Reflect's functions and the arrays' iterator are never
+        // run by a guard, so none is handed an original or changes what was checked)
+        let hijack = "let seen = 0; const mark = function () { seen++; return 'hijacked'; };
+                      Function.prototype.call = mark; Function.prototype.apply = mark; Reflect.apply = mark; Reflect.construct = mark;
+                      Array.prototype[Symbol.iterator] = function* () { seen++; yield Symbol('swapped'); };
+                      const key = {}; const map = new WeakMap(); map.set(key, 1); new WeakSet().add(key); new WeakRef(key);
+                      new FinalizationRegistry(() => {}).register(key, 1);
+                      let refused = 0;
+                      const attempts = [() => map.set(Symbol('a'), 1), () => new WeakRef(Symbol('a'))];
+                      for (let i = 0; i < attempts.length; i++) {
+                          try { attempts[i](); } catch (e) { if (e instanceof TypeError && String(e.message).includes('no symbol')) refused++; }
+                      }
+                      return [map.get(key), seen, refused];";
+        assert_eq!(go_alone(hijack).value.as_deref(), Some("[1,0,2]"));
     }
 
     #[test]
@@ -886,6 +1093,23 @@ mod tests {
         assert!(render(&outcome, &limits).contains("time limit"));
     }
 
+    /// A stop leaves such a program behind the grace after it, and not after the whole of its time.
+    #[test]
+    fn a_stop_leaves_a_program_the_interrupt_cannot_reach_behind_after_the_grace() {
+        let limits = Limits { time: Duration::from_secs(60), ..limits() };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            stopper.store(true, Ordering::SeqCst);
+        });
+        let began = Instant::now();
+        let outcome = run("__test_sleep(4000); return 1;", &[], &limits, &cancel, &mut |_, _| panic!("no call"));
+        let waited = began.elapsed();
+        assert!(waited >= Duration::from_millis(200) + GRACE && waited < Duration::from_millis(2500), "left at the stop and the grace: {waited:?}");
+        assert_eq!((outcome.stopped, outcome.value.as_deref()), (Some(Stop::Cancelled), None));
+    }
+
     #[test]
     fn time_spent_inside_a_call_is_not_counted_against_the_program() {
         let limits = Limits { time: Duration::from_millis(200), ..limits() };
@@ -914,6 +1138,31 @@ mod tests {
             Ok(String::new())
         });
         assert_eq!(outcome.stopped, Some(Stop::Time));
+    }
+
+    /// What the host keeps of a program's waits is bounded: clearing ids it never made keeps nothing, a wait past the most at once is refused, and setting
+    /// and clearing again and again does not pile up.
+    #[test]
+    fn the_waits_the_host_keeps_are_bounded() {
+        let outcome = go_alone("for (let i = 1; i < 1000000; i++) clearTimeout(i); return 'cleared';");
+        assert_eq!(outcome.value.as_deref(), Some("cleared"), "{:?}", outcome.error);
+        let outcome = go_alone("for (let i = 0; i < 10000; i++) setTimeout(() => {}, 1);\ntry { setTimeout(() => {}, 1); return 'set'; } catch (error) { return error.message; }");
+        assert_eq!(outcome.value.as_deref(), Some("at most 10000 waits at a time"), "{:?}", outcome.error);
+        let began = Instant::now();
+        let outcome = go_alone("for (let i = 0; i < 50000; i++) clearTimeout(setTimeout(() => {}, 29000));\nawait sleep(1); return 'quick';");
+        assert_eq!(outcome.value.as_deref(), Some("quick"), "{:?}", outcome.error);
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+    }
+
+    /// Out of memory as the engine made its own error, it throws nothing it can name, as `throw null` does: the error says both.
+    #[test]
+    fn a_nameless_error_says_it_may_be_the_memory_limit() {
+        // (out of memory with its waits: the memory limit is said, as a stop or in the nameless error, whichever way the engine went)
+        let small = Limits { memory: 4 << 20, ..limits() };
+        let outcome = run("const all = []; for (let i = 0; i < 9000; i++) all.push(sleep(i % 50)); await Promise.all(all); return 'all';", &[], &small, &AtomicBool::new(false), &mut |_, _| panic!("no call"));
+        assert!(outcome.stopped == Some(Stop::Memory) || outcome.error.as_deref().is_some_and(|error| error.contains("ran out of its memory (4 MiB)")), "{outcome:?}");
+        let thrown = go_alone("throw null;");
+        assert!(thrown.error.as_deref().is_some_and(|error| error.starts_with("null: the program threw null")), "{thrown:?}");
     }
 
     #[test]
@@ -1094,7 +1343,7 @@ mod tests {
     #[test]
     fn the_program_has_no_file_network_process_or_clock_of_its_own() {
         let outcome = go_alone(
-            "return ['require', 'std', 'os', 'process', 'fetch', 'XMLHttpRequest', 'setTimeout', 'setInterval', 'import', '__host', 'host', 'write', 'scriptArgs']\
+            "return ['require', 'std', 'os', 'process', 'fetch', 'XMLHttpRequest', 'setInterval', 'import', '__host', 'host', 'write', 'scriptArgs']\
              .map((name) => name + ':' + typeof globalThis[name]).join(' ');",
         );
         let value = outcome.value.expect("the value");
@@ -1105,6 +1354,74 @@ mod tests {
         assert_eq!(outcome.value.as_deref(), Some("refused"), "{:?}", outcome.error);
         let outcome = go_alone("return String(typeof tools) + ' ' + String(Object.isFrozen(tools));");
         assert_eq!(outcome.value.as_deref(), Some("object true"));
+    }
+
+    /// A server that needs a moment after it starts: a call, a wait of 6 s as a program writes it, and another call, in one program. The wait is its own time.
+    #[test]
+    fn a_program_waits_between_two_calls_and_the_wait_counts_in_its_time() {
+        let began = Instant::now();
+        let code = "const a = await tools.start({});\nawait new Promise(r => setTimeout(r, 6000));\nconst b = await tools.status({});\nreturn a + ' ' + b;";
+        let outcome = go(code, &["start", "status"], |name, _| Ok(format!("{name} answered")));
+        assert_eq!(outcome.value.as_deref(), Some("start answered status answered"), "{:?}", outcome.error);
+        assert_eq!(outcome.calls.len(), 2);
+        assert!(outcome.ms >= 6000 && began.elapsed() >= Duration::from_secs(6), "{} ms", outcome.ms);
+        let outcome = go_alone("await sleep(50); return 'slept';");
+        assert_eq!(outcome.value.as_deref(), Some("slept"), "{:?}", outcome.error);
+    }
+
+    /// Timers run by when they are due, a cleared one not at all; a wait past the most is refused with how to wait longer.
+    #[test]
+    fn timers_run_in_their_order_and_a_wait_past_the_most_is_refused() {
+        let code = "const log = []; setTimeout(() => log.push('a'), 200); const x = setTimeout(() => log.push('x'), 100); setTimeout((what) => log.push(what), 50, 'b');\nclearTimeout(x); await sleep(300); return log.join('');";
+        assert_eq!(go_alone(code).value.as_deref(), Some("ba"));
+        let outcome = go_alone("await sleep(31000); return 'late';");
+        assert!(outcome.error.as_deref().is_some_and(|error| error.contains("a wait is at most 30000 ms")), "{:?}", outcome.error);
+    }
+
+    /// Many timers are taken in their turn without the time going on sorting them, and a cleared one is not waited for.
+    #[test]
+    fn many_timers_run_without_a_cost_of_their_own_and_a_cleared_one_is_not_waited_for() {
+        let began = Instant::now();
+        let outcome = go_alone("const all = []; for (let i = 0; i < 5000; i++) all.push(sleep(i % 50)); await Promise.all(all); return 'all ' + all.length;");
+        assert_eq!(outcome.value.as_deref(), Some("all 5000"), "{:?}", outcome.error);
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        let began = Instant::now();
+        let outcome = go_alone("const long = setTimeout(() => {}, 29000); clearTimeout(long); await sleep(10); return 'quick';");
+        assert_eq!(outcome.value.as_deref(), Some("quick"));
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    }
+
+    /// A wait past what is left of the program's time ends at its limit, and a stop in the middle of one ends it at once.
+    #[test]
+    fn a_wait_ends_at_the_time_limit_and_at_a_stop() {
+        let began = Instant::now();
+        let short = Limits { time: Duration::from_secs(2), ..limits() };
+        let outcome = run("await sleep(6000); return 'late';", &[], &short, &AtomicBool::new(false), &mut |_, _| panic!("no call"));
+        assert_eq!(outcome.stopped, Some(Stop::Time));
+        assert!(began.elapsed() >= Duration::from_millis(1900) && began.elapsed() < Duration::from_millis(2600), "{:?}", began.elapsed());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                cancel.store(true, Ordering::SeqCst);
+                Instant::now()
+            })
+        };
+        let outcome = run("await sleep(6000); return 'late';", &[], &limits(), &cancel, &mut |_, _| panic!("no call"));
+        let ended = Instant::now();
+        let set = setter.join().unwrap();
+        assert_eq!(outcome.stopped, Some(Stop::Cancelled));
+        assert!(ended.duration_since(set) < Duration::from_millis(300), "{:?} after the stop", ended.duration_since(set));
+    }
+
+    /// A tool is callable without `tools.` too (a model wrote `describe_tools({...})` so), where it does not take a name a program is refused.
+    #[test]
+    fn a_tool_is_callable_without_tools_dot_but_not_under_a_refused_name() {
+        let code = "const a = await describe_tools({names: ['x']}); const b = await tools.describe_tools({names: ['x']});\nreturn [a === b, typeof fetch, typeof tools.fetch, typeof console.log].join(' ');";
+        let outcome = go(code, &["describe_tools", "fetch"], |name, args| Ok(format!("{name} {args}")));
+        assert_eq!(outcome.value.as_deref(), Some("true undefined function function"), "{:?}", outcome.error);
+        assert_eq!(outcome.calls.len(), 2);
     }
 
     #[test]
@@ -1146,6 +1463,9 @@ mod tests {
         assert_eq!(asked(Some(-5.0)), Duration::from_secs(1));
         assert_eq!(asked(Some(f64::NAN)), Duration::from_secs(120));
         assert_eq!(asked(Some(f64::INFINITY)), Duration::from_secs(120));
+        // (a number no Duration holds: making one of it panicked)
+        assert_eq!(asked(Some(1e20)), Duration::from_secs(600));
+        assert_eq!(asked(Some(f64::MAX)), Duration::from_secs(600));
         // A time set past the most is held to it by the run itself.
         let limits = Limits { time: Duration::from_secs(5000), ..limits() };
         assert!(run("return 1;", &[], &limits, &AtomicBool::new(false), &mut |_, _| panic!("no call")).value.is_some());
@@ -1188,9 +1508,9 @@ mod tests {
         assert_eq!(lines[1], "tools.read_file({path, limit?}) — Read a text file.");
         assert_eq!(lines[2], "tools.todo({todos: [{id, status?: \"pending\"|\"done\"}], merge?}) — A checklist.");
         assert_eq!(lines[3], "tools.show_diff({scope: \"session\"|\"staged\", paths?: [string], depth?: [number]})");
-        assert_eq!(lines[4], "tools[\"mcp__a-b__c.d\"]({}) — Version 1.2 of it is here.");
-        assert_eq!(lines[5], "tools.mcp__s__t({})");
-        assert_eq!(lines.len(), 6);
+        // (an MCP server's tool is in the list in full, and is told of once: there)
+        assert!(lines[4].starts_with("The MCP servers' tools in your list") && !description.contains("Version 1.2"), "{description}");
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]

@@ -106,7 +106,7 @@ fn a_flipped_byte_is_damage_that_is_told_and_what_is_left_still_opens() {
     assert_eq!(read_checked(&path).unwrap().1, [6]);
     assert!(damage_words(&opened.damaged).ends_with("lines 6"), "{}", damage_words(&opened.damaged));
     // a branch would leave it out without a word: refused, in the same words
-    let error = fork(&path, 0, None).unwrap_err();
+    let error = fork(&path, 0, None, &Policy::default()).unwrap_err();
     assert!(error.contains(DAMAGE_NOTICE), "{error}");
     // the list counts what opens and the session is there
     assert_eq!(list(dir.path())[0].messages, 2);
@@ -233,7 +233,7 @@ fn a_session_whose_key_is_not_here_is_listed_as_such_and_never_opened_or_written
     crate::conversation_key::forget(key.fingerprint());
     assert!(read(&path).unwrap_err().contains("encrypted"), "{}", read(&path).unwrap_err());
     assert!(is_unreadable(&entries_of(&path).err().unwrap()));
-    assert!(Session::open(&path).is_err() && rename(&path, "x").is_err() && fork(&path, 0, None).is_err());
+    assert!(Session::open(&path).is_err() && rename(&path, "x").is_err() && fork(&path, 0, None, &Policy::default()).is_err());
     let listed = list(dir.path());
     assert_eq!((listed.len(), listed[0].messages), (1, 0));
     assert!(listed[0].unreadable.is_some() && listed[0].title.contains("encrypted"), "{:?}", listed[0]);
@@ -261,7 +261,7 @@ fn a_branch_of_an_encrypted_session_is_encrypted_with_an_id_of_its_own_and_its_p
     let stored = fs::read(crate::images::folder_of(&path).join("a.png")).unwrap();
     assert!(crate::images::is_sealed(&crate::images::folder_of(&path).join("a.png")) && !String::from_utf8_lossy(&stored).contains("pretend"));
     let before = fs::read(&path).unwrap();
-    let branch = fork(&path, 2, Some("a title (branch)")).unwrap();
+    let branch = fork(&path, 2, Some("a title (branch)"), &Policy::on(key.clone())).unwrap();
     assert_eq!(fs::read(&path).unwrap(), before, "the original is only read");
     assert!(is_encrypted(&branch));
     assert_ne!(file_lines(&path)[0], file_lines(&branch)[0], "an id of its own");
@@ -273,7 +273,29 @@ fn a_branch_of_an_encrypted_session_is_encrypted_with_an_id_of_its_own_and_its_p
     let there = crate::images::folder_of(&branch).join("a.png");
     assert_eq!(crate::images::read_stored(&there).unwrap(), b"pretend this is a png");
     assert_ne!(fs::read(&there).unwrap(), stored, "sealed again, not copied");
-    assert!(fork(&path, 9, None).is_err());
+    assert!(fork(&path, 9, None, &Policy::on(key.clone())).is_err());
+}
+
+/// A branch is written as the conversations are written now, not as the one it is of: a plain conversation's, once they are encrypted (its change
+/// still under way), is encrypted; and an encrypted one's, once they are kept as they are, is plain.
+#[test]
+fn a_branch_is_written_as_the_policy_says_whatever_its_conversation_was() {
+    let dir = crate::in_container::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "1").unwrap();
+    session.append(&Message::text("system", "s")).unwrap();
+    session.append(&Message::text("user", "a plain question")).unwrap();
+    session.append(&Message::text("assistant", "a plain answer")).unwrap();
+    let path = session.path.clone();
+    drop(session);
+    let key = cipher();
+    let branch = fork(&path, 2, None, &Policy::on(key.clone())).unwrap();
+    assert!(!is_encrypted(&path) && is_encrypted(&branch));
+    assert!(!fs::read_to_string(&branch).unwrap().contains("a plain answer"));
+    assert_eq!(Session::open(&branch).unwrap().2.len(), 3);
+    let back = fork(&branch, 2, None, &Policy::default()).unwrap();
+    assert!(!is_encrypted(&back) && fs::read_to_string(&back).unwrap().contains("a plain answer"));
+    // (and none while the key waits to be unlocked)
+    assert!(fork(&path, 2, None, &Policy::locked()).is_err());
 }
 
 #[test]

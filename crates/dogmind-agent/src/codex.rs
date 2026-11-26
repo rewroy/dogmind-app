@@ -340,6 +340,161 @@ fn usage_of(raw: &Value) -> Option<Usage> {
     })
 }
 
+/// What a structured answer being written says so far (`output_schema`): its `kind`, once written whole, and as much of its `content` string as has come,
+/// its escapes undone (one cut in half waits for the rest). The rest of the object, `tool_calls` and any other, is gone past.
+fn partial_answer(raw: &str) -> (Option<String>, String) {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut at = 0;
+    let skip_space = |at: &mut usize| {
+        while *at < chars.len() && chars[*at].is_whitespace() {
+            *at += 1;
+        }
+    };
+    // A string from its opening quote: what it holds so far, and whether it closed.
+    let string = |at: &mut usize| -> (String, bool) {
+        let mut out = String::new();
+        *at += 1;
+        while *at < chars.len() {
+            match chars[*at] {
+                '"' => {
+                    *at += 1;
+                    return (out, true);
+                }
+                '\\' => {
+                    let Some(&kind) = chars.get(*at + 1) else { return (out, false) };
+                    let simple = match kind {
+                        'n' => Some('\n'),
+                        't' => Some('\t'),
+                        'r' => Some('\r'),
+                        'b' => Some('\u{8}'),
+                        'f' => Some('\u{c}'),
+                        '"' | '\\' | '/' => Some(kind),
+                        _ => None,
+                    };
+                    if let Some(simple) = simple {
+                        out.push(simple);
+                        *at += 2;
+                        continue;
+                    }
+                    // (\uXXXX, and a surrogate pair as two of them: one not here whole yet waits)
+                    let hex = |from: usize| -> Option<u32> { (chars.len() >= from + 4).then(|| chars[from..from + 4].iter().collect::<String>()).and_then(|text| u32::from_str_radix(&text, 16).ok()) };
+                    let Some(first) = hex(*at + 2) else { return (out, false) };
+                    if (0xD800..0xDC00).contains(&first) {
+                        if chars.len() < *at + 12 {
+                            return (out, false);
+                        }
+                        let second = (chars[*at + 6] == '\\' && chars[*at + 7] == 'u').then(|| hex(*at + 8)).flatten().unwrap_or(0);
+                        out.extend(char::from_u32(0x10000 + ((first - 0xD800) << 10) + second.saturating_sub(0xDC00)));
+                        *at += 12;
+                    } else {
+                        out.extend(char::from_u32(first));
+                        *at += 6;
+                    }
+                }
+                other => {
+                    out.push(other);
+                    *at += 1;
+                }
+            }
+        }
+        (out, false)
+    };
+    let (mut kind, mut content) = (None, String::new());
+    skip_space(&mut at);
+    if chars.get(at) != Some(&'{') {
+        return (kind, content);
+    }
+    at += 1;
+    loop {
+        skip_space(&mut at);
+        while chars.get(at) == Some(&',') {
+            at += 1;
+            skip_space(&mut at);
+        }
+        if chars.get(at) != Some(&'"') {
+            return (kind, content);
+        }
+        let (key, closed) = string(&mut at);
+        if !closed {
+            return (kind, content);
+        }
+        skip_space(&mut at);
+        if chars.get(at) != Some(&':') {
+            return (kind, content);
+        }
+        at += 1;
+        skip_space(&mut at);
+        if chars.get(at) == Some(&'"') {
+            let (value, closed) = string(&mut at);
+            match key.as_str() {
+                "content" => content = value,
+                "kind" if closed => kind = Some(value),
+                _ => {}
+            }
+            if !closed {
+                return (kind, content);
+            }
+            continue;
+        }
+        // (any other value, gone past as it nests, its strings with their quotes; one not ended yet ends what can be read)
+        let mut depth = 0usize;
+        while at < chars.len() {
+            match chars[at] {
+                '"' => {
+                    if !string(&mut at).1 {
+                        return (kind, content);
+                    }
+                    continue;
+                }
+                '[' | '{' => depth += 1,
+                ']' | '}' if depth > 0 => depth -= 1,
+                ',' | '}' if depth == 0 => break,
+                _ => {}
+            }
+            at += 1;
+        }
+        if at >= chars.len() {
+            return (kind, content);
+        }
+    }
+}
+
+/// The answer as it is written, from the deltas of the agent's message: what of its `content` has been shown, once its `kind` says it is the final answer.
+/// A message of another item begins again (a commentary of plain words reads as no answer, and shows nothing).
+#[derive(Default)]
+struct AnswerStream {
+    item: String,
+    raw: String,
+    shown: String,
+}
+
+impl AnswerStream {
+    fn push(&mut self, item: &str, delta: &str, on: &mut dyn FnMut(Delta)) {
+        if item != self.item {
+            (self.item, self.raw) = (item.to_string(), String::new());
+        }
+        self.raw.push_str(delta);
+        let (kind, content) = partial_answer(&self.raw);
+        if kind.as_deref() != Some("final") {
+            return;
+        }
+        if let Some(more) = content.strip_prefix(self.shown.as_str()).filter(|more| !more.is_empty()) {
+            on(Delta::Content(more));
+            self.shown = content;
+        }
+    }
+
+    /// What of the finished answer was not shown as it came: all of it where nothing was, the rest where what was shown begins it, and nothing where what
+    /// was shown is not how it begins (the answer kept is the finished one).
+    fn rest<'a>(&self, content: &'a str) -> &'a str {
+        if self.shown.is_empty() {
+            content
+        } else {
+            content.strip_prefix(self.shown.as_str()).unwrap_or("")
+        }
+    }
+}
+
 /// The answer in a finished turn's items: the final message, else the last that is not commentary.
 fn final_text(turn: &Value) -> Option<String> {
     let items = turn.get("items")?.as_array()?;
@@ -482,13 +637,14 @@ impl Codex {
         let mut reasoning = String::new();
         let mut usage = None;
         let mut ended = None;
+        let mut answer = AnswerStream::default();
         {
-            let mut note = |message: &Value| -> Result<(), LlmError> { observe(message, &thread_id, &mut reasoning, &mut usage, &mut ended, on) };
+            let mut note = |message: &Value| -> Result<(), LlmError> { observe(message, &thread_id, &mut reasoning, &mut usage, &mut ended, &mut answer, on) };
             server.request("turn/start", params, cancel, &mut note)?;
         }
         while ended.is_none() {
             let message = server.next(cancel, STALL)?;
-            observe(&message, &thread_id, &mut reasoning, &mut usage, &mut ended, on)?;
+            observe(&message, &thread_id, &mut reasoning, &mut usage, &mut ended, &mut answer, on)?;
         }
         let turn: Value = ended.unwrap_or(Value::Null);
         if turn.get("status").and_then(Value::as_str) != Some("completed") {
@@ -498,14 +654,18 @@ impl Codex {
         let text = final_text(&turn).ok_or_else(|| LlmError::Transient("the Codex turn ended with no answer".into()))?;
         let mut completion = completion_of(&text, usage)?;
         completion.reasoning = String::new(); // a summary, not reasoning to send back
-        if !completion.content.is_empty() {
-            on(Delta::Content(&completion.content));
+        // (what was not shown as it came; the answer kept is the finished one either way)
+        let rest = answer.rest(&completion.content);
+        if !rest.is_empty() {
+            on(Delta::Content(rest));
         }
         Ok(completion)
     }
 }
 
-fn observe(message: &Value, thread: &str, reasoning: &mut String, usage: &mut Option<Usage>, ended: &mut Option<Value>, on: &mut dyn FnMut(Delta)) -> Result<(), LlmError> {
+// (the answer's words are shown as they are written, from its message's deltas: they came all at once when the turn ended, and the screen showed
+// nothing of them meanwhile)
+fn observe(message: &Value, thread: &str, reasoning: &mut String, usage: &mut Option<Usage>, ended: &mut Option<Value>, answer: &mut AnswerStream, on: &mut dyn FnMut(Delta)) -> Result<(), LlmError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else { return Ok(()) };
     let Some(params) = message.get("params") else { return Ok(()) };
     if params.get("threadId").and_then(Value::as_str) != Some(thread) {
@@ -516,6 +676,11 @@ fn observe(message: &Value, thread: &str, reasoning: &mut String, usage: &mut Op
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                 reasoning.push_str(delta);
                 on(Delta::Reasoning(delta));
+            }
+        }
+        "item/agentMessage/delta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                answer.push(params.get("itemId").and_then(Value::as_str).unwrap_or(""), delta, on);
             }
         }
         "thread/tokenUsage/updated" => {
@@ -624,6 +789,14 @@ mod tests {
                 // What it answers is the model it was asked for, by the thread and by the turn.
                 let said = format!("{} {}", message["params"]["threadId"].as_str().unwrap_or(""), message["params"]["model"].as_str().unwrap_or(""));
                 let final_text = json!({"kind": "final", "content": said, "tool_calls": []}).to_string();
+                // (written as Codex writes it, in pieces, after a commentary of plain words where the conversation asks for one)
+                let delta = |item: &str, piece: String| json!({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": message["params"]["threadId"], "itemId": item, "delta": piece}});
+                if asked.contains("comment first") {
+                    writeln!(out, "{}", delta("msg-0", "Looking at it first.".to_string())).unwrap();
+                }
+                for piece in final_text.chars().collect::<Vec<char>>().chunks(5) {
+                    writeln!(out, "{}", delta("msg-1", piece.iter().collect())).unwrap();
+                }
                 let turn = json!({"status": "completed", "items": [{"type": "agentMessage", "phase": "final_answer", "text": final_text}]});
                 writeln!(out, "{}", json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": message["params"]["threadId"], "turn": turn}})).unwrap();
             }
@@ -678,6 +851,39 @@ mod tests {
         assert_eq!(ask("gpt-old", Some("old/1")), "thread-gpt-old gpt-old");
         assert_eq!(ask("gpt-old", Some("old/2")), "thread-gpt-old gpt-old");
         assert_eq!(codex.anchors.lock().unwrap().get("old"), Some(&None));
+    }
+
+    /// The answer's words are shown as they are written, in the pieces they come in, each once; a commentary of plain words before them shows nothing.
+    #[test]
+    fn the_answers_words_are_shown_as_they_are_written() {
+        let codex = stood_in();
+        let messages = [crate::message::Message::text("user", "comment first, then answer")];
+        let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
+        let mut shown: Vec<String> = Vec::new();
+        let answer = codex.stream(&request, &AtomicBool::new(false), &mut |delta| {
+            if let Delta::Content(text) = delta {
+                shown.push(text.to_string());
+            }
+        }).unwrap();
+        assert!(shown.len() > 2, "in pieces as they came: {shown:?}");
+        assert_eq!(shown.concat(), answer.content);
+        assert!(!shown.concat().contains("Looking at it"), "{shown:?}");
+    }
+
+    /// What a structured answer says so far, read as it is written: its kind once whole, its content's words with their escapes undone, and an escape cut in
+    /// half left for the rest.
+    #[test]
+    fn an_answer_being_written_is_read_as_far_as_it_goes() {
+        assert_eq!(partial_answer(""), (None, String::new()));
+        assert_eq!(partial_answer(r#"{"kind": "fin"#), (None, String::new()));
+        assert_eq!(partial_answer(r#"{"kind": "final", "content": "Hello, wor"#), (Some("final".into()), "Hello, wor".into()));
+        assert_eq!(partial_answer(r#"{"kind":"final","content":"line\nnext \"quoted\" é 😀 end"#), (Some("final".into()), "line\nnext \"quoted\" é 😀 end".into()));
+        assert_eq!(partial_answer(r#"{"kind":"final","content":"cut \"#), (Some("final".into()), "cut ".into()));
+        assert_eq!(partial_answer(r#"{"kind":"final","content":"cut \u00"#), (Some("final".into()), "cut ".into()));
+        assert_eq!(partial_answer(r#"{"kind":"final","content":"pair \ud83d"#), (Some("final".into()), "pair ".into()));
+        // (other fields before it, nested and quoted, are gone past; the kind after the content is read too)
+        assert_eq!(partial_answer(r#"{"tool_calls": [{"id": "a", "arguments": "{\"x\": [1, \"]\"]}"}], "content": "after", "kind": "tool_calls"}"#), (Some("tool_calls".into()), "after".into()));
+        assert_eq!(partial_answer("Looking at it first."), (None, String::new()), "plain words are no answer");
     }
 
     #[test]

@@ -14,6 +14,17 @@ pub fn kept_from_the_real_machine() -> bool {
     cfg!(debug_assertions) && std::env::var_os("DOGMIND_TEST_KEYS").is_some()
 }
 
+/// A program of Windows' own by its full path in the system folder (`taskkill.exe`, `icacls.exe`): by its name alone, the first of that name on PATH runs,
+/// and a folder put before System32 there runs its own as the person. `None` where Windows does not say where its system folder is.
+pub fn system_program(name: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 32768];
+    // SAFETY: the buffer is writable for the length given; Windows returns the length of what it wrote, in UTF-16 units.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    (length > 0 && length < buffer.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join(name))
+}
+
 /// The build number of this Windows, as it really is: `GetVersionEx` lies to a program not manifested for it.
 pub fn windows_build() -> Option<u32> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -315,6 +326,16 @@ pub fn readable_build(build: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program of Windows' own is named by its full path in the system folder, whatever is on PATH before it.
+    #[test]
+    fn a_program_of_windows_own_is_named_by_its_path_in_the_system_folder() {
+        let taskkill = system_program("taskkill.exe").unwrap();
+        assert!(taskkill.is_absolute() && taskkill.is_file(), "{}", taskkill.display());
+        let folder = taskkill.parent().unwrap().to_string_lossy().to_lowercase();
+        assert!(folder.ends_with("\\system32"), "{folder}");
+        assert_eq!(system_program("icacls.exe").unwrap().parent(), taskkill.parent());
+    }
 
     #[test]
     fn a_build_is_told_by_its_commit_and_the_day() {

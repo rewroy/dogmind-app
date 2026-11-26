@@ -38,7 +38,7 @@ fn version_line_of(version: &str, build: &str, windows: Option<u32>) -> String {
     format!("Dogmind {version} ({commit}{built}), Windows build {}", windows.map_or("unknown".to_string(), |build| build.to_string()))
 }
 
-fn version_line() -> String {
+pub(crate) fn version_line() -> String {
     version_line_of(env!("CARGO_PKG_VERSION"), env!("DOGMIND_APP_BUILD"), crate::machine::windows_build())
 }
 

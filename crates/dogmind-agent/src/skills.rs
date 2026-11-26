@@ -36,6 +36,9 @@ pub struct Skill {
     pub mcp_servers: Vec<String>,
     /// Which of [`OTHER_APP`] it carries: it needs something of another app that this one has no counterpart for.
     pub other_app: Option<&'static str>,
+    /// Where it was found: a project's root, or a folder of the person's skills in their home. Its folder is opened to commands only where it really
+    /// is in that ([`opens_to_commands`]).
+    pub(crate) place: Option<PathBuf>,
 }
 
 /// What a skill that is written for another app's own features has in it. Calibrated on the fourteen skills a Claude account synced to a machine: the six general ones (documents, sheets,
@@ -88,6 +91,30 @@ impl Skill {
 
 /// The frontmatter's top-level words: plain, quoted, or a block (`>` or `|`). Nothing else of YAML is needed here, and anything
 /// else in it is left alone rather than refused, as the other readers of these files have fields this one does not know.
+/// A value without its comment, as YAML has it: a `#` after a space or tab begins one, outside quotes (a quoted value ends at its closing quote, and what
+/// follows that is dropped). `disable-model-invocation: true   # only when asked` says true.
+fn without_comment(value: &str) -> &str {
+    let mut chars = value.char_indices().peekable();
+    match chars.next() {
+        Some((_, quote @ ('"' | '\''))) => {
+            while let Some((at, c)) = chars.next() {
+                if quote == '"' && c == '\\' {
+                    chars.next();
+                } else if c == quote && quote == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else if c == quote {
+                    return &value[..at + c.len_utf8()];
+                }
+            }
+            value
+        }
+        _ => {
+            let bytes = value.as_bytes();
+            (1..bytes.len()).find(|&at| bytes[at] == b'#' && matches!(bytes[at - 1], b' ' | b'\t')).map_or(value, |at| value[..at].trim_end())
+        }
+    }
+}
+
 pub fn frontmatter(text: &str) -> (Vec<(String, String)>, &str) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return (Vec::new(), text) };
@@ -118,7 +145,7 @@ pub fn frontmatter(text: &str) -> (Vec<(String, String)>, &str) {
             continue;
         }
         let Some((name, value)) = bare.split_once(':') else { continue };
-        let value = value.trim();
+        let value = without_comment(value.trim());
         if value.starts_with('>') || value.starts_with('|') {
             block = Some((name.trim().to_string(), value.starts_with('>'), Vec::new()));
             continue;
@@ -150,16 +177,45 @@ fn parse_skill(text: &str, folder: PathBuf, scope: &'static str, embedded: Optio
     let yes = |name: &str, default: bool| field(name).map_or(default, |value| value.trim().eq_ignore_ascii_case("true"));
     let (lower, lower_description) = (text.to_lowercase(), description.to_lowercase());
     let other_app = OTHER_APP.iter().find(|(in_description, words, _)| if *in_description { lower_description.contains(words) } else { lower.contains(words) }).map(|(_, _, meaning)| *meaning);
-    Some(Skill { name, description, folder, scope, embedded, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true), mcp_servers: servers_named(text), other_app })
+    Some(Skill { name, description, folder, scope, embedded, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true), mcp_servers: servers_named(text), other_app, place: None })
 }
 
-fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>) {
+/// Whether `path` is a link or a junction itself (a reparse point, on Windows).
+fn leads_elsewhere(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if found.file_attributes() & 0x400 != 0 {
+                return true;
+            }
+        }
+        found.file_type().is_symlink()
+    })
+}
+
+/// Whether `path` is in `place` where both really are, through links and junctions.
+fn really_within(place: &Path, path: &Path) -> bool {
+    match (crate::safety::real_path(place), crate::safety::real_path(path)) {
+        (Some(place), Some(path)) => crate::safety::inside(&place, &path),
+        _ => false,
+    }
+}
+
+/// The skills under `folder`, found in `place`. A project's are in a folder a command can write, and a junction there leads wherever its program
+/// likes: a project's walk goes into no link or junction, reads no `SKILL.md` that is one, and begins only where its folder really is in the project.
+/// The person's own, in their home, may be links of theirs.
+fn walk(folder: &Path, depth: usize, scope: &'static str, place: &Path, found: &mut Vec<Skill>) {
     if depth > MAX_DEPTH || found.len() >= MAX_SKILLS {
         return;
     }
+    let project = scope == "project";
+    if project && (leads_elsewhere(folder) || (depth == 0 && folder.exists() && !really_within(place, folder))) {
+        return;
+    }
     let file = folder.join("SKILL.md");
-    if file.is_file() {
-        found.extend(read_skill(&file, scope));
+    if file.is_file() && !(project && leads_elsewhere(&file)) {
+        found.extend(read_skill(&file, scope).map(|skill| Skill { place: Some(place.to_path_buf()), ..skill }));
         return;
     }
     // (not a hidden folder: `.system` holds another tool's own skills, written for its tools and its agents. One such review skill
@@ -167,7 +223,7 @@ fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>
     let mut folders: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir() && !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))).collect();
     folders.sort();
     for inner in folders {
-        walk(&inner, depth + 1, scope, found);
+        walk(&inner, depth + 1, scope, place, found);
     }
 }
 
@@ -188,12 +244,13 @@ pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
             continue;
         }
         for place in FOLDERS {
-            walk(&under(folder, place), 0, "project", &mut found);
+            walk(&under(folder, place), 0, "project", root, &mut found);
         }
     }
     if let Some(home) = home {
         for place in FOLDERS {
-            walk(&under(home, place), 0, "user", &mut found);
+            let folder = under(home, place);
+            walk(&folder, 0, "user", &folder, &mut found);
         }
     }
     found.extend(parse_skill(MODERN_WEB_GUIDANCE, PathBuf::new(), "builtin", Some(MODERN_WEB_GUIDANCE)));
@@ -279,6 +336,12 @@ pub fn listing(skills: &[Skill]) -> String {
     the_model_may_start(skills).into_iter().map(|skill| format!("- {}: {}\n", skill.name, skill.description.split_whitespace().collect::<Vec<_>>().join(" "))).collect()
 }
 
+/// Whether a skill's folder is opened to commands as it is started: only where it really is in the place it was found in, and not where a link or a
+/// junction on the way leads now (a program in the sandbox could have put one there since it was found, and the grant would land at its end).
+pub(crate) fn opens_to_commands(skill: &Skill) -> bool {
+    skill.place.as_deref().is_some_and(|place| really_within(place, &skill.folder))
+}
+
 /// A skill's instructions, as the model reads them: where it is, as what it names is relative to that.
 pub fn instructions(skill: &Skill) -> Result<String, String> {
     if let Some(text) = skill.embedded {
@@ -288,7 +351,9 @@ pub fn instructions(skill: &Skill) -> Result<String, String> {
     let file = skill.folder.join("SKILL.md");
     let text = std::fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
     #[cfg(windows)]
-    crate::sandbox::also_readable(&skill.folder);
+    if opens_to_commands(skill) {
+        crate::sandbox::also_readable(&skill.folder);
+    }
     let (_, body) = frontmatter(&text);
     let body: String = if body.len() > MAX_BODY {
         let mut cut = MAX_BODY;
@@ -325,6 +390,22 @@ pub fn schema() -> Value {
 mod tests {
     use super::*;
 
+    /// A value's comment is not part of it, as in YAML: a skill the person keeps from the model by `disable-model-invocation: true  # ...` stays kept,
+    /// and a `#` inside quotes or a word is the value's.
+    #[test]
+    fn a_comment_after_a_value_is_not_part_of_it() {
+        let text = "---\nname: deploy\ndescription: \"Ships it # carefully\" # what it does\ndisable-model-invocation: true   # only when asked\nuser-invocable: 'yes' # quoted\nnote: C#9 and a#b\n---\nbody";
+        let (fields, body) = frontmatter(text);
+        let field = |name: &str| fields.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
+        assert_eq!(field("description"), Some("Ships it # carefully"));
+        assert_eq!(field("disable-model-invocation"), Some("true"));
+        assert_eq!(field("user-invocable"), Some("yes"));
+        assert_eq!(field("note"), Some("C#9 and a#b"));
+        assert_eq!(body, "body");
+        let skill = parse_skill(text, PathBuf::from("deploy"), "project", None).unwrap();
+        assert!(!skill.for_the_model, "kept from the model, as its frontmatter says");
+    }
+
     /// A skill's line is its first sentence, cut where a word ends when it is long, and never in the middle of one.
     #[test]
     fn a_skills_line_is_its_first_sentence_cut_where_a_word_ends() {
@@ -347,6 +428,35 @@ mod tests {
         let dir = crate::in_container::tempdir().unwrap();
         write(&dir.path().join("a"), text);
         read_skill(&dir.path().join("a").join("SKILL.md"), "user").unwrap()
+    }
+
+    /// A project's skill folder made a junction to a place outside (as a program in the sandbox can make one) is not found, nor is one under a folder on
+    /// the way that is a junction, nor is any opened to commands; a project's own and the person's are as before. One found before a junction was put
+    /// in its place is not opened either.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_a_projects_skills_leads_nowhere() {
+        let (work, home, outside) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        let junction = |link: &Path, target: &Path| {
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        };
+        std::fs::create_dir_all(work.path().join(".git")).unwrap();
+        write(&outside.path().join("x"), "---\nname: x\ndescription: Outside\n---\nbody");
+        write(&outside.path().join("skills").join("y"), "---\nname: y\ndescription: Outside too\n---\nbody");
+        junction(&work.path().join(".dogmind").join("skills").join("x"), &outside.path().join("x"));
+        junction(&work.path().join(".agents"), outside.path());
+        write(&work.path().join(".claude").join("skills").join("own"), "---\nname: own\ndescription: The project's\n---\nbody");
+        write(&home.path().join(".claude").join("skills").join("mine"), "---\nname: mine\ndescription: The person's\n---\nbody");
+        let found = discover(work.path(), Some(home.path()));
+        let names: Vec<&str> = found.iter().map(|skill| skill.name.as_str()).collect();
+        assert!(names.contains(&"own") && names.contains(&"mine") && !names.contains(&"x") && !names.contains(&"y"), "{names:?}");
+        assert!(found.iter().filter(|skill| skill.scope != "builtin").all(opens_to_commands));
+        let own = found.iter().find(|skill| skill.name == "own").unwrap().clone();
+        std::fs::remove_dir_all(&own.folder).unwrap();
+        junction(&own.folder, &outside.path().join("x"));
+        assert!(!opens_to_commands(&own), "a junction put in its place since");
     }
 
     /// Skills written for another app's own tools are told from the general ones, by what they name and by what they say they need: stand-ins written for this test, one of each kind.

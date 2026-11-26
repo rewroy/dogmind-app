@@ -56,6 +56,11 @@ pub fn touched_since(workspace: &Path, since: std::time::SystemTime) -> Vec<Touc
     found
 }
 
+/// The largest file a rewind keeps a copy of. What is larger is not copied into the app's folder (tens of gigabytes there would take the drive's
+/// room and wear an SSD, for a copy kept only in case): an edit that writes over or takes away one is asked about with that said
+/// (`safety::REASON_TOO_LARGE_TO_KEEP`), and a rewind says it cannot bring it back.
+pub const MOST_KEPT: u64 = 256 << 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
     pub path: PathBuf,
@@ -65,11 +70,14 @@ pub struct Saved {
     /// command has since made a junction to somewhere else would take what is put back there, so a path that leads elsewhere now is left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real: Option<PathBuf>,
+    /// It was larger than [`MOST_KEPT`], and no copy of it was kept: a rewind cannot bring it back, and leaves it as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub large: bool,
 }
 
 impl Saved {
     fn of(path: &Path, copy: Option<String>) -> Saved {
-        Saved { path: path.to_path_buf(), copy, real: crate::safety::real_path(path) }
+        Saved { path: path.to_path_buf(), copy, real: crate::safety::real_path(path), large: false }
     }
 
     /// Whether the path leads somewhere else than when it was saved. One saved before that was kept has no "then" to compare with: a link or a junction on its way now is taken to lead
@@ -207,17 +215,16 @@ fn folder_of(session: &Path) -> PathBuf {
 }
 
 /// A kept copy in a file's place: copied beside it whole, then put in its place, as an edit is. Copied straight over it, a rewind that
-/// failed on the way (a full disk, the app ended) left the file cut or empty.
-fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
+/// failed on the way (a full disk, the app ended) left the file cut or empty. The folders from `root` to it are held while it is written, and
+/// those it lacks are made (`held_way`): a command may have made one a junction to anywhere.
+pub(crate) fn put_back(root: &Path, copy: &Path, path: &Path) -> std::io::Result<()> {
+    let way = crate::held_way::hold(root, path.parent().unwrap_or(root), true).map_err(std::io::Error::other)?;
     let beside = crate::tools::written_beside(path);
     // (on the disk before it takes the place: a power cut just after would otherwise leave the person's file as zeros)
-    let done = std::fs::copy(copy, &beside)
-        .and_then(|_| std::fs::OpenOptions::new().write(true).open(&beside)?.sync_all())
-        .and_then(|()| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
-    if done.is_err() {
-        let _ = std::fs::remove_file(&beside);
-    }
-    done
+    crate::held_way::write_new(way.as_ref(), &beside, |out| std::io::copy(&mut std::fs::File::open(copy)?, out).map(|_| ()))?;
+    crate::held_way::into_place(&beside, path, path.exists()).inspect_err(|_| {
+        let _ = crate::held_way::remove(way.as_ref(), &beside);
+    })
 }
 
 /// With a session that is deleted.
@@ -377,6 +384,10 @@ impl Checkpoints {
         if !path.exists() {
             return Ok(Saved::of(path, None));
         }
+        // (too large to keep: the edit was asked about with that said, and a rewind says it cannot bring it back)
+        if std::fs::metadata(path).is_ok_and(|found| found.len() > MOST_KEPT) {
+            return Ok(Saved { large: true, ..Saved::of(path, None) });
+        }
         std::fs::create_dir_all(&self.folder).map_err(|error| format!("{}: {error}", self.folder.display()))?;
         // A copy, not a read: the file may be larger than this machine's memory. Never over one that is there: the next name that is free.
         loop {
@@ -472,7 +483,7 @@ impl Checkpoints {
     /// saved).
     fn touched_change(&self, touched: &Touched, after: Option<PathBuf>, workspace: &Path, most_read: u64) -> Option<FileChange> {
         if touched.made {
-            return self.change_of(&Saved { path: touched.path.clone(), copy: None, real: None }, after, workspace, most_read);
+            return self.change_of(&Saved { path: touched.path.clone(), copy: None, real: None, large: false }, after, workspace, most_read);
         }
         Some(FileChange::without_diff(&touched.path.strip_prefix(workspace).unwrap_or(&touched.path).display().to_string()))
     }
@@ -535,8 +546,9 @@ impl Checkpoints {
     }
 
     /// Back to a turn's beginning. What is there now is saved first: a rewind can itself be rewound.
-    pub fn restore(&mut self, id: u64, at: &str) -> Restored {
-        self.restore_with(id, at, &mut || {})
+    /// `workspace`: the root the files are written and deleted under, as the person, with the folders on the way held (`held_way`).
+    pub fn restore(&mut self, workspace: &Path, id: u64, at: &str) -> Restored {
+        self.restore_with(workspace, id, at, &mut || {})
     }
 
     /// Whether a file is still as the rewind saw it when it kept a copy of what it held: absent if it was, else the same bytes as that copy.
@@ -548,7 +560,7 @@ impl Checkpoints {
     }
 
     /// `between` is called when the copies are kept and before any file is written: a test's way to make the person, or a command, write in between.
-    fn restore_with(&mut self, id: u64, at: &str, between: &mut dyn FnMut()) -> Restored {
+    fn restore_with(&mut self, workspace: &Path, id: u64, at: &str, between: &mut dyn FnMut()) -> Restored {
         let plan = self.plan(id);
         let mut restored = Restored::default();
         if plan.is_empty() {
@@ -561,7 +573,15 @@ impl Checkpoints {
                 restored.failed.push(Checkpoints::leads_elsewhere_words(saved));
                 continue;
             }
+            if saved.large {
+                restored.failed.push(format!("{}: it was larger than 256 MB when it was changed, so no copy of it was kept, and it was left as it is", saved.path.display()));
+                continue;
+            }
             match self.copy_of(&saved.path) {
+                // (what is there now cannot be kept before it is written over: it is left as it is)
+                Ok(current) if current.large => {
+                    restored.failed.push(format!("{}: it is larger than 256 MB now, so no copy of it could be kept before the rewind, and it was left as it is", saved.path.display()));
+                }
                 Ok(current) => keep.push(current),
                 Err(error) => {
                     // Without a copy of what is there, it is not overwritten.
@@ -596,18 +616,20 @@ impl Checkpoints {
                         restored.failed.push(format!("{}: the copy kept of it is only zeros, as a power cut leaves a file written just before it, so it was left as it is", saved.path.display()));
                         continue;
                     }
-                    if let Some(parent) = saved.path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match put_back(&self.folder.join(copy), &saved.path) {
+                    match put_back(workspace, &self.folder.join(copy), &saved.path) {
                         Ok(()) => restored.written.push(saved.path.clone()),
                         Err(error) => restored.failed.push(format!("{}: {error}", saved.path.display())),
                     }
                 }
-                None => match std::fs::remove_file(&saved.path) {
-                    Ok(()) => restored.removed.push(saved.path.clone()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => restored.failed.push(format!("{}: {error}", saved.path.display())),
+                // (what is not there has nothing to take away; what is, is taken away with the folders on its way held)
+                None if std::fs::symlink_metadata(&saved.path).is_err() => {}
+                None => match crate::held_way::hold(workspace, saved.path.parent().unwrap_or(workspace), false) {
+                    Err(error) => restored.failed.push(error),
+                    Ok(way) => match crate::held_way::remove(way.as_ref(), &saved.path) {
+                        Ok(()) => restored.removed.push(saved.path.clone()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => restored.failed.push(format!("{}: {error}", saved.path.display())),
+                    },
                 },
             }
         }
@@ -762,7 +784,7 @@ mod tests {
         let status = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(work.join("sub")).arg(&elsewhere).stdout(std::process::Stdio::null()).status().unwrap();
         assert!(status.success());
         std::fs::write(elsewhere.join("new.txt"), "theirs").unwrap();
-        let restored = marks.restore(1, "t");
+        let restored = marks.restore(dir.path(), 1, "t");
         assert!(!elsewhere.join("run.bat").exists(), "nothing written through the junction");
         assert_eq!(read(&elsewhere.join("new.txt")), "theirs", "nothing removed through it");
         assert_eq!(read(&plain), "before", "the rest is rewound");
@@ -907,7 +929,7 @@ mod tests {
         std::fs::write(&f.file, "the agent's").unwrap();
         std::fs::write(&f.other, "the agent's too").unwrap();
         let (file, created_now) = (f.file.clone(), created.clone());
-        let restored = f.marks.restore_with(1, "t", &mut || {
+        let restored = f.marks.restore_with(f._dir.path(), 1, "t", &mut || {
             std::fs::write(&file, "the person's own, a moment ago").unwrap();
             std::fs::write(&created_now, "theirs").unwrap();
         });
@@ -945,7 +967,7 @@ mod tests {
         std::fs::remove_dir_all(work.join("sub")).unwrap();
         let status = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(work.join("sub")).arg(&elsewhere).stdout(std::process::Stdio::null()).status().unwrap();
         assert!(status.success());
-        let restored = marks.restore(1, "t");
+        let restored = marks.restore(dir.path(), 1, "t");
         assert!(!elsewhere.join("run.bat").exists(), "nothing written through the junction");
         assert_eq!(read(&plain), "before", "the rest is rewound");
         assert_eq!(restored.failed.len(), 1, "{:?}", restored.failed);
@@ -959,7 +981,7 @@ mod tests {
         let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
         assert!(!has_a_link_on_its_way(&dir.path().join("a").join("b").join("c.txt")));
-        let record = Saved { path: dir.path().join("a").join("b").join("c.txt"), copy: None, real: None };
+        let record = Saved { path: dir.path().join("a").join("b").join("c.txt"), copy: None, real: None, large: false };
         assert!(!record.leads_elsewhere());
     }
 
@@ -974,12 +996,40 @@ mod tests {
         let mut locked = std::fs::metadata(&f.file).unwrap().permissions();
         locked.set_readonly(true);
         std::fs::set_permissions(&f.file, locked.clone()).unwrap();
-        let restored = f.marks.restore(1, "t");
+        let restored = f.marks.restore(f._dir.path(), 1, "t");
         locked.set_readonly(false);
         std::fs::set_permissions(&f.file, locked).unwrap();
         assert_eq!((read(&f.file), restored.failed.len()), ("after".to_string(), 1), "{:?}", restored.failed);
         let left: Vec<String> = std::fs::read_dir(f.file.parent().unwrap()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.contains("dogmind-edit")).collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A file larger than a rewind keeps a copy of is not copied, and a rewind leaves it as it is and says so; a file that has grown past it since is not
+    /// written over either, as nothing could be kept of it first.
+    #[test]
+    fn a_file_too_large_to_keep_is_not_copied_and_a_rewind_says_it_cannot_bring_it_back() {
+        let mut f = fixture();
+        let large = f.file.with_file_name("large.bin");
+        std::fs::File::create(&large).unwrap().set_len(300 << 20).unwrap();
+        std::fs::write(&f.file, "before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[large.clone(), f.file.clone()]).unwrap();
+        let copies = || std::fs::read_dir(&f.marks.folder).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().ends_with(".bin")).count();
+        assert_eq!(copies(), 1, "a copy of the small one alone");
+        std::fs::write(&large, "written over").unwrap();
+        std::fs::write(&f.file, "after").unwrap();
+        let restored = f.marks.restore(f._dir.path(), 1, "t");
+        assert_eq!((read(&large), read(&f.file)), ("written over".to_string(), "before".to_string()));
+        assert!(restored.failed.iter().any(|why| why.contains("large.bin") && why.contains("larger than 256 MB when it was changed")), "{:?}", restored.failed);
+        // (a small one grown past it since: not written over)
+        let mut f = fixture();
+        std::fs::write(&f.file, "before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::File::create(&f.file).unwrap().set_len(300 << 20).unwrap();
+        let restored = f.marks.restore(f._dir.path(), 1, "t");
+        assert_eq!(std::fs::metadata(&f.file).unwrap().len(), 300 << 20);
+        assert!(restored.failed.iter().any(|why| why.contains("larger than 256 MB now")), "{:?}", restored.failed);
     }
 
     /// A kept copy that a power cut left as zeros is not put back: the file stays as it is, and the rewind says why.
@@ -993,7 +1043,7 @@ mod tests {
         let copy = f.marks.folder.join("0.bin");
         assert_eq!(read(&copy), "before");
         std::fs::write(&copy, vec![0u8; "before".len()]).unwrap();
-        let restored = f.marks.restore(1, "t");
+        let restored = f.marks.restore(f._dir.path(), 1, "t");
         assert_eq!(read(&f.file), "after");
         assert!(restored.written.is_empty() && restored.failed.len() == 1 && restored.failed[0].contains("only zeros"), "{:?}", restored.failed);
         assert!(!left_as_zeros(&f.file).unwrap() && !left_as_zeros(&f.marks.folder.join("index.json")).unwrap());
@@ -1011,10 +1061,10 @@ mod tests {
         f.marks.begin("second", "t", Some(3)).unwrap();
         f.marks.before_edit(&[f.file.clone()]).unwrap();
         std::fs::write(&f.file, "two").unwrap();
-        let restored = f.marks.restore(2, "t");
+        let restored = f.marks.restore(f._dir.path(), 2, "t");
         assert_eq!(read(&f.file), "one and more");
         assert_eq!(restored.written, [f.file.clone()]);
-        f.marks.restore(1, "t");
+        f.marks.restore(f._dir.path(), 1, "t");
         assert_eq!(read(&f.file), "zero");
     }
 
@@ -1024,7 +1074,7 @@ mod tests {
         f.marks.begin("first", "t", Some(1)).unwrap();
         f.marks.before_edit(&[f.file.clone()]).unwrap();
         std::fs::write(&f.file, "new").unwrap();
-        let restored = f.marks.restore(1, "t");
+        let restored = f.marks.restore(f._dir.path(), 1, "t");
         assert!(!f.file.exists());
         assert_eq!(restored.removed, [f.file.clone()]);
     }
@@ -1036,12 +1086,12 @@ mod tests {
         f.marks.begin("first", "t", Some(1)).unwrap();
         f.marks.before_edit(&[f.file.clone()]).unwrap();
         std::fs::write(&f.file, "after").unwrap();
-        f.marks.restore(1, "t");
+        f.marks.restore(f._dir.path(), 1, "t");
         assert_eq!(read(&f.file), "before");
         let last = f.marks.turns().last().unwrap().clone();
         assert!(last.title.starts_with("Before the rewind"));
         assert_eq!(last.message, None);
-        f.marks.restore(last.id, "t");
+        f.marks.restore(f._dir.path(), last.id, "t");
         assert_eq!(read(&f.file), "after");
     }
 
@@ -1056,12 +1106,12 @@ mod tests {
         f.marks.begin("two", "t", Some(2)).unwrap();
         f.marks.before_edit(&[f.other.clone()]).unwrap();
         std::fs::write(&f.other, "b1").unwrap();
-        f.marks.restore(2, "t");
+        f.marks.restore(f._dir.path(), 2, "t");
         assert_eq!((read(&f.file), read(&f.other)), ("a1".to_string(), "b0".to_string()));
         f.marks.begin("three", "t", Some(2)).unwrap();
         f.marks.before_edit(&[f.file.clone()]).unwrap();
         std::fs::write(&f.file, "a3").unwrap();
-        f.marks.restore(1, "t");
+        f.marks.restore(f._dir.path(), 1, "t");
         assert_eq!((read(&f.file), read(&f.other)), ("a0".to_string(), "b0".to_string()));
     }
 
@@ -1078,7 +1128,7 @@ mod tests {
         let mut again = Checkpoints::open(&session);
         assert_eq!(again.turns().len(), 1);
         assert_eq!(again.files_after(1), [file.clone()]);
-        again.restore(1, "t");
+        again.restore(dir.path(), 1, "t");
         assert_eq!(read(&file), "x");
         remove_for(&session).unwrap();
         assert!(Checkpoints::open(&session).turns().is_empty());
@@ -1144,7 +1194,7 @@ mod tests {
     fn a_turn_that_edits_nothing_has_nothing_to_restore() {
         let mut f = fixture();
         f.marks.begin("one", "t", Some(1)).unwrap();
-        assert_eq!(f.marks.restore(1, "t"), Restored::default());
+        assert_eq!(f.marks.restore(f._dir.path(), 1, "t"), Restored::default());
         assert_eq!(f.marks.turns().len(), 1);
     }
 }
@@ -1217,7 +1267,7 @@ mod sealed_tests {
         // Kept with the index, and a rewind puts none of it back.
         let opened = Checkpoints::open(&dir.path().join("session.jsonl"));
         assert_eq!(opened.turns()[0].commanded.len(), 2);
-        let restored = marks.restore(id, "later");
+        let restored = marks.restore(&work, id, "later");
         assert!(restored.removed.iter().all(|path| path != &work.join("sub").join("made.txt")) && work.join("sub").join("made.txt").exists());
         assert_eq!(std::fs::read_to_string(work.join("edited.txt")).unwrap(), "after\n");
     }

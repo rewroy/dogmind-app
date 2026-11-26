@@ -597,6 +597,36 @@ fn data_folder_from(named: Option<PathBuf>, local: Option<PathBuf>, temp: PathBu
     local.filter(|folder| folder.is_absolute()).unwrap_or(temp).join("DogmindApp")
 }
 
+/// A folder the person has just chosen as the workspace (in the folder dialog, or given at the start): where it really is when it is a link or a
+/// junction itself. The moment it is chosen is the person's word on where it leads; a folder remembered that has become a link since may be a
+/// command's doing, and is opened as it is, and refused for commands (`sandbox::MOVED`).
+pub fn as_chosen(folder: PathBuf) -> PathBuf {
+    let link = std::fs::symlink_metadata(&folder).is_ok_and(|found| {
+        use std::os::windows::fs::MetadataExt;
+        found.file_type().is_symlink() || found.file_attributes() & 0x400 != 0
+    });
+    if !link {
+        return folder;
+    }
+    match std::fs::canonicalize(&folder) {
+        Ok(real) => {
+            let text = real.to_string_lossy().into_owned();
+            PathBuf::from(match text.strip_prefix("\\\\?\\UNC\\") {
+                Some(share) => format!("\\\\{share}"),
+                None => text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string(),
+            })
+        }
+        Err(_) => folder,
+    }
+}
+
+/// The workspace a start opens: the folder given, if it is one, and otherwise the one remembered. The folder given is the person's choice, and opens
+/// where it leads ([`as_chosen`]), unless the app gave it to itself as it started again (`remembered`: it is the workspace the older copy had open,
+/// which a command may have made a link since), when it opens as it is, as the one remembered does.
+pub fn starting_folder(given: Option<PathBuf>, remembered: bool, saved: Option<PathBuf>) -> Option<PathBuf> {
+    given.map(|folder| if remembered { folder } else { as_chosen(folder) }).filter(|path| path.is_dir()).or_else(|| saved.filter(|path| path.is_dir()))
+}
+
 /// Whether `path` is `folder` or lies under it, as the same folder may be spelled in another case by the system and by a dialog.
 pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
     let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -605,10 +635,10 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The folders this app makes in its data folder, by name.
-const MADE_FOLDERS: [&str; 8] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates"];
+const MADE_FOLDERS: [&str; 9] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates", "for-sandbox"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
-const MADE_FILES: [&str; 12] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json"];
+const MADE_FILES: [&str; 13] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json", "workspace-sids.txt"];
 
 /// Whether the app makes this, at the top of its data folder: a name of its own, a folder as a folder and a file as a file.
 fn made_here(path: &Path) -> bool {
@@ -646,6 +676,25 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A folder chosen that is a junction opens as the folder it leads to; one that is not, as it is.
+    #[test]
+    fn a_folder_chosen_that_is_a_junction_opens_as_where_it_leads() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (real, link) = (dir.path().join("real"), dir.path().join("link"));
+        std::fs::create_dir_all(&real).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&real).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        let real_spelled = super::as_chosen(link.clone());
+        assert!(super::same_or_inside(&real_spelled, &std::fs::canonicalize(&real).map(|path| std::path::PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"))).unwrap()), "{}", real_spelled.display());
+        assert!(!real_spelled.to_string_lossy().starts_with("\\\\?\\"));
+        assert_eq!(super::as_chosen(real.clone()), real, "a folder as it is");
+        // At a start: given by the person, where it leads; given by the app to itself as it starts again, or remembered, as it is (the sandbox refuses it).
+        assert_eq!(super::starting_folder(Some(link.clone()), false, None), Some(real_spelled.clone()));
+        assert_eq!(super::starting_folder(Some(link.clone()), true, None), Some(link.clone()));
+        assert_eq!(super::starting_folder(None, false, Some(link.clone())), Some(link.clone()));
+        assert_eq!(super::starting_folder(Some(dir.path().join("gone")), false, Some(real.clone())), Some(real.clone()), "no folder given: the one remembered");
+    }
+
     /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
     #[test]
     fn a_file_written_whole_replaces_the_one_there_and_leaves_nothing_beside_it() {
