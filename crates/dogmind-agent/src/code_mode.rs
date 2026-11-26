@@ -257,6 +257,30 @@ const SETUP: &str = r#"(function (host, write, names, setTimer, clearTimer, wait
             return String(value);
         }
     };
+    // The engine (quickjs-ng 0.16.2, rquickjs 0.14.0) frees a WeakMap's records wrongly when a symbol keys one (fixed in 0.18.0, #1844:
+    // a use-after-free any script can cause) and miscounts Promise.withResolvers' result on an error (0.17.0, #1692). Until it is 0.18 or
+    // later, a program keys no weak collection by a symbol and has no Promise.withResolvers; the originals stay in this function.
+    delete Promise.withResolvers;
+    const noSymbol = (what) => new TypeError(what + ' takes no symbol here: use an object');
+    for (const [type, method] of [[WeakMap, 'set'], [WeakSet, 'add'], [FinalizationRegistry, 'register']]) {
+        const original = type.prototype[method];
+        Object.defineProperty(type.prototype, method, {
+            value: function (target, ...rest) {
+                if (typeof target === 'symbol' || (method === 'register' && typeof rest[1] === 'symbol')) throw noSymbol(type.name + '.' + method);
+                return original.call(this, target, ...rest);
+            },
+            writable: false, enumerable: false, configurable: false,
+        });
+    }
+    const OriginalWeakRef = WeakRef;
+    const SafeWeakRef = function WeakRef(target) {
+        if (new.target === undefined) throw new TypeError("Constructor WeakRef requires 'new'");
+        if (typeof target === 'symbol') throw noSymbol('WeakRef');
+        return Reflect.construct(OriginalWeakRef, [target], new.target);
+    };
+    SafeWeakRef.prototype = OriginalWeakRef.prototype;
+    Object.defineProperty(OriginalWeakRef.prototype, 'constructor', { value: SafeWeakRef, writable: false, configurable: false });
+    Object.defineProperty(globalThis, 'WeakRef', { value: SafeWeakRef, writable: false, configurable: false });
     const tools = {};
     for (const name of names) {
         tools[name] = async function (args) {
@@ -883,6 +907,27 @@ mod tests {
 
     fn go_alone(code: &str) -> Outcome {
         go(code, &[], |_, _| panic!("no call was expected"))
+    }
+
+    /// What the engine frees wrongly is out of a program's reach: a symbol keys no weak collection, Promise.withResolvers is gone, and
+    /// objects are kept weakly as before.
+    #[test]
+    fn a_weak_collection_takes_no_symbol_and_promise_has_no_with_resolvers() {
+        for code in ["new WeakMap().set(Symbol('a'), 1)", "new WeakMap([[Symbol('a'), 1]])", "new WeakSet().add(Symbol('a'))",
+                     "new WeakSet([Symbol('a')])", "new WeakRef(Symbol('a'))", "new FinalizationRegistry(() => {}).register(Symbol('a'), 1)",
+                     "new FinalizationRegistry(() => {}).register({}, 1, Symbol('a'))", "Promise.withResolvers()"] {
+            let outcome = go_alone(&format!("{code}; return 'kept';"));
+            assert!(outcome.error.as_deref().is_some_and(|error| error.contains("TypeError")), "{code}: {outcome:?}");
+        }
+        assert_eq!(go_alone("return typeof Promise.withResolvers;").value.as_deref(), Some("undefined"));
+        let kept = "const key = {}; const map = new WeakMap([[key, 1]]); new WeakSet().add(key); const ref = new WeakRef(key);
+                    new FinalizationRegistry(() => {}).register(key, 1); return [map.get(key), ref.deref() === key, ref instanceof WeakRef,
+                    ref.constructor === WeakRef];";
+        assert_eq!(go_alone(kept).value.as_deref(), Some("[1,true,true,true]"));
+        // (the guards hold: not replaced, not taken off the prototype, the originals nowhere in reach)
+        let tamper = "try { WeakMap.prototype.set = null; } catch (e) {} try { delete WeakMap.prototype.set; } catch (e) {}
+                      try { globalThis.WeakRef = null; } catch (e) {} new WeakMap().set(Symbol('a'), 1); return 'kept';";
+        assert!(go_alone(tamper).error.as_deref().is_some_and(|error| error.contains("TypeError")));
     }
 
     #[test]
