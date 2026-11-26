@@ -533,6 +533,12 @@ pub fn not_found_words() -> &'static str {
 }
 
 /// The same in a line of a list.
+/// Whether the engine is fetched when "Straydog on this PC" is asked for ([`crate::engine_updates::fetch_first`]): none is found, the app was not
+/// started from inside its zip, and the person named no program of their own. An app that comes without one has none until then.
+pub fn fetches_engine(settings: &Settings) -> bool {
+    find(settings).is_none() && !started_inside_a_zip() && settings.straydog.is_none()
+}
+
 pub fn not_found_short() -> &'static str {
     if started_inside_a_zip() { t("Started from inside the zip: extract it first") } else { t("straydog.exe is not beside this app") }
 }

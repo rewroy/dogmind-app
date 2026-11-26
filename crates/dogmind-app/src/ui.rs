@@ -794,6 +794,10 @@ enum Note {
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
     ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
     StraydogUpdate(engine_updates::Result),
+    /// How far the engine fetched for a first start has come ([`App::fetch_engine_first`]), in bytes of the whole.
+    EngineFetch { done: u64, whole: u64 },
+    /// The engine fetched for a first start is here (its path), or why it is not.
+    EngineFetched(Result<PathBuf, String>),
     /// How far the setup of a newer release has come, of how many bytes.
     ReleaseProgress { done: u64, total: u64 },
     /// The setup of a newer release is fetched and checked and waits to be run, or why it is not.
@@ -2677,6 +2681,8 @@ struct App {
     leaving: Leaving,
     start_folders: Vec<PathBuf>,
     setting_up: bool,
+    /// The engine is being fetched for a first start ([`App::fetch_engine_first`]).
+    engine_fetching: bool,
     /// What the running setup has said of the whole, for one bar across its stages.
     setup_tally: engine::SetupTally,
     /// The chosen model's licence, as a link.
@@ -9296,6 +9302,8 @@ impl App {
                 let claude_key = crate::machine::fresh_variable("ANTHROPIC_API_KEY").is_some();
                 // Only what bears on the choice.
                 let this_pc = match (straydog.is_some(), model_ready) {
+                    // (an app that comes without the engine fetches it when this is chosen)
+                    (false, _) if engine::fetches_engine(&self.settings) => t("Needs an NVIDIA GPU. Downloads the Straydog engine (about 0.6 GB) and a model of about 75 GB"),
                     (false, _) => engine::not_found_short(),
                     (true, true) => "",
                     (true, false) => t("Needs an NVIDIA GPU. Downloads a model of about 75 GB"),
@@ -10259,24 +10267,56 @@ impl App {
         self.setup_kind = [Kind::Embedded, Kind::Server, Kind::Codex, Kind::Anthropic][at.min(3)];
         if self.setup_kind == Kind::Embedded {
             if engine::find(&self.settings).is_none() {
-                self.problem_in_panel(engine::not_found_words());
+                if engine::fetches_engine(&self.settings) {
+                    self.fetch_engine_first();
+                } else {
+                    self.problem_in_panel(engine::not_found_words());
+                }
                 return;
             }
-            if self.settings.models_folder.is_none() {
-                self.settings.models_folder = Some(self.folder.join("models"));
-            }
-            self.settings.use_provider(Kind::Embedded, "", "", "");
-            self.save();
-            if engine::is_set_up(&self.folder) {
-                // (it starts when something is written, as it does after any start of the app)
-                self.engine_waits = true;
-                self.connection = "starts when you write".into();
-                self.set_panel(Panel::Start);
-            } else {
-                self.set_panel(Panel::Models);
-            }
+            self.this_pc_chosen();
         } else {
             self.set_panel(Panel::SetupDetails);
+        }
+    }
+
+    /// "On this PC" chosen where the app has no engine (it comes without one): the newest release's is fetched ([`engine_updates::fetch_first`]),
+    /// how far it has come said in the panel, and the setup goes on to the models once it is here; why it is not, where it is not.
+    unsafe fn fetch_engine_first(&mut self) {
+        if self.engine_fetching {
+            return;
+        }
+        self.engine_fetching = true;
+        self.setup_cancel.store(false, Ordering::Relaxed);
+        self.say_in_panel(t("Fetching the Straydog engine from GitHub..."));
+        let (poster, cancel, settings, folder) = (self.poster.clone(), self.setup_cancel.clone(), self.settings.clone(), self.folder.clone());
+        std::thread::spawn(move || {
+            let mut said = std::time::Instant::now();
+            let outcome = engine_updates::fetch_first(&settings, &folder, &cancel, &mut |done, whole| {
+                // (a tenth of a second between two at the least: the window is told, not flooded)
+                if said.elapsed() >= std::time::Duration::from_millis(100) || done == whole {
+                    said = std::time::Instant::now();
+                    poster.send(Note::EngineFetch { done, whole });
+                }
+            });
+            poster.send(Note::EngineFetched(outcome));
+        });
+    }
+
+    /// "On this PC" chosen, with an engine to run: on to the models, or to the conversation where one is set up.
+    unsafe fn this_pc_chosen(&mut self) {
+        if self.settings.models_folder.is_none() {
+            self.settings.models_folder = Some(self.folder.join("models"));
+        }
+        self.settings.use_provider(Kind::Embedded, "", "", "");
+        self.save();
+        if engine::is_set_up(&self.folder) {
+            // (it starts when something is written, as it does after any start of the app)
+            self.engine_waits = true;
+            self.connection = "starts when you write".into();
+            self.set_panel(Panel::Start);
+        } else {
+            self.set_panel(Panel::Models);
         }
     }
 
@@ -14764,6 +14804,20 @@ impl App {
                     self.fetch_release_setup(release, on_its_own);
                 }
             }
+            Note::EngineFetch { done, whole } => {
+                if self.engine_fetching && self.panel == Panel::Setup {
+                    self.say_in_panel(&tf("Fetching the Straydog engine: {0} of {1}", &[&engine::gb_file(done), &engine::gb_file(whole)]));
+                }
+            }
+            Note::EngineFetched(outcome) => {
+                self.engine_fetching = false;
+                match outcome {
+                    Ok(_) if self.panel == Panel::Setup && self.setup_kind == Kind::Embedded => self.this_pc_chosen(),
+                    Ok(_) => {}
+                    Err(reason) if self.panel == Panel::Setup => self.problem_in_panel(&reason),
+                    Err(reason) => self.say(&reason),
+                }
+            }
             Note::StraydogUpdate(outcome) => match outcome {
                 engine_updates::Result::Ready(version) => self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version])),
                 engine_updates::Result::ModelNotReady(reason) => self.say(&reason),
@@ -18836,6 +18890,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             remove_all: make_button(pane, ID_REMOVE_ALL, "", ButtonKind::Secondary, theme::background()),
             start_folders: Vec::new(),
             setting_up: false,
+            engine_fetching: false,
             setup_tally: Default::default(),
             licence_link: make_button(window, ID_MODEL_LICENCE, "", ButtonKind::Link, theme::background()),
             setup_cancel: Arc::new(AtomicBool::new(false)),
