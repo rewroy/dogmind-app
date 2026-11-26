@@ -1100,7 +1100,8 @@ impl Client {
         let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
         let image_digests = props.get("image_digests").and_then(Value::as_bool) == Some(true);
         let latest_reminder = props.get("latest_reminder").and_then(Value::as_bool) == Some(true);
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests, latest_reminder })
+        let system_after_first = props.get("system_after_first").and_then(Value::as_bool);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests, latest_reminder, system_after_first })
     }
 }
 
@@ -1134,15 +1135,19 @@ pub struct ServerInfo {
     pub image_digests: bool,
     /// Whether the server takes the app's own messages in the role `latest_reminder`.
     pub latest_reminder: bool,
+    /// Whether the model's template takes a system message after the first, where the server says (`/props`' `system_after_first`): none from a
+    /// server that does not.
+    pub system_after_first: Option<bool>,
 }
 
 impl ServerInfo {
-    /// The role the app's own messages go to this server in: `latest_reminder` where it says it takes that, `system` for Straydog's other models, none for
-    /// a server whose templates are not known.
+    /// The role the app's own messages go to this server in: `latest_reminder` where it says it takes that, `system` for Straydog's other models
+    /// unless it says their template takes no system message after the first, none for a server whose templates are not known. Qwen3.8's refuses
+    /// one ("System message must be at the beginning."): sent so, the first request of each start was refused before the notes went as the user's.
     pub fn app_role(&self) -> Option<&'static str> {
         if self.latest_reminder {
             Some(REMINDER_ROLE)
-        } else if self.straydog {
+        } else if self.straydog && self.system_after_first != Some(false) {
             Some(APP_ROLE)
         } else {
             None
@@ -1331,6 +1336,21 @@ mod tests {
         assert!(!described(r#"{"tool_writing": false}"#).tool_writing);
         assert!(!described(r#"{"tool_writing": "yes"}"#).tool_writing);
         assert!(!described("{}").tool_writing);
+    }
+
+    /// The app's notes go to Straydog as system messages where they are, unless `/props` says the model's template takes none after the first
+    /// (Qwen3.8's): then as the user's from the first request; a Straydog that says nothing is sent them as before.
+    #[test]
+    fn a_template_that_takes_no_later_system_message_is_sent_the_notes_as_the_users() {
+        let straydog = |props: &'static str| described(props);
+        let refusing = straydog(r#"{"build_info": "straydog-0.1.18", "system_after_first": false}"#);
+        assert_eq!((refusing.system_after_first, refusing.app_role()), (Some(false), None));
+        let taking = straydog(r#"{"build_info": "straydog-0.1.18", "system_after_first": true}"#);
+        assert_eq!(taking.app_role(), Some(APP_ROLE));
+        let silent = straydog(r#"{"build_info": "straydog-0.1.17"}"#);
+        assert_eq!((silent.system_after_first, silent.app_role()), (None, Some(APP_ROLE)));
+        let reminders = straydog(r#"{"build_info": "straydog-0.1.18", "latest_reminder": true, "system_after_first": false}"#);
+        assert_eq!(reminders.app_role(), Some(REMINDER_ROLE));
     }
 
     #[test]
