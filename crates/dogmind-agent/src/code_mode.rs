@@ -261,22 +261,33 @@ const SETUP: &str = r#"(function (host, write, names, setTimer, clearTimer, wait
     // a use-after-free any script can cause) and miscounts Promise.withResolvers' result on an error (0.17.0, #1692). Until it is 0.18 or
     // later, a program keys no weak collection by a symbol and has no Promise.withResolvers; the originals stay in this function.
     delete Promise.withResolvers;
-    const noSymbol = (what) => new TypeError(what + ' takes no symbol here: use an object');
-    for (const [type, method] of [[WeakMap, 'set'], [WeakSet, 'add'], [FinalizationRegistry, 'register']]) {
-        const original = type.prototype[method];
-        Object.defineProperty(type.prototype, method, {
-            value: function (target, ...rest) {
-                if (typeof target === 'symbol' || (method === 'register' && typeof rest[1] === 'symbol')) throw noSymbol(type.name + '.' + method);
-                return original.call(this, target, ...rest);
-            },
-            writable: false, enumerable: false, configurable: false,
-        });
-    }
+    // (what the guards call is taken now, before any program: a program can replace Function.prototype.call, Reflect's functions and
+    // the arrays' iterator, which would hand it the originals or change what is passed after the check; the arguments go by name)
+    const apply = Reflect.apply, construct = Reflect.construct;
+    const guard = (prototype, method, check) => {
+        const original = prototype[method];
+        Object.defineProperty(prototype, method, { value: check(original), writable: false, enumerable: false, configurable: false });
+    };
+    const noSymbol = (what) => what + ' takes no symbol here: use an object';
+    const setRefused = noSymbol('WeakMap.set'), addRefused = noSymbol('WeakSet.add'), registerRefused = noSymbol('FinalizationRegistry.register'),
+          refRefused = noSymbol('WeakRef');
+    guard(WeakMap.prototype, 'set', (original) => function set(key, value) {
+        if (typeof key === 'symbol') throw new TypeError(setRefused);
+        return apply(original, this, [key, value]);
+    });
+    guard(WeakSet.prototype, 'add', (original) => function add(value) {
+        if (typeof value === 'symbol') throw new TypeError(addRefused);
+        return apply(original, this, [value]);
+    });
+    guard(FinalizationRegistry.prototype, 'register', (original) => function register(target, held, token) {
+        if (typeof target === 'symbol' || typeof token === 'symbol') throw new TypeError(registerRefused);
+        return arguments.length < 3 ? apply(original, this, [target, held]) : apply(original, this, [target, held, token]);
+    });
     const OriginalWeakRef = WeakRef;
     const SafeWeakRef = function WeakRef(target) {
         if (new.target === undefined) throw new TypeError("Constructor WeakRef requires 'new'");
-        if (typeof target === 'symbol') throw noSymbol('WeakRef');
-        return Reflect.construct(OriginalWeakRef, [target], new.target);
+        if (typeof target === 'symbol') throw new TypeError(refRefused);
+        return construct(OriginalWeakRef, [target], new.target);
     };
     SafeWeakRef.prototype = OriginalWeakRef.prototype;
     Object.defineProperty(OriginalWeakRef.prototype, 'constructor', { value: SafeWeakRef, writable: false, configurable: false });
@@ -928,6 +939,20 @@ mod tests {
         let tamper = "try { WeakMap.prototype.set = null; } catch (e) {} try { delete WeakMap.prototype.set; } catch (e) {}
                       try { globalThis.WeakRef = null; } catch (e) {} new WeakMap().set(Symbol('a'), 1); return 'kept';";
         assert!(go_alone(tamper).error.as_deref().is_some_and(|error| error.contains("TypeError")));
+        // (nor through what a guard calls: replaced, Function.prototype.call, Reflect's functions and the arrays' iterator are never
+        // run by a guard, so none is handed an original or changes what was checked)
+        let hijack = "let seen = 0; const mark = function () { seen++; return 'hijacked'; };
+                      Function.prototype.call = mark; Function.prototype.apply = mark; Reflect.apply = mark; Reflect.construct = mark;
+                      Array.prototype[Symbol.iterator] = function* () { seen++; yield Symbol('swapped'); };
+                      const key = {}; const map = new WeakMap(); map.set(key, 1); new WeakSet().add(key); new WeakRef(key);
+                      new FinalizationRegistry(() => {}).register(key, 1);
+                      let refused = 0;
+                      const attempts = [() => map.set(Symbol('a'), 1), () => new WeakRef(Symbol('a'))];
+                      for (let i = 0; i < attempts.length; i++) {
+                          try { attempts[i](); } catch (e) { if (e instanceof TypeError && String(e.message).includes('no symbol')) refused++; }
+                      }
+                      return [map.get(key), seen, refused];";
+        assert_eq!(go_alone(hijack).value.as_deref(), Some("[1,0,2]"));
     }
 
     #[test]
