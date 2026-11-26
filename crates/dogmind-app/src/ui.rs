@@ -3114,11 +3114,11 @@ fn notice_text(shown: &notice::Notice) -> (String, String) {
         Notice::Page { version } => (tf("Dogmind {0} is available.", &[version]), t("Open the release page").to_string()),
         Notice::Fetching { version, percent } => (tf("Dogmind {0} is available.", &[version]), tf("Downloading… {0}%", &[percent])),
         Notice::UpdateNow { waiting: true, checking, .. } => (t("It restarts into the new version when this work is done.").to_string(), if *checking { t("Checking…") } else { t("Not now") }.to_string()),
-        Notice::UpdateNow { version: Some(version), engine: Some(engine), checking, .. } => (tf("Dogmind {0} and Straydog {1} are ready to install.", &[version, engine]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
-        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
-        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+        Notice::UpdateNow { version: Some(version), engine: Some(engine), checking, .. } => (tf("Update: Dogmind {0}, Straydog {1}", &[version, engine]), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
+        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
+        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
         Notice::EngineNow { waiting: true, .. } => (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()),
-        Notice::EngineNow { engine, .. } => (tf("Straydog {0} is ready to install.", &[engine]), t("Update now (Dogmind restarts)").to_string()),
+        Notice::EngineNow { engine, .. } => (tf("Straydog {0} is ready.", &[engine]), t("Restart to update").to_string()),
     }
 }
 
@@ -10863,7 +10863,7 @@ impl App {
         shapes.push(Shape::Round { area: rect(left, top, width, tall), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
         let (words, label) = notice_text(notice);
         // (one width for every state the button goes through: one that says how far the fetch has come does not move as the number grows)
-        let widest = [t("Update now (Dogmind restarts)").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
+        let widest = [t("Restart to update").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
             .iter()
             .map(|label| text_width(self.fonts.strong, label))
             .max()
@@ -19320,16 +19320,21 @@ mod tests {
         assert_eq!(text(Notice::Page { version: "0.2.0".into() }), (said("0.2.0"), t("Open the release page").to_string()));
         // (while the setup comes, the button is how far it has come)
         assert_eq!(text(Notice::Fetching { version: "0.2.0".into(), percent: 37 }), (said("0.2.0"), tf("Downloading… {0}%", &[&37])));
-        // (once it is here and checked, one press updates, and the button says that Dogmind restarts)
+        // (once it is here and checked, one press updates, and the button says that it restarts: a short label, so that what the notice says fits beside it,
+        // as when the engine comes with it)
         let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: false });
-        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Restart to update").to_string()));
         assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: true }).1, t("Checking…"));
         // (work under way is waited for, and the same button takes that back)
         assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
-        assert_eq!(text(Notice::UpdateNow { version: None, engine: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: None, engine: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: Some("0.1.19".into()), waiting: false, checking: false }),
+                   (tf("Update: Dogmind {0}, Straydog {1}", &[&"0.2.0", &"0.1.19"]), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::EngineNow { engine: "0.1.19".into(), waiting: false }), (tf("Straydog {0} is ready.", &[&"0.1.19"]), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::EngineNow { engine: "0.1.19".into(), waiting: true }).1, t("Not now"));
         // (what the person reads in English is the words the test names)
         if !lang::is_japanese() {
-            assert_eq!(ready.1, "Update now (Dogmind restarts)");
+            assert_eq!(ready.1, "Restart to update");
         }
     }
 
