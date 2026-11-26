@@ -19,8 +19,9 @@ use crate::settings::Settings;
 pub fn find(settings: &Settings) -> Option<PathBuf> {
     let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("straydog.exe")));
     let on_path = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|folder| folder.join("straydog.exe")).find(|file| file.is_file()));
+    // (an engine fetched and selected comes before one beside the app: an app that comes without one has only the fetched one)
     settings.straydog.clone().filter(|file| file.is_file())
-        .or_else(|| beside.as_ref().filter(|file| file.is_file()).and_then(|_| crate::engine_updates::selected(&crate::settings::data_folder())))
+        .or_else(|| crate::engine_updates::selected(&crate::settings::data_folder()))
         .or(beside.filter(|file| file.is_file())).or(on_path)
 }
 

@@ -838,11 +838,17 @@ fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>,
 
 /// Fetch a Straydog release asset with Dogmind's redirect, size and SHA-256 checks.
 pub(crate) fn fetch_straydog_asset(asset: &Setup, partial: &Path, stop: &AtomicBool) -> Result<(), Failed> {
+    fetch_straydog_asset_told(asset, partial, stop, &mut |_, _| {})
+}
+
+/// [`fetch_straydog_asset`], saying as it goes the bytes that have arrived and the file's whole (`told`): an engine fetched for a first start
+/// is waited for, and shown as it comes.
+pub(crate) fn fetch_straydog_asset_told(asset: &Setup, partial: &Path, stop: &AtomicBool, told: &mut dyn FnMut(u64, u64)) -> Result<(), Failed> {
     const STRAYDOG_DOWNLOADS: &str = "/rewroy/Straydog/releases/download/";
     let first = plain_address(&asset.url).filter(|url| {
         url.tls && url.port == 443 && url.host == "github.com" && url.path.starts_with(STRAYDOG_DOWNLOADS) && !url.path.contains("..")
     }).ok_or(Failed::NotAllowed)?;
-    stream(&first, asset, partial, None, &mut |_, _| {}, stop)
+    stream(&first, asset, partial, None, told, stop)
 }
 
 #[cfg(test)]
