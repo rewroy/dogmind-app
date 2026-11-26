@@ -9324,7 +9324,9 @@ impl App {
                 set_text(self.buttons[1], t("Skip for now"));
                 self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Link]);
                 self.fill_list();
-                SendMessageW(self.list, LB_SETCURSEL, suggested_way(straydog.is_some(), model_ready, codex.is_some(), claude_key), 0);
+                // (an app that comes without the engine fetches it when this PC's way is chosen: offered first as one with it, where the driver can run it)
+                let engine_here = straydog.is_some() || engine::fetches_engine(&self.settings) && engine::driver_problem(false).is_none();
+                SendMessageW(self.list, LB_SETCURSEL, suggested_way(engine_here, model_ready, codex.is_some(), claude_key), 0);
             }
             Panel::SetupDetails => {
                 match self.setup_kind {

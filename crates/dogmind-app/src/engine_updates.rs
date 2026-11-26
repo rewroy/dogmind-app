@@ -484,6 +484,11 @@ pub fn check_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool) -> O
         return None;
     }
     let running = running_engine(data);
+    // (with none, only once the person has set the app up for this PC's way: before, the setup's choice fetches it (fetch_first), and an app
+    // set up for another way fetches nothing it would not run)
+    if running.is_none() && !(settings.set_up && settings.active_provider().is_some_and(|provider| provider.kind == crate::settings::Kind::Embedded)) {
+        return None;
+    }
     let running_version = match &running {
         Some(exe) => Some(version(exe)?),
         None => None,
@@ -495,8 +500,17 @@ pub fn check_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool) -> O
     if crate::machine::connection_is_metered() || stop.load(Ordering::Relaxed) {
         return None;
     }
+    let _staging = STAGING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (a first fetch the person asked for may have selected one meanwhile: it is the one that runs, and no other is fetched over it now)
+    if running.is_none() && running_engine(data).is_some() {
+        return None;
+    }
     Some(stage(&release, running.as_deref(), settings, data, stop))
 }
+
+/// One staging at a time, in this app: the look after the start and a first fetch the person asked for work in the same folder, and each
+/// takes away what it finds half done there (`v{version}.partial`). The second waits, and finds the first's engine.
+static STAGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The version every release is newer than: what an app with no engine compares the releases with.
 const NONE_RUNNING: &str = "0.0.0";
@@ -520,6 +534,8 @@ fn failed_before(data: &Path, release: &Candidate) -> bool {
 /// selected. `told` hears the bytes that have arrived and the whole as they come (the exe and the zip). The setting that turns the background
 /// look off does not hold this back: the person asked for it. The engine's path once it is there, or why it is not.
 pub fn fetch_first(settings: &Settings, data: &Path, stop: &AtomicBool, told: &mut dyn FnMut(u64, u64)) -> std::result::Result<PathBuf, String> {
+    // (after a staging under way, whose engine is then the one: see STAGING)
+    let _staging = STAGING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(running) = running_engine(data) {
         return Ok(running);
     }

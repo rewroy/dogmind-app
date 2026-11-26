@@ -532,7 +532,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     // stays (kept_engine), and is written down below as this one's.
     let mut new_files: HashSet<String> = entries.iter().map(|entry| entry.path.to_lowercase()).collect();
     new_files.insert(UNINSTALLER.to_lowercase());
-    let kept = kept_engine(folder, previous.as_ref(), &new_files);
+    let mut kept = kept_engine(folder, previous.as_ref(), &new_files);
     new_files.extend(kept.iter().map(|file| file.to_lowercase()));
     if let Some(previous) = &previous {
         for file in previous.files.iter().filter(|file| !new_files.contains(&file.to_lowercase()) && !through_a_link(folder, file)) {
@@ -542,6 +542,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
         }
         remove_empty_folders(folder, previous.files.iter().map(String::as_str));
     }
+    kept.extend(cuda_license_beside(folder, &kept));
     // (copies of what this version has, or the last one had: the last one's own may have been moved aside before it went)
     let ours: HashSet<String> = new_files.iter().cloned().chain(previous.iter().flat_map(|manifest| manifest.files.iter().map(|file| file.to_lowercase()))).collect();
     remove_old_copies(folder, &ours);
@@ -765,6 +766,25 @@ fn kept_engine(folder: &Path, previous: Option<&Manifest>, new_files: &HashSet<S
         .filter(|file| is_bundled_engine(file) && !new_files.contains(&file.to_lowercase()) && !through_a_link(folder, file) && folder.join(file).is_file())
         .cloned()
         .collect()
+}
+
+/// NVIDIA's licence of the CUDA toolkit's cuBLAS, as the engine's release carries it beside its libraries (the toolkit's LICENSE, 13.x).
+const CUDA_LICENSE: &str = include_str!("../../../assets/licenses/NVIDIA-CUDA-LICENSE.txt");
+const CUDA_LICENSE_FILE: &str = "NVIDIA-CUDA-LICENSE.txt";
+
+/// The cuBLAS kept beside the engine an app up to 0.1.17 came with goes with NVIDIA's licence: that app had it in its LICENSE.txt, which the
+/// version that comes without the engine replaces without it. Written beside the libraries where it is not there, and written down as this
+/// version's (`kept` holds it from then on, while it is there). The file's name where it is new to the list, none otherwise.
+fn cuda_license_beside(folder: &Path, kept: &[String]) -> Option<String> {
+    let cublas = kept.iter().any(|file| file.to_lowercase().starts_with("cublas"));
+    if !cublas || kept.iter().any(|file| file.eq_ignore_ascii_case(CUDA_LICENSE_FILE)) {
+        return None;
+    }
+    let path = folder.join(CUDA_LICENSE_FILE);
+    if !path.is_file() {
+        std::fs::write(&path, CUDA_LICENSE).ok()?;
+    }
+    Some(CUDA_LICENSE_FILE.to_string())
 }
 
 /// What was left beside the app's files when they were replaced while it ran from them (`NAME.previous-TIME.EXT`), in its folder and in fonts:
@@ -1037,7 +1057,10 @@ mod tests {
         for (name, _) in &engine[..3] {
             assert!(manifest.files.iter().any(|file| file == name), "{name} is written down as this version's");
         }
-        assert!(!manifest.files.iter().any(|file| file == "NVIDIA-CUDA-LICENSE.txt"), "one the last version did not have is no one's");
+        // (NVIDIA's licence of the cuBLAS kept, which the last version had in its LICENSE.txt alone, is written beside them and is this version's)
+        assert_eq!(std::fs::read_to_string(folder.join("NVIDIA-CUDA-LICENSE.txt")).unwrap(), CUDA_LICENSE);
+        assert!(CUDA_LICENSE.starts_with("End User License Agreement"));
+        assert!(manifest.files.iter().any(|file| file == "NVIDIA-CUDA-LICENSE.txt"));
         // (the next update keeps it as well, while it is there; one taken away by hand is written down no more)
         std::fs::remove_file(folder.join("cublasLt64_13.dll")).unwrap();
         let mut next = scene.package("0.1.19", &[("dogmind-app.exe", b"app three")]);
@@ -1045,6 +1068,7 @@ mod tests {
         assert!(folder.join("straydog.exe").is_file() && folder.join("cublas64_13.dll").is_file());
         let manifest = read_manifest(&folder).unwrap();
         assert!(manifest.files.iter().any(|file| file == "straydog.exe") && !manifest.files.iter().any(|file| file == "cublasLt64_13.dll"));
+        assert!(manifest.files.iter().any(|file| file == "NVIDIA-CUDA-LICENSE.txt"), "the licence stays with the cuBLAS that stays");
         assert!(is_bundled_engine("cublasLt64_14.dll") && is_bundled_engine("STRAYDOG.EXE") && !is_bundled_engine("tools\\straydog.exe") && !is_bundled_engine("cublas.txt"));
     }
 
