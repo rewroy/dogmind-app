@@ -2263,6 +2263,11 @@ struct App {
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
+    /// An engine fetched and checked over the one that runs, waiting for the app's next start (`engine_updates::waiting`): the notice offers it with the
+    /// app's own update, in one restart, or alone.
+    engine_waiting: Option<String>,
+    /// Later was pressed on the notice of that engine alone.
+    engine_notice_closed: bool,
     /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
     checking_setup: bool,
     /// A newer release on GitHub than this one, found on the app's own look: the notice at the top of the main screen tells of it (`notice`), with a button for its page while nothing of its
@@ -3109,8 +3114,11 @@ fn notice_text(shown: &notice::Notice) -> (String, String) {
         Notice::Page { version } => (tf("Dogmind {0} is available.", &[version]), t("Open the release page").to_string()),
         Notice::Fetching { version, percent } => (tf("Dogmind {0} is available.", &[version]), tf("Downloading… {0}%", &[percent])),
         Notice::UpdateNow { waiting: true, checking, .. } => (t("It restarts into the new version when this work is done.").to_string(), if *checking { t("Checking…") } else { t("Not now") }.to_string()),
+        Notice::UpdateNow { version: Some(version), engine: Some(engine), checking, .. } => (tf("Dogmind {0} and Straydog {1} are ready to install.", &[version, engine]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
         Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
         Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+        Notice::EngineNow { waiting: true, .. } => (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()),
+        Notice::EngineNow { engine, .. } => (tf("Straydog {0} is ready to install.", &[engine]), t("Update now (Dogmind restarts)").to_string()),
     }
 }
 
@@ -10750,6 +10758,13 @@ impl App {
     /// Windows lets it rename): a row above the input asks whether to restart into it, and the tray says so if the window is out of sight. Nothing
     /// restarts unless the person says so. A file still being written is not taken for one: the same new size and time twice in a row is.
     unsafe fn look_for_update(&mut self) {
+        // (an engine that waits, alone: the app restarts on it when the work is done, if the person said so)
+        if self.restart_when_done && !self.update_offer && self.ready_setup().is_none() && self.engine_waiting.is_some() {
+            if !self.at_work() {
+                self.restart_into_update();
+            }
+            return;
+        }
         // (the setup of a release, fetched and checked: it restarts when the work is done, if the person said so)
         if self.restart_when_done && !self.update_offer && self.ready_setup().is_some() {
             if !self.at_work() {
@@ -10830,6 +10845,8 @@ impl App {
             new_build: self.update_offer,
             restart_when_done: self.restart_when_done,
             checking: self.checking_setup,
+            engine: self.engine_waiting.as_deref(),
+            engine_closed: self.engine_notice_closed,
         })
     }
 
@@ -10864,6 +10881,7 @@ impl App {
             notice::Notice::Page { .. } => (ButtonKind::Secondary, true),
             notice::Notice::Fetching { .. } => (ButtonKind::Secondary, false),
             notice::Notice::UpdateNow { waiting, checking, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, !*checking),
+            notice::Notice::EngineNow { waiting, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, true),
         };
         set_button_style(main, kind, theme::surface());
         EnableWindow(main, i32::from(enabled));
@@ -10882,9 +10900,15 @@ impl App {
         let version = match &shown {
             notice::Notice::Page { version } | notice::Notice::Fetching { version, .. } => Some(version.clone()),
             notice::Notice::UpdateNow { version, .. } => version.clone(),
+            notice::Notice::EngineNow { .. } => None,
         };
         if let Some(version) = version {
             self.dismiss_release(&version);
+        }
+        if matches!(shown, notice::Notice::EngineNow { .. }) {
+            // (the engine waits all the same: the app's next start takes it)
+            self.engine_notice_closed = true;
+            self.restart_when_done = false;
         }
         if matches!(shown, notice::Notice::UpdateNow { .. }) {
             // (not this build: a newer one is offered again)
@@ -11106,6 +11130,8 @@ impl App {
         }
         if updates::is_due_after(self.settings.last_update_check, updates::now(), every) {
             self.start_release_look(true);
+            // (the engine's look with it: what each finds is offered in the one notice, for one restart)
+            self.start_straydog_update();
         }
     }
 
@@ -14821,7 +14847,16 @@ impl App {
                 }
             }
             Note::StraydogUpdate(outcome) => match outcome {
-                engine_updates::Result::Ready(version) => self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version])),
+                engine_updates::Result::Ready(version) => {
+                    // (over the engine that runs, it waits for the restart the notice offers; a first engine, with none before it, is selected at once)
+                    self.engine_waiting = engine_updates::waiting(&self.folder);
+                    if self.engine_waiting.is_some() {
+                        self.engine_notice_closed = false;
+                        self.release_update_changed();
+                    } else {
+                        self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version]));
+                    }
+                }
                 engine_updates::Result::ModelNotReady(reason) => self.say(&reason),
                 engine_updates::Result::Failed(_) => {
                     self.say(t("The Straydog update could not be prepared. See engine.log for details."));
@@ -18602,6 +18637,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_keep: make_button(pane, ID_TOGGLE_KEEP, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
+            engine_waiting: None,
+            engine_notice_closed: false,
             checking_setup: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
@@ -18945,6 +18982,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             ShowWindow(window, if app.settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         }
         SetTimer(window, TIMER_ENGINE, 1000, None);
+        // (the engine an update fetched and checked: its turn is this start, before any engine runs, and never a conversation's middle)
+        if let Some(version) = engine_updates::take_waiting(&app.folder) {
+            engine_updates::log_failure(&app.folder, &format!("Straydog {version} selected at the app's start"));
+        }
         engine_updates::prefer_bundled_if_newer(&app.folder);
         // What this copy runs, to see a new build come in over it.
         app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
@@ -19280,12 +19321,12 @@ mod tests {
         // (while the setup comes, the button is how far it has come)
         assert_eq!(text(Notice::Fetching { version: "0.2.0".into(), percent: 37 }), (said("0.2.0"), tf("Downloading… {0}%", &[&37])));
         // (once it is here and checked, one press updates, and the button says that Dogmind restarts)
-        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: false });
+        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: false });
         assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Update now (Dogmind restarts)").to_string()));
-        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: true }).1, t("Checking…"));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: true }).1, t("Checking…"));
         // (work under way is waited for, and the same button takes that back)
-        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
-        assert_eq!(text(Notice::UpdateNow { version: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: None, engine: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
         // (what the person reads in English is the words the test names)
         if !lang::is_japanese() {
             assert_eq!(ready.1, "Update now (Dogmind restarts)");

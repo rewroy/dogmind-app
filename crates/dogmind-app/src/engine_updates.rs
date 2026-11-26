@@ -24,6 +24,8 @@ const ROOT: &str = "engine-updates";
 const SELECTED: &str = "selected.txt";
 const PENDING: &str = "awaiting-ready.txt";
 const FAILED: &str = "failed.txt";
+/// An engine fetched and checked over the one that runs, which waits for the app's next start to be selected ([`take_waiting`]).
+const WAITING: &str = "waiting.txt";
 const MOST_RELEASES: usize = 4 << 20;
 const MOST_EXE: u64 = 128 << 20;
 /// How long a new engine's `--check-model` may take. Its first run is the first time Windows sees the program and its cuBLAS libraries (568 MB), and Defender
@@ -583,6 +585,36 @@ fn stage(
     )
 }
 
+/// What a staged engine comes to: selected at once where none runs (a first start's), else waiting for the app's next start ([`WAITING`]), which
+/// the person's one restart brings with the app's own update, so that the engine never changes under a conversation.
+fn staged(data: &Path, version: &str, running: Option<&Path>) -> std::io::Result<()> {
+    if running.is_none() {
+        return select(data, version);
+    }
+    let folder = root(data);
+    flushed_partial(&folder.join("waiting.partial"), version)?;
+    fs::rename(folder.join("waiting.partial"), folder.join(WAITING))
+}
+
+/// The engine that waits for the app's next start ([`staged`]): its version, where its folder holds it and it is not the one selected.
+pub fn waiting(data: &Path) -> Option<String> {
+    let version = fs::read_to_string(root(data).join(WAITING)).ok()?.trim().to_string();
+    let here = plain_version(&version) && root(data).join(format!("v{version}")).join("straydog.exe").is_file();
+    let selected_now = selected(data).and_then(|exe| exe.parent()?.file_name()?.to_str().map(str::to_string));
+    (here && selected_now.as_deref() != Some(format!("v{version}").as_str())).then_some(version)
+}
+
+/// At the app's start, before any engine runs: the engine that waits is selected (its first start may roll it back, as any update's), and no
+/// longer waits. Its version where there was one.
+pub fn take_waiting(data: &Path) -> Option<String> {
+    let version = waiting(data);
+    if let Some(version) = &version {
+        select(data, version).ok()?;
+    }
+    let _ = fs::remove_file(root(data).join(WAITING));
+    version
+}
+
 fn stage_with<F>(
     release: &Candidate,
     running: Option<&Path>,
@@ -618,7 +650,7 @@ where
                 if let Err(reason) = check_model(&ready, settings, data) {
                     return Ok(Result::ModelNotReady(reason));
                 }
-                select(data, &release.version).map_err(|error| error.to_string())?;
+                staged(data, &release.version, running).map_err(|error| error.to_string())?;
                 return Ok(Result::Ready(release.version.clone()));
             }
             fs::remove_dir_all(&version_folder).map_err(|error| error.to_string())?;
@@ -665,7 +697,7 @@ where
             return Err(t("The engine update was cancelled.").into());
         }
         fs::rename(&partial, &version_folder).map_err(|error| error.to_string())?;
-        select(data, &release.version).map_err(|error| error.to_string())?;
+        staged(data, &release.version, running).map_err(|error| error.to_string())?;
         Ok(Result::Ready(release.version.clone()))
     };
     let outcome = attempt().unwrap_or_else(Result::Failed);
@@ -1553,6 +1585,11 @@ mod tests {
             ),
             Result::Ready(_)
         ));
+        // (over a running engine it waits for the app's next start, and is selected then)
+        assert!(selected(data.path()).is_none());
+        assert_eq!(waiting(data.path()).as_deref(), Some("0.1.11"));
+        assert_eq!(take_waiting(data.path()).as_deref(), Some("0.1.11"));
+        assert!(waiting(data.path()).is_none() && take_waiting(data.path()).is_none(), "taken once");
         assert!(selected(data.path()).is_some());
         let attempted = selected(data.path()).unwrap();
         assert!(rollback_if_pending(data.path(), &attempted));
