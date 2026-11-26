@@ -528,9 +528,12 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     placing += placing_began.elapsed();
     let finishing_began = Instant::now();
     on(Progress { stage: Stage::Finishing, fraction: 1.0, file: String::new() });
-    // What the last version had and this one has not: nothing else in the folder is this program's to take.
+    // What the last version had and this one has not: nothing else in the folder is this program's to take. The engine the last one came with
+    // stays (kept_engine), and is written down below as this one's.
     let mut new_files: HashSet<String> = entries.iter().map(|entry| entry.path.to_lowercase()).collect();
     new_files.insert(UNINSTALLER.to_lowercase());
+    let kept = kept_engine(folder, previous.as_ref(), &new_files);
+    new_files.extend(kept.iter().map(|file| file.to_lowercase()));
     if let Some(previous) = &previous {
         for file in previous.files.iter().filter(|file| !new_files.contains(&file.to_lowercase()) && !through_a_link(folder, file)) {
             if std::fs::remove_file(folder.join(file)).is_ok() {
@@ -545,6 +548,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     (job.write_uninstaller)(&folder.join(UNINSTALLER)).map_err(|error| say(&folder.join(UNINSTALLER), &error))?;
     let mut files: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
     files.push(UNINSTALLER.to_string());
+    files.extend(kept);
     // What is written down of each file is its size and time as the disk has them now, after the last write of it: a file placed by this run has the time it was unpacked with, which the
     // rename keeps. A file that was found in place is written down only if it still has what it had when it was looked at.
     let mut written_down = Vec::with_capacity(entries.len());
@@ -742,6 +746,25 @@ fn stood_for(name: &str) -> Option<String> {
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
     let extension = &rest[digits..];
     (!stem.is_empty() && digits > 0 && (extension.is_empty() || extension.starts_with('.'))).then(|| format!("{stem}{extension}"))
+}
+
+/// Whether a file of the folder's top is the engine an app came with up to 0.1.17: straydog.exe and the cuBLAS libraries beside it, with
+/// their licence.
+fn is_bundled_engine(file: &str) -> bool {
+    let name = file.to_lowercase();
+    !name.contains('\\') && !name.contains('/')
+        && (name == "straydog.exe" || name == "nvidia-cuda-license.txt"
+            || (name.ends_with(".dll") && (name.starts_with("cublas64_") || name.starts_with("cublaslt64_"))))
+}
+
+/// The engine the last version came with, where this one comes without it (0.1.18 on): it stays in place and is this version's to take on a
+/// removal. The app runs it until it has fetched its own (crates/dogmind-app/src/engine_updates.rs); taken away by the update, an app
+/// updated from 0.1.17 had no engine until its first fetch. Those of the last version's files that are there now and that this one has not.
+fn kept_engine(folder: &Path, previous: Option<&Manifest>, new_files: &HashSet<String>) -> Vec<String> {
+    previous.iter().flat_map(|manifest| manifest.files.iter())
+        .filter(|file| is_bundled_engine(file) && !new_files.contains(&file.to_lowercase()) && !through_a_link(folder, file) && folder.join(file).is_file())
+        .cloned()
+        .collect()
 }
 
 /// What was left beside the app's files when they were replaced while it ran from them (`NAME.previous-TIME.EXT`), in its folder and in fonts:
@@ -991,6 +1014,38 @@ mod tests {
         assert_eq!(std::fs::read(folder.join("notes.previous-1.txt")).unwrap(), b"mine too", "a person's file of that kind of name stays: it is no copy of the program's");
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
         assert_eq!(walk(&data), ["models\\m.gguf", "sessions\\one.jsonl", "settings.json"]);
+    }
+
+    /// An update from an app that came with the engine (up to 0.1.17) to one that comes without it keeps the engine where it is, as the app runs it
+    /// until it has fetched its own, writes it down as its own for a removal to take, and keeps it through the next update too; a file of the
+    /// last version that is no engine goes as before.
+    #[test]
+    fn an_update_to_an_app_without_the_engine_keeps_the_one_it_came_with() {
+        let scene = Scene::new();
+        let engine: [(&str, &[u8]); 4] = [("straydog.exe", b"engine"), ("cublas64_13.dll", b"cublas"), ("cublasLt64_13.dll", b"cublaslt"), ("NVIDIA-CUDA-LICENSE.txt", b"nvidia")];
+        let mut with_it = scene.package("0.1.17", &[("dogmind-app.exe", b"app one"), ("gone.dll", b"old"), engine[0], engine[1], engine[2]]);
+        scene.run(&mut with_it, None, None).unwrap();
+        let folder = scene.folder();
+        let mut without = scene.package("0.1.18", &[("dogmind-app.exe", b"app two")]);
+        let done = scene.run(&mut without, None, None).unwrap();
+        assert_eq!(done.removed, 1, "gone.dll alone");
+        for (name, body) in &engine[..3] {
+            assert_eq!(std::fs::read(folder.join(name)).unwrap(), *body, "{name} stays");
+        }
+        assert!(!folder.join("gone.dll").exists());
+        let manifest = read_manifest(&folder).unwrap();
+        for (name, _) in &engine[..3] {
+            assert!(manifest.files.iter().any(|file| file == name), "{name} is written down as this version's");
+        }
+        assert!(!manifest.files.iter().any(|file| file == "NVIDIA-CUDA-LICENSE.txt"), "one the last version did not have is no one's");
+        // (the next update keeps it as well, while it is there; one taken away by hand is written down no more)
+        std::fs::remove_file(folder.join("cublasLt64_13.dll")).unwrap();
+        let mut next = scene.package("0.1.19", &[("dogmind-app.exe", b"app three")]);
+        scene.run(&mut next, None, None).unwrap();
+        assert!(folder.join("straydog.exe").is_file() && folder.join("cublas64_13.dll").is_file());
+        let manifest = read_manifest(&folder).unwrap();
+        assert!(manifest.files.iter().any(|file| file == "straydog.exe") && !manifest.files.iter().any(|file| file == "cublasLt64_13.dll"));
+        assert!(is_bundled_engine("cublasLt64_14.dll") && is_bundled_engine("STRAYDOG.EXE") && !is_bundled_engine("tools\\straydog.exe") && !is_bundled_engine("cublas.txt"));
     }
 
     #[test]
