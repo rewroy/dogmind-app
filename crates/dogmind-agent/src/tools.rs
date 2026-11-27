@@ -1671,11 +1671,34 @@ pub fn text_of_file(bytes: &[u8]) -> Option<(String, &'static str)> {
 }
 
 fn readable_file_text(bytes: &[u8]) -> Option<(Cow<'_, str>, &'static str)> {
-    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
-    if !utf16 && bytes.iter().take(8192).any(|&byte| byte == 0) {
+    if binary_head(&bytes[..bytes.len().min(BINARY_HEAD)]) {
         return None;
     }
     Some(decode_file_text(bytes))
+}
+
+/// How much of a file's beginning says whether it is binary.
+const BINARY_HEAD: usize = 8192;
+
+/// Whether a file that begins with `head` (its first [`BINARY_HEAD`] bytes, or all of a shorter one) is binary: a NUL byte there, unless it begins
+/// with a UTF-16 byte order mark.
+fn binary_head(head: &[u8]) -> bool {
+    let utf16 = head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]);
+    !utf16 && head.contains(&0)
+}
+
+/// A file's bytes, or none where its beginning already says it is binary ([`binary_head`]): a search passes over a binary file without reading
+/// the rest of it. (A workspace of a game's assets held 6.4 GB of pictures and models among 340 MB of text, every byte of them read for a search.)
+fn bytes_unless_binary(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    (&mut file).take(BINARY_HEAD as u64).read_to_end(&mut bytes)?;
+    if binary_head(&bytes) {
+        return Ok(None);
+    }
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, String)), String> {
@@ -2131,8 +2154,11 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
             secrets += 1;
             continue;
         }
-        let bytes = match std::fs::read(entry.path()) {
-            Ok(bytes) => bytes,
+        // (a binary file is passed over by its beginning: the rest of it is never read)
+        let bytes = match bytes_unless_binary(entry.path()) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) if entry.depth() == 0 => return Err(format!("{} is binary: search_files reads text", root.display())),
+            Ok(None) => continue,
             Err(error) if entry.depth() == 0 => return Err(format!("{}: {error}", root.display())),
             Err(_) => continue,
         };
@@ -7035,6 +7061,30 @@ mod tests {
         assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "cp932.txt:1:日本語", "le.txt:1:日本語"]);
         #[cfg(not(windows))]
         assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "le.txt:1:日本語"]);
+    }
+
+    /// A file is binary by its beginning alone, as it was when it was read whole: a NUL at the last byte of the first 8 KiB passes it over, one
+    /// just past them leaves it text and searched, and a large file whose beginning says binary is passed over without the rest of it read.
+    #[test]
+    fn a_search_tells_a_binary_file_by_its_first_8_kib_as_reading_it_whole_did() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let text_with = |at: usize| {
+            let mut bytes = vec![b'a'; BINARY_HEAD + 64];
+            bytes[at] = 0;
+            bytes.extend_from_slice(b"\nneedle\n");
+            bytes
+        };
+        std::fs::write(dir.path().join("inside.txt"), text_with(BINARY_HEAD - 1)).unwrap();
+        std::fs::write(dir.path().join("past.txt"), text_with(BINARY_HEAD)).unwrap();
+        let mut large = vec![0u8; 4 << 20];
+        large.extend_from_slice(b"\nneedle\n");
+        std::fs::write(dir.path().join("large.bin"), &large).unwrap();
+        let found = search_files(&json!({"pattern": "^needle$"}), dir.path(), &[], &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.lines().collect::<Vec<_>>(), ["past.txt:2:needle"]);
+        for name in ["inside.txt", "past.txt", "large.bin"] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            assert_eq!(bytes_unless_binary(&dir.path().join(name)).unwrap().is_none(), readable_file_text(&bytes).is_none(), "{name}");
+        }
     }
 
     #[test]
