@@ -2384,7 +2384,7 @@ impl Agent {
             return self.failed(crate::conversation_key::LOCKED.to_string());
         }
         match Session::open_checked(path) {
-            Ok(crate::session::Opened { session, workspace, messages, damaged }) => {
+            Ok(crate::session::Opened { session, workspace, messages, damaged, remembered }) => {
                 self.move_to(&workspace);
                 self.workspace = workspace;
                 self.background.reset();
@@ -2394,24 +2394,25 @@ impl Agent {
                 self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(path, &self.workspace)));
                 // (what it had read, it has read: a real one, refused an edit of a file it had read before the app was closed, read it and wrote the same 4,776
                 // characters again)
-                self.bench.restore_seen(crate::session::seen_of(path));
+                // (all it remembers was read with its messages, in one pass: crate::session::Remembered)
+                self.bench.restore_seen(remembered.seen);
                 self.load_extras();
                 // As it was sent, whatever is installed or running by now: the prefix goes on, and a call to what has gone says so.
-                if let Some(tools) = crate::session::tools_of(path) {
+                if let Some(tools) = remembered.tools {
                     self.tool_schemas = tools;
                 }
-                self.added_tools = crate::session::added_of(path).and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
+                self.added_tools = remembered.added.and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
                 self.messages = messages;
                 // (a fork keeps the tools told of in the one it came from, and maybe not where they were told of)
                 self.added_due = self.added_untold();
                 self.web_rules_due = false;
                 self.japanese_session = false;
                 self.rewound.clear();
-                (self.web_from, self.web_untold) = crate::session::web_sources(path);
+                (self.web_from, self.web_untold) = (remembered.web_from, remembered.web_untold);
                 self.web_told = self.web_seen();
                 self.emit(Event::WebSeen(self.web_told));
                 // (the history has said it already; a compaction will say it again)
-                (self.goal, self.goal_due) = (crate::session::goal_of(path), false);
+                (self.goal, self.goal_due) = (remembered.goal, false);
                 self.round_goal = None;
                 self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {

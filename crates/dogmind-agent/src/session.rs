@@ -371,6 +371,108 @@ fn lines_of(path: &Path) -> std::io::Result<impl Iterator<Item = String>> {
     }))
 }
 
+/// What a session file holds besides its messages, gathered line by line as the readers below each gathered it ([`seen_of`], [`tools_of`],
+/// [`added_of`], [`goal_of`], [`web_sources`]): a conversation opened again ([`Session::open_checked`]) takes all of it from the one pass that
+/// reads its messages, where it read and opened the whole file six times, an encrypted one's every line six times.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Remembered {
+    /// The files it had read, each with its hash as it last saw it ([`seen_of`]).
+    pub seen: std::collections::HashMap<PathBuf, String>,
+    /// The tools it was last offered ([`tools_of`]).
+    pub tools: Option<serde_json::Value>,
+    /// The tools it was told of after it began ([`added_of`]).
+    pub added: Option<serde_json::Value>,
+    /// What it works toward ([`goal_of`]).
+    pub goal: Option<String>,
+    /// Where what a stranger said came into it, and whether some of it cannot be told ([`web_sources`]).
+    pub web_from: Vec<String>,
+    pub web_untold: bool,
+}
+
+/// [`Remembered`] as a file's lines come, each taken as the reader of its part took it.
+struct Remembering {
+    seen: std::collections::HashMap<PathBuf, String>,
+    tools: Option<serde_json::Value>,
+    added: Option<serde_json::Value>,
+    /// The last goal line's goal (none: cleared), if there was one.
+    goal: Option<Option<String>>,
+    web_mark: String,
+    web_tools: Vec<String>,
+    web_blocks: Vec<String>,
+    web_plain: bool,
+    damaged: bool,
+}
+
+impl Remembering {
+    fn new() -> Remembering {
+        Remembering { seen: Default::default(), tools: None, added: None, goal: None, web_mark: serde_json::to_string(&Line::WebSeen).expect("a plain line serializes"),
+                      web_tools: Vec::new(), web_blocks: Vec::new(), web_plain: false, damaged: false }
+    }
+
+    fn take(&mut self, entry: &Entry) {
+        let Entry::Text(line) = entry else {
+            self.damaged = true;
+            return;
+        };
+        if line.starts_with("{\"kind\":\"seen") {
+            match serde_json::from_str(line) {
+                Ok(Line::Seen { path, hash }) => {
+                    self.seen.insert(path, hash);
+                }
+                Ok(Line::SeenForgotten) => self.seen.clear(),
+                _ => {}
+            }
+        } else if line.starts_with("{\"kind\":\"goal\"") {
+            if let Ok(Line::Goal { goal }) = serde_json::from_str(line) {
+                self.goal = Some(goal);
+            }
+        } else if line.starts_with("{\"kind\":\"tools\"") {
+            if let Ok(Line::Tools { tools }) = serde_json::from_str(line) {
+                self.tools = Some(tools);
+            }
+        } else if line.starts_with("{\"kind\":\"added\"") {
+            if let Ok(Line::Added { tools }) = serde_json::from_str(line) {
+                self.added = Some(tools);
+            }
+        }
+        // (where web content came from: every line is looked at for it, whatever else it held)
+        let add = |tools: &mut Vec<String>, tool: String| {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        };
+        if *line == self.web_mark {
+            self.web_plain = true;
+        } else if line.starts_with("{\"kind\":\"web_from\"") {
+            if let Ok(Line::WebFrom { tool }) = serde_json::from_str(line) {
+                add(&mut self.web_tools, tool);
+            }
+        } else if line.contains("untrusted") {
+            // (as many escapes deep as the block was quoted: a program's log holds its calls' results as strings)
+            let bare: String = line.chars().filter(|c| *c != '\\').collect();
+            for source in bare.split("source=\"").skip(1).filter_map(|rest| rest.split('"').next()) {
+                if source != "run_code" {
+                    add(&mut self.web_blocks, source.to_string());
+                }
+            }
+        }
+    }
+
+    fn done(self) -> Remembered {
+        let mut web_from = self.web_tools;
+        // (the blocks are read only under a plain mark: a conversation with none has had no stranger's answer)
+        if self.web_plain {
+            for source in self.web_blocks {
+                if !web_from.contains(&source) {
+                    web_from.push(source);
+                }
+            }
+        }
+        let web_untold = self.web_plain && (self.damaged || web_from.is_empty());
+        Remembered { seen: self.seen, tools: self.tools, added: self.added, goal: self.goal.flatten(), web_from, web_untold }
+    }
+}
+
 /// What a session file comes to when it is read whole.
 struct Loaded {
     /// The original first user line, or the last explicit name, even after compaction. Absent until a message was appended.
@@ -386,6 +488,14 @@ struct Loaded {
 fn load(path: &Path) -> Result<Loaded, String> {
     let entries = entries_of(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(load_entries(entries))
+}
+
+/// As [`load`], and what else the file remembers ([`Remembered`]), in the same pass.
+fn load_remembering(path: &Path) -> Result<(Loaded, Remembered), String> {
+    let entries = entries_of(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut remembering = Remembering::new();
+    let loaded = load_entries(entries.inspect(|(_, entry)| remembering.take(entry)));
+    Ok((loaded, remembering.done()))
 }
 
 fn first_words(message: &Message) -> String {
@@ -433,6 +543,8 @@ pub struct Opened {
     pub workspace: PathBuf,
     pub messages: Vec<Message>,
     pub damaged: Vec<usize>,
+    /// What else it remembers, read in the same pass as its messages.
+    pub remembered: Remembered,
 }
 
 impl Session {
@@ -514,7 +626,7 @@ impl Session {
     /// As `open`, and with the lines of an encrypted session that did not open: it opens without them, and says so.
     pub fn open_checked(path: &Path) -> Result<Opened, String> {
         // (whatever a crash cut in two, a character too, and what is written next starts a line of its own)
-        let loaded = load(path)?;
+        let (loaded, remembered) = load_remembering(path)?;
         let mut messages = loaded.messages;
         complete_tool_calls(&mut messages);
         let sealed = sealed_of(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -526,7 +638,7 @@ impl Session {
             set_count(path, loaded.lines);
         }
         let session = Session { path: path.to_path_buf(), file, sealed, generation: GENERATION.load(Ordering::SeqCst) };
-        Ok(Opened { session, workspace: loaded.workspace, messages, damaged: loaded.damaged })
+        Ok(Opened { session, workspace: loaded.workspace, messages, damaged: loaded.damaged, remembered })
     }
 
     /// The file is another one by now (a conversion of every session put a new file in its place): the same name, opened again.
@@ -1080,6 +1192,36 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen.get(Path::new("C:/w/a.txt")).map(String::as_str), Some("4444"));
         assert_eq!(Session::open(&path).unwrap().2.len(), 1);
+    }
+
+    /// A conversation opened again remembers in its one pass what the reader of each part finds in a pass of its own: the files it had read
+    /// (one forgotten), the tools it was offered and those added, the goal (set, cleared, set again) and where web content came from.
+    #[test]
+    fn a_conversation_opened_again_remembers_in_one_pass_what_each_reader_finds() {
+        use serde_json::json;
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261127-1").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "1111").unwrap();
+        session.forget_seen().unwrap();
+        session.note_seen(Path::new("C:/w/b.txt"), "2222").unwrap();
+        session.mark_web_from("web_read", false).unwrap();
+        session.append(&Message::text("tool", "<untrusted_web_content source=\"web_search\">x</untrusted_web_content>")).unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let lines = [Line::Tools { tools: json!([{"name": "read_file"}]) }, Line::Added { tools: json!([{"name": "mcp__s__t"}]) },
+                     Line::Goal { goal: Some("first".into()) }, Line::Goal { goal: None }, Line::Goal { goal: Some("second".into()) }, Line::WebSeen];
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for line in &lines {
+            writeln!(file, "{}", serde_json::to_string(line).unwrap()).unwrap();
+        }
+        drop(file);
+        let opened = Session::open_checked(&path).unwrap();
+        let (web_from, web_untold) = web_sources(&path);
+        let each = Remembered { seen: seen_of(&path), tools: tools_of(&path), added: added_of(&path), goal: goal_of(&path), web_from, web_untold };
+        assert_eq!(opened.remembered, each);
+        assert_eq!((opened.remembered.goal.as_deref(), opened.remembered.seen.len()), (Some("second"), 1));
+        assert!(opened.remembered.tools.is_some() && opened.remembered.added.is_some() && !opened.remembered.web_from.is_empty());
     }
 
     /// Where web content came from: each tool's line; and for a plain mark from before those lines were kept, the blocks its results hold, a
