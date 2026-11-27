@@ -369,6 +369,8 @@ const SPINNER_MS: u32 = 33;
 /// How often text goes into the transcript as an answer comes. The view moves on every frame; to insert costs a millisecond or more, and
 /// nobody reads the difference between thirty insertions a second and more of them.
 const REVEAL_EVERY_MS: u128 = 30;
+/// How often the thinking shown goes in, all that has come of it: not each piece, which was an insertion and a drawing of the transcript of its own.
+const THINKING_EVERY_MS: u128 = 100;
 /// The least time between frames: a screen faster than this is served every other time it refreshes.
 const FRAME_LEAST: std::time::Duration = std::time::Duration::from_micros(6500);
 /// How long frames wait where there is no composition to wait for.
@@ -2609,6 +2611,11 @@ struct App {
     pending_text: String,
     /// What has arrived of the answer and is not on screen yet (`reveal_tick`).
     reveal: String,
+    /// What has arrived of the thinking, where it is shown, and is not on screen yet: it goes in with the frames (`reveal_tick`), as the answer
+    /// does, and all of it at once.
+    thinking_reveal: String,
+    /// When thinking last went in from it.
+    thinking_revealed_at: std::time::Instant,
     /// The reply's keys, hidden as they come in pieces: what is shown of it (the reply itself is kept as it was written).
     stream_mask: crate::mask::StreamMask,
     /// When text last went in from it.
@@ -13628,6 +13635,7 @@ impl App {
             self.greeting = next_greeting(self.greeting, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.subsec_nanos() as u64));
         }
         self.reveal.clear();
+        self.thinking_reveal.clear();
         self.follow_end = true;
         self.line_start = true;
         self.code_fence = None;
@@ -13894,8 +13902,25 @@ impl App {
         }
     }
 
-    /// What waits to be shown goes in now: something else is about to follow it.
+    /// What waits to be shown goes in now: something else is about to follow it. The thinking first: what waits of the answer came after it.
     unsafe fn flush_reveal(&mut self) {
+        self.flush_thinking();
+        self.flush_answer();
+    }
+
+    /// The thinking that waits goes in, in one insertion at the transcript's end, the rest of the transcript as it was.
+    unsafe fn flush_thinking(&mut self) {
+        if !self.thinking_reveal.is_empty() {
+            let text = std::mem::take(&mut self.thinking_reveal);
+            self.thinking_revealed_at = std::time::Instant::now();
+            let revealing = std::mem::replace(&mut self.revealing, true);
+            self.append(&text, Style::Thinking);
+            self.revealing = revealing;
+        }
+    }
+
+    /// What waits of the answer goes in now.
+    unsafe fn flush_answer(&mut self) {
         if !self.reveal.is_empty() {
             let text = std::mem::take(&mut self.reveal);
             self.append_answer(&text);
@@ -13907,6 +13932,10 @@ impl App {
     unsafe fn reveal_tick(&mut self) {
         let mut trace = crate::frametrace::frame();
         let mut went_in = 0;
+        if !self.thinking_reveal.is_empty() && self.thinking_revealed_at.elapsed().as_millis() >= THINKING_EVERY_MS {
+            went_in += self.thinking_reveal.len();
+            self.flush_thinking();
+        }
         if !self.reveal.is_empty() && self.revealed_at.elapsed().as_millis() >= REVEAL_EVERY_MS {
             // (a window held up for long does not rush to make up for it)
             let seconds = self.revealed_at.elapsed().as_secs_f32().min(0.1);
@@ -13916,7 +13945,7 @@ impl App {
             (self.reveal_rate, self.reveal_carried) = (rate, carried);
             let at = self.reveal.char_indices().nth(count).map_or(self.reveal.len(), |(at, _)| at);
             let chunk: String = self.reveal.drain(..at).collect();
-            went_in = chunk.len();
+            went_in += chunk.len();
             self.revealing = true;
             self.append_answer(&chunk);
             self.revealing = false;
@@ -13951,7 +13980,7 @@ impl App {
             trace.part(2);
             trace.end(view.1.y - view.0.y, went_in, self.reveal.len());
         }
-        if self.reveal.is_empty() && settled {
+        if self.reveal.is_empty() && self.thinking_reveal.is_empty() && settled {
             self.frames.wanted.store(false, Ordering::Relaxed);
         }
     }
@@ -14002,7 +14031,10 @@ impl App {
         let event = hidden_shown(event);
         self.timeline_event(&event);
         let live_report = matches!(&event, Event::Usage { usage, .. } if usage.prompt == 0 && usage.completion == 0);
-        if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
+        // (thinking that comes waits for the frames with what came of it before; what waits of the answer goes in first)
+        if matches!(event, Event::Reasoning(_)) {
+            self.flush_answer();
+        } else if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
             self.flush_reveal();
         }
         match event {
@@ -14058,15 +14090,20 @@ impl App {
                 self.set_activity(t("Thinking…").into());
             }
             Event::Reasoning(text) => {
+                // (with the frames, as the answer goes in: a piece at a time, each an insertion and a drawing of the transcript of its own, it took the
+                // app's thread a share of a CPU whose cores are what a partially resident model's decode is held by)
                 if self.settings.show_thinking {
-                    self.append(&text, Style::Thinking);
+                    self.thinking_reveal.push_str(&text);
                     self.line_start = text.ends_with('\n');
                     self.thinking_written = true;
+                    self.want_frames();
                 }
                 self.thinking.push_str(&text);
                 self.set_activity(t("Thinking…").into());
             }
             Event::Content(text) => {
+                // (the thinking that waits came before it)
+                self.flush_thinking();
                 if self.answer.is_empty() {
                     // (the words coming say so: the ring alone says it is not done)
                     self.set_activity(" ".into());
@@ -18877,6 +18914,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             last_answer: String::new(),
             pending_text: String::new(),
             reveal: String::new(),
+            thinking_reveal: String::new(),
+            thinking_revealed_at: std::time::Instant::now(),
             stream_mask: crate::mask::StreamMask::default(),
             revealed_at: std::time::Instant::now(),
             revealing: false,
