@@ -923,9 +923,14 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 
 /// In one turn of the person's, at most: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
 /// note three times in one turn only delayed its first stroke. Once a file is written (when code in its reasoning may be the plan of an edit), only a draft
-/// of more than `LONG_DRAFT_LINES` is stopped; after a stop, with its reasoning kept, one of `DRAFT_LINES_AFTER_STOP`. Not watched at all after the third,
-/// a real turn wrote a whole page of 101,903 characters in its reasoning (567 s) and then wrote it again with create_file.
+/// of more than `LONG_DRAFT_LINES` is stopped; after a stop, with its reasoning kept, one of `DRAFT_LINES_AFTER_STOP`. After the third, only a whole page
+/// (`WHOLE_PAGE_LINES`), once: unwatched, a real turn wrote a whole page of 101,903 characters in its reasoning (567 s) and then wrote it again with create_file.
 const MAX_DRAFTS_STOPPED: u32 = 3;
+/// Past the third stop, one more draft is stopped, of a whole page alone: more than this many lines of code of its own. Over the 345 reasonings kept in 17 of
+/// the owner's sessions, replayed, a watch at this line stopped one, the 101,903 characters above, at 77,412 of them, whose create_file then wrote none of
+/// its 770 lines as they were; it stopped no reasoning that ended in an answer or another tool's call. (At 300 lines it stopped one more, of 59,196
+/// characters, whose file took 3% of its draft; at 500, the same one, later.)
+const WHOLE_PAGE_LINES: usize = 400;
 /// The rounds a goal has when the model does not say (set_goal's `rounds`), and the most it may ask for.
 const GOAL_ROUNDS: u32 = 12;
 const MOST_GOAL_ROUNDS: u32 = 30;
@@ -3135,16 +3140,18 @@ impl Agent {
             // Only where a file may change: a draft in a turn the person asked for no change in, or in plan mode, is the model thinking with code, whose answer will have it once.
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
             let files_may_change = self.mode != Mode::Plan && !self.turn_is_read_only();
-            let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && files_may_change;
-            // (after a stop, a lower line; once a file is written with no stop yet, a higher one, for the plan of an edit)
-            let (line, watch_on) = if drafts_stopped > 0 {
+            let may_stop_drafting = cuts && drafts_stopped <= MAX_DRAFTS_STOPPED && files_may_change;
+            // (after a stop, a lower line; once a file is written with no stop yet, a higher one, for the plan of an edit; past the most, a whole page's)
+            let (line, watch_on) = if drafts_stopped >= MAX_DRAFTS_STOPPED {
+                (WHOLE_PAGE_LINES + 1, "on:whole_page")
+            } else if drafts_stopped > 0 {
                 (DRAFT_LINES_AFTER_STOP, "on:after_stop")
             } else if wrote {
                 (LONG_DRAFT_LINES + 1, "on:long")
             } else {
                 (DRAFT_LINES, "on")
             };
-            let watch_is = if may_stop_drafting { watch_on } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
+            let watch_is = if may_stop_drafting { watch_on } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped > MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
             let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages), line));
             // The app's own stop (of a draft) ends the stream through a flag of the stream's: on the person's,
@@ -9831,7 +9838,7 @@ Body").unwrap();
     }
 
     /// After a first stop, a draft is stopped again at a lower line (`DRAFT_LINES_AFTER_STOP`: shorter than the first stop's, and than a whole file's once
-    /// one is written), and three times in a turn at most: then its call goes through.
+    /// one is written), and three times in a turn at most: then a draft shorter than a whole page (`WHOLE_PAGE_LINES`) goes through with its call.
     #[test]
     fn after_the_first_stop_a_draft_is_stopped_at_a_lower_line_and_three_at_most() {
         let dir = crate::in_container::tempdir().unwrap();
@@ -9861,7 +9868,40 @@ Body").unwrap();
         assert_eq!(notes, 3);
         assert!(dir.path().join("index.html").is_file());
         let watched: Vec<String> = of_kind(&trajectory_of(&run), "request").iter().map(|line| line["draft_watch"].as_str().unwrap_or("").to_string()).collect();
-        assert_eq!(watched[..4], ["on", "on:after_stop", "on:after_stop", "off:stopped_most"], "{watched:?}");
+        assert_eq!(watched[..4], ["on", "on:after_stop", "on:after_stop", "on:whole_page"], "{watched:?}");
+    }
+
+    /// Past the third stop, a whole page in its reasoning is stopped once more (a real turn's 101,903 characters, 567 s, went unwatched there and were typed
+    /// again with create_file); then nothing is.
+    #[test]
+    fn past_the_third_stop_a_whole_page_is_stopped_once_more_and_then_nothing() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
+        let long = |text: String| -> Vec<Value> { std::iter::once(think(&text)).chain((0..400).map(|_| think(" more of it"))).collect() };
+        let between = DRAFT_LINES_AFTER_STOP + 5;
+        const _: () = assert!(WHOLE_PAGE_LINES > LONG_DRAFT_LINES);
+        let mut last = vec![think(&format!("The page again.\n{}", fenced(&code_lines(WHOLE_PAGE_LINES + 10))))];
+        last.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
+        let (client, bodies) = trickling_server(vec![
+            long(format!("Plan.\n{}", fenced(&code_lines(DRAFT_LINES + 2)))),
+            long(format!("Again.\n{}", fenced(&code_lines(between)))),
+            long(format!("And again.\n{}", fenced(&code_lines(between)))),
+            long(format!("The whole page.\n{}", fenced(&code_lines(WHOLE_PAGE_LINES + 10)))),
+            last,
+            vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 6, "four stops, then its call: {log:?}");
+        let notes = bodies[5]["messages"].as_array().unwrap().iter()
+            .filter(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))).count();
+        assert_eq!(notes, 4);
+        assert!(dir.path().join("index.html").is_file());
+        let watched: Vec<String> = of_kind(&trajectory_of(&run), "request").iter().map(|line| line["draft_watch"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(watched[..5], ["on", "on:after_stop", "on:after_stop", "on:whole_page", "off:stopped_most"], "{watched:?}");
     }
 
     /// Once a file is written, a whole file in its reasoning is still stopped (a real one, 101,903 characters and 567 s, was written again with create_file);
