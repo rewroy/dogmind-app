@@ -1450,27 +1450,36 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
     limit_to(root, &git.join("hooks"), sid, &[(READ_EXECUTE, everything)], Walk::Yes)
 }
 
-/// How far under the workspace a repository is looked for. A hook in one deeper or in what is skipped runs only for a person who goes there and uses git.
-/// Every folder to that depth is looked at: the look stopped at 4,000 folders, and a workspace of a game's assets (16,142 folders to that depth) had a
-/// repository at the 9,914th, whose hooks a command could then have changed.
-const REPOSITORY_DEPTH: usize = 8;
-const MOST_REPOSITORIES: usize = 64;
+/// How far under the workspace a repository is looked for, and for how long at most: every folder is looked at, every repository found guarded, until
+/// one of these is reached. The look stopped at 4,000 folders and at depth 8, and a workspace of a game's assets (30,252 folders, 15 deep) had a
+/// repository at the 9,914th folder, whose hooks a command could then have changed; all of it is looked at in 260-300 ms. Where folders are left
+/// unlooked at, the person is told so ([`repositories_left_unguarded`]). A hook in what is skipped runs only for a person who goes there and uses git.
+const REPOSITORY_DEPTH: usize = 64;
+const LOOK_TIME_MOST: Duration = Duration::from_secs(2);
 const NO_REPOSITORIES_HERE: [&str; 6] = ["node_modules", "target", ".venv", "venv", "__pycache__", crate::bundled::PY_DEPS];
 
 /// What git would use in each repository under a folder: a `.git`, or a folder that is a bare repository, which git takes as one when it is run there. The nearest first. It is done
 /// before and after every command, over every folder to [`REPOSITORY_DEPTH`]: each level's folders are read on several threads ([`look_in_folders`]) and taken in the order one thread
 /// would have taken them, so what is found, and in what order, is the same.
 fn repositories_under(root: &Path) -> Vec<PathBuf> {
+    let (found, left) = repositories_within(root, Instant::now() + LOOK_TIME_MOST);
+    LEFT_UNLOOKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new).insert(key(root), left);
+    found
+}
+
+/// The repositories under `root`, as [`repositories_under`] finds them, and whether folders were left unlooked at: past [`REPOSITORY_DEPTH`], or past
+/// `until` (looked at a level at a time).
+fn repositories_within(root: &Path, until: Instant) -> (Vec<PathBuf>, bool) {
     let (mut found, mut level) = (Vec::new(), vec![root.to_path_buf()]);
-    for _ in 0..=REPOSITORY_DEPTH {
+    for depth in 0..=REPOSITORY_DEPTH {
         if level.is_empty() {
-            break;
+            return (found, false);
+        }
+        if depth > 0 && Instant::now() >= until {
+            return (found, true);
         }
         let mut next = Vec::new();
         for (folder, look) in level.iter().zip(look_in_folders(&level)) {
-            if found.len() >= MOST_REPOSITORIES {
-                return found;
-            }
             found.extend(look.gits);
             if look.bare {
                 found.push(folder.clone());
@@ -1480,7 +1489,17 @@ fn repositories_under(root: &Path) -> Vec<PathBuf> {
         }
         level = next;
     }
-    found
+    (found, !level.is_empty())
+}
+
+/// Whether the last look under each workspace left folders unlooked at.
+static LEFT_UNLOOKED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+/// Whether the last look for repositories under `root`, before or after a command, left folders unlooked at (deeper than [`REPOSITORY_DEPTH`], or
+/// more than [`LOOK_TIME_MOST`] can look at): a repository there is not guarded, and a command could change its hooks, for git to run them outside
+/// the sandbox when the person uses it there.
+pub fn repositories_left_unguarded(root: &Path) -> bool {
+    LEFT_UNLOOKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().and_then(|left| left.get(&key(root)).copied()).unwrap_or(false)
 }
 
 /// What one folder holds for the walk for repositories: its `.git` entries, whether it is a bare repository itself, and the folders in it to go into.
@@ -5103,8 +5122,9 @@ mod tests {
     }
 
     /// A repository past the first 4,000 folders is found, as a game's assets workspace had one at the 9,914th: the look goes over every folder to
-    /// its depth. And the folders read on several threads give what one thread reading them in order gives, the order of what is found too: the
-    /// nearest first, bare repositories among them, the skipped folders and the depth kept.
+    /// its depth, 64, and finds every repository, more than the 64 it stopped at. And the folders read on several threads give what one thread
+    /// reading them in order gives, the order of what is found too: the nearest first, bare repositories among them, the skipped folders and the
+    /// depth kept. Folders left past the depth, or the time, are said to be.
     #[test]
     fn every_folder_to_the_depth_is_looked_at_and_on_several_threads_as_on_one() {
         fn walked_alone(root: &Path) -> Vec<PathBuf> {
@@ -5112,9 +5132,6 @@ mod tests {
             for _ in 0..=REPOSITORY_DEPTH {
                 let mut next = Vec::new();
                 for folder in &level {
-                    if found.len() >= MOST_REPOSITORIES {
-                        return found;
-                    }
                     let look = look_in_folder(folder);
                     found.extend(look.gits);
                     if look.bare {
@@ -5143,13 +5160,30 @@ mod tests {
         std::fs::create_dir_all(bare.join("objects")).unwrap();
         std::fs::create_dir_all(bare.join("refs")).unwrap();
         std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let deep: PathBuf = (0..10).fold(place.join("assets03"), |path, level| path.join(format!("d{level}")));
+        // (a repository 12 deep, which the look at depth 8 did not see, and one past the depth of 64)
+        let twelve: PathBuf = (0..10).fold(place.join("assets03"), |path, level| path.join(format!("d{level}")));
+        std::fs::create_dir_all(twelve.join(".git")).unwrap();
+        let deep: PathBuf = (0..REPOSITORY_DEPTH).fold(place.join("assets04"), |path, _| path.join("d"));
         std::fs::create_dir_all(deep.join(".git")).unwrap();
+        // (and more repositories than the look stopped at before: 80)
+        for many in 0..80 {
+            std::fs::create_dir_all(place.join(format!("assets05\\set{many:02}\\.git"))).unwrap();
+        }
         let found = repositories_under(&place);
         assert!(found.contains(&place.join("assets89\\set49\\.git")) && found.contains(&place.join("assets00\\set00\\a\\b\\.git")), "{found:?}");
         assert!(found.contains(&bare) && !found.iter().any(|git| git.starts_with(place.join("assets01\\node_modules"))), "{found:?}");
-        assert!(!found.contains(&deep.join(".git")), "past the depth: {found:?}");
+        assert!(found.contains(&twelve.join(".git")) && !found.contains(&deep.join(".git")), "the depths: {found:?}");
+        assert_eq!(found.iter().filter(|git| git.starts_with(place.join("assets05"))).count(), 80);
         assert_eq!(found, walked_alone(&place));
+        assert!(repositories_left_unguarded(&place), "folders past the depth were left, and it is said");
+        // (a workspace looked at whole leaves nothing)
+        let whole = holder.path().join("whole");
+        std::fs::create_dir_all(whole.join("a\\b\\.git")).unwrap();
+        assert_eq!(repositories_under(&whole), vec![whole.join("a\\b\\.git")]);
+        assert!(!repositories_left_unguarded(&whole));
+        // (and a look out of time leaves the rest, and says so)
+        let (_, left) = repositories_within(&place, Instant::now());
+        assert!(left);
     }
 
     /// What is not a link goes on as it did: a `.git` file in the workspace reaches a folder in it, a repository that was there before is not touched whatever a worktree says, and a place outside

@@ -681,6 +681,7 @@ const JA: &[(&str, &str)] = &[
     ("Downloading Dogmind {0}… {1}%", "Dogmind {0} をダウンロードしています… {1}%"),
     ("Dogmind {0} is ready to install.", "Dogmind {0} をインストールする準備ができました。"),
     ("Update: Dogmind {0}, Straydog {1}", "更新: Dogmind {0}・Straydog {1}"),
+    ("Some folders of this workspace are deeper, or more, than the app looks through before and after a command: a git repository there is not guarded, and a command could change its hooks, which git would run outside the sandbox when you use it there.", "このワークスペースには、コマンドの前後にアプリが確認する深さや量を超えるフォルダがあります。その先の git リポジトリは守られていないため、コマンドがその hooks を書き換えられます。そこで git を使うと、それがサンドボックスの外で実行されます。"),
     ("Straydog {0} is ready.", "Straydog {0} の準備ができました。"),
     ("The update download was cancelled, and its partial file deleted. The next automatic look tries again.", "更新のダウンロードを中止し、途中のファイルを削除しました。次の自動確認でもう一度試します。"),
     ("The update was not downloaded: this connection is metered. Check for updates downloads it anyway.", "更新はダウンロードしませんでした。この接続は従量制です。「更新を確認」を押すとダウンロードします。"),

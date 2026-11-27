@@ -361,6 +361,9 @@ pub struct PlanReview {
     pub answer: Sender<Result<(), String>>,
 }
 
+/// What the person is told, once a conversation, when the look for repositories before and after a command left folders of the workspace unlooked at.
+pub const UNGUARDED_REPOSITORIES: &str = "Some folders of this workspace are deeper, or more, than the app looks through before and after a command: a git repository there is not guarded, and a command could change its hooks, which git would run outside the sandbox when you use it there.";
+
 pub enum Event {
     SessionStarted { path: PathBuf, workspace: PathBuf, transcript: Vec<Message> },
     /// A new session's first message has given it a file.
@@ -1640,6 +1643,8 @@ struct Agent {
     japanese_system: bool,
     /// Kana have been typed in this conversation: what follows stays Japanese, however short.
     japanese_session: bool,
+    /// The person was told, in this conversation, that the look for repositories left folders of the workspace unlooked at.
+    told_unguarded: bool,
     live: Arc<Mutex<Live>>,
     instructions: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -1927,6 +1932,7 @@ impl Agent {
             language: config.language,
             japanese_system: config.japanese_system,
             japanese_session: false,
+            told_unguarded: false,
             live: Arc::new(Mutex::new(Live { mode: Mode::Default, effort: None, safe_commands: false })),
             instructions: config.instructions,
             repeated: HashSet::new(),
@@ -2355,6 +2361,7 @@ impl Agent {
         self.emit(Event::Goal(None));
         (self.web_from, self.web_untold, self.web_told) = (Vec::new(), false, false);
         self.japanese_session = false;
+        self.told_unguarded = false;
         self.rewound.clear();
         self.read_only = false;
         self.emit(Event::WebSeen(false));
@@ -2407,6 +2414,7 @@ impl Agent {
                 self.added_due = self.added_untold();
                 self.web_rules_due = false;
                 self.japanese_session = false;
+                self.told_unguarded = false;
                 self.rewound.clear();
                 (self.web_from, self.web_untold) = (remembered.web_from, remembered.web_untold);
                 self.web_told = self.web_seen();
@@ -4146,6 +4154,11 @@ impl Agent {
         // A command left running in the background is not followed.)
         let began = (name == "execute_command" && arguments.get("background").and_then(Value::as_bool) != Some(true)).then(std::time::SystemTime::now);
         let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
+        // (the look for repositories before and after a command stopped short of some of the workspace: said once a conversation)
+        if matches!(name, "execute_command" | "check_page") && !self.told_unguarded && crate::sandbox::repositories_left_unguarded(&self.workspace) {
+            self.told_unguarded = true;
+            self.emit(Event::Notice(UNGUARDED_REPOSITORIES.to_string()));
+        }
         if let Some(began) = began {
             let touched = crate::checkpoint::touched_since(&self.workspace, began);
             if !touched.is_empty() {
