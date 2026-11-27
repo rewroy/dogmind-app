@@ -215,9 +215,13 @@ impl Assembly {
                 let at = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let (Some(block), Some(delta)) = (self.blocks.get_mut(at), event.get("delta")) else { return Ok(()) };
                 let text = |name: &str| delta.get(name).and_then(Value::as_str).unwrap_or("");
-                let grow = |block: &mut Map<String, Value>, field: &str, more: &str| {
-                    let known = block.get(field).and_then(Value::as_str).unwrap_or("").to_string();
-                    block.insert(field.to_string(), Value::String(known + more));
+                // (in place: a long answer or thinking comes in thousands of pieces, and copying all that had come again for each one cost the
+                // square of its length)
+                let grow = |block: &mut Map<String, Value>, field: &str, more: &str| match block.get_mut(field) {
+                    Some(Value::String(known)) => known.push_str(more),
+                    _ => {
+                        block.insert(field.to_string(), Value::String(more.to_string()));
+                    }
                 };
                 match delta.get("type").and_then(Value::as_str).unwrap_or("") {
                     "text_delta" => {
@@ -489,6 +493,32 @@ mod tests {
         let blocks = assistant_blocks(&message);
         assert_eq!(blocks[0], json!({"type": "thinking", "thinking": "hm", "signature": "sig"}));
         assert_eq!(blocks[2]["input"], json!({"path": "a"}));
+    }
+
+    /// Thinking and text that come in many pieces are put together in place, as they came, and a block that started without the field
+    /// (or with another kind of value in it) takes its first piece as the whole of it.
+    #[test]
+    fn many_pieces_of_thinking_and_text_are_put_together_as_they_came() {
+        let mut events = vec![
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": null}}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}),
+        ];
+        let (mut thought, mut said) = (String::new(), String::new());
+        for piece in 0..2000 {
+            let (thinking, text) = (format!("t{piece} "), format!("{piece}語 "));
+            events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}}));
+            events.push(json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": text}}));
+            thought.push_str(&thinking);
+            said.push_str(&text);
+        }
+        events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "si"}}));
+        events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "g"}}));
+        events.push(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}));
+        let completion = feed(&events).finish().unwrap();
+        assert_eq!(completion.content, said);
+        let blocks = assistant_blocks(&completion.message());
+        assert_eq!((blocks[0]["thinking"].as_str(), blocks[0]["signature"].as_str()), (Some(thought.as_str()), Some("sig")));
+        assert_eq!(blocks[1]["text"].as_str(), Some(said.as_str()));
     }
 
     #[test]
