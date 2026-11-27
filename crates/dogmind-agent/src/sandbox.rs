@@ -1451,44 +1451,86 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
 }
 
 /// How far under the workspace a repository is looked for. A hook in one deeper or in what is skipped runs only for a person who goes there and uses git.
+/// Every folder to that depth is looked at: the look stopped at 4,000 folders, and a workspace of a game's assets (16,142 folders to that depth) had a
+/// repository at the 9,914th, whose hooks a command could then have changed.
 const REPOSITORY_DEPTH: usize = 8;
-const MOST_FOLDERS_LOOKED_AT: usize = 4000;
 const MOST_REPOSITORIES: usize = 64;
 const NO_REPOSITORIES_HERE: [&str; 6] = ["node_modules", "target", ".venv", "venv", "__pycache__", crate::bundled::PY_DEPS];
 
-/// What git would use in each repository under a folder: a `.git`, or a folder that is a bare repository, which git takes as one when it is run there. The nearest first, with what a look of this
-/// size finds. It is done before and after every command.
+/// What git would use in each repository under a folder: a `.git`, or a folder that is a bare repository, which git takes as one when it is run there. The nearest first. It is done
+/// before and after every command, over every folder to [`REPOSITORY_DEPTH`]: each level's folders are read on several threads ([`look_in_folders`]) and taken in the order one thread
+/// would have taken them, so what is found, and in what order, is the same.
 fn repositories_under(root: &Path) -> Vec<PathBuf> {
-    let (mut found, mut level, mut looked) = (Vec::new(), vec![root.to_path_buf()], 0usize);
+    let (mut found, mut level) = (Vec::new(), vec![root.to_path_buf()]);
     for _ in 0..=REPOSITORY_DEPTH {
+        if level.is_empty() {
+            break;
+        }
         let mut next = Vec::new();
-        for folder in &level {
-            looked += 1;
-            if looked > MOST_FOLDERS_LOOKED_AT || found.len() >= MOST_REPOSITORIES {
+        for (folder, look) in level.iter().zip(look_in_folders(&level)) {
+            if found.len() >= MOST_REPOSITORIES {
                 return found;
             }
-            let (mut inner, mut bare_marks) = (Vec::new(), 0);
-            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                // (an entry's own type, which does not follow a link: a junction is no folder here, and is never gone down into. A `.git` that is a link is found all the same, for the
-                // guard to refuse it and for the disarming not to go through it)
-                let folder_there = entry.file_type().is_ok_and(|kind| kind.is_dir());
-                bare_marks += usize::from(if folder_there { matches!(name.as_str(), "objects" | "refs") } else { name == "head" });
-                if name == ".git" {
-                    found.push(entry.path());
-                } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) && !NO_REPOSITORIES_HERE.iter().any(|skipped| name.eq_ignore_ascii_case(skipped)) {
-                    inner.push(entry.path());
-                }
-            }
-            if bare_marks == 3 {
+            found.extend(look.gits);
+            if look.bare {
                 found.push(folder.clone());
             } else {
-                next.append(&mut inner);
+                next.extend(look.inner);
             }
         }
         level = next;
     }
     found
+}
+
+/// What one folder holds for the walk for repositories: its `.git` entries, whether it is a bare repository itself, and the folders in it to go into.
+#[derive(Default)]
+struct FolderLook {
+    gits: Vec<PathBuf>,
+    bare: bool,
+    inner: Vec<PathBuf>,
+}
+
+fn look_in_folder(folder: &Path) -> FolderLook {
+    let (mut look, mut bare_marks) = (FolderLook::default(), 0);
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        // (an entry's own type, which does not follow a link: a junction is no folder here, and is never gone down into. A `.git` that is a link is found all the same, for the
+        // guard to refuse it and for the disarming not to go through it)
+        let folder_there = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        bare_marks += usize::from(if folder_there { matches!(name.as_str(), "objects" | "refs") } else { name == "head" });
+        if name == ".git" {
+            look.gits.push(entry.path());
+        } else if folder_there && !NO_REPOSITORIES_HERE.iter().any(|skipped| name.eq_ignore_ascii_case(skipped)) {
+            look.inner.push(entry.path());
+        }
+    }
+    look.bare = bare_marks == 3;
+    look
+}
+
+/// Each folder's look, in the folders' order: on several threads where there are enough of them for it to pay (a level of a game's assets
+/// workspace held thousands).
+fn look_in_folders(folders: &[PathBuf]) -> Vec<FolderLook> {
+    const ALONE_UNDER: usize = 32;
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get()).min(8);
+    if folders.len() < ALONE_UNDER || threads < 2 {
+        return folders.iter().map(|folder| look_in_folder(folder)).collect();
+    }
+    let at = std::sync::atomic::AtomicUsize::new(0);
+    let mut looks: Vec<(usize, FolderLook)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads).map(|_| scope.spawn(|| {
+            let mut mine = Vec::new();
+            loop {
+                let index = at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(folder) = folders.get(index) else { return mine };
+                mine.push((index, look_in_folder(folder)));
+            }
+        })).collect();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap_or_default()).collect()
+    });
+    looks.sort_unstable_by_key(|(index, _)| *index);
+    looks.into_iter().map(|(_, look)| look).collect()
 }
 
 /// The repositories known of in each workspace: those there at the first command, and those made since and looked at.
@@ -5058,6 +5100,56 @@ mod tests {
         assert!(found.iter().all(|git| !git.starts_with(place.join("away")) && !git.starts_with(&standin)), "a junction was looked into: {found:?}");
         assert_eq!(found.len(), 2, "{found:?}");
         drop(links);
+    }
+
+    /// A repository past the first 4,000 folders is found, as a game's assets workspace had one at the 9,914th: the look goes over every folder to
+    /// its depth. And the folders read on several threads give what one thread reading them in order gives, the order of what is found too: the
+    /// nearest first, bare repositories among them, the skipped folders and the depth kept.
+    #[test]
+    fn every_folder_to_the_depth_is_looked_at_and_on_several_threads_as_on_one() {
+        fn walked_alone(root: &Path) -> Vec<PathBuf> {
+            let (mut found, mut level) = (Vec::new(), vec![root.to_path_buf()]);
+            for _ in 0..=REPOSITORY_DEPTH {
+                let mut next = Vec::new();
+                for folder in &level {
+                    if found.len() >= MOST_REPOSITORIES {
+                        return found;
+                    }
+                    let look = look_in_folder(folder);
+                    found.extend(look.gits);
+                    if look.bare {
+                        found.push(folder.clone());
+                    } else {
+                        next.extend(look.inner);
+                    }
+                }
+                level = next;
+            }
+            found
+        }
+        let holder = crate::in_container::tempdir().unwrap();
+        let place = holder.path().join("work");
+        // (4,500 folders over two levels, a repository under the last of them and another two levels down, one in a skipped folder, a bare one, and
+        // one past the depth)
+        for group in 0..90 {
+            for leaf in 0..50 {
+                std::fs::create_dir_all(place.join(format!("assets{group:02}\\set{leaf:02}"))).unwrap();
+            }
+        }
+        std::fs::create_dir_all(place.join("assets89\\set49\\.git")).unwrap();
+        std::fs::create_dir_all(place.join("assets00\\set00\\a\\b\\.git")).unwrap();
+        std::fs::create_dir_all(place.join("assets01\\node_modules\\pkg\\.git")).unwrap();
+        let bare = place.join("assets02\\set03\\mirror.git");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let deep: PathBuf = (0..10).fold(place.join("assets03"), |path, level| path.join(format!("d{level}")));
+        std::fs::create_dir_all(deep.join(".git")).unwrap();
+        let found = repositories_under(&place);
+        assert!(found.contains(&place.join("assets89\\set49\\.git")) && found.contains(&place.join("assets00\\set00\\a\\b\\.git")), "{found:?}");
+        assert!(found.contains(&bare) && !found.iter().any(|git| git.starts_with(place.join("assets01\\node_modules"))), "{found:?}");
+        assert!(!found.contains(&deep.join(".git")), "past the depth: {found:?}");
+        assert_eq!(found, walked_alone(&place));
     }
 
     /// What is not a link goes on as it did: a `.git` file in the workspace reaches a folder in it, a repository that was there before is not touched whatever a worktree says, and a place outside
