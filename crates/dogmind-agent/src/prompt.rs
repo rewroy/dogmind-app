@@ -459,6 +459,12 @@ pub fn check_failed(line: &str, status: &str) -> String {
 
 /// What the model is told when its answer ended with a tool call written out as text, which the server could not read as a call: nothing ran, and the turn would
 /// have ended with that markup as its answer.
+/// After an answer that wrote its tool call in its reasoning and ended there, the thinking never closed: the server read the call as reasoning.
+pub fn call_in_reasoning(tool: Option<&str>) -> String {
+    let which = tool.map_or(String::new(), |tool| format!(" (`{tool}`)"));
+    format!("[From the app, not the user] Your last message wrote a tool call{which} in your reasoning, and ended there: the call was read as reasoning, and nothing ran. End your reasoning, then make the call as a tool call.")
+}
+
 pub fn call_as_text(tool: Option<&str>) -> String {
     let which = tool.map_or(String::new(), |tool| format!(" (`{tool}`)"));
     format!("[From the app, not the user] Your last message wrote a tool call{which} out as text, and it could not be read as a call: nothing ran. Make the call again, as a tool call. If you meant no call, give your answer without that markup.")

@@ -3462,6 +3462,17 @@ impl Agent {
             if completion.finish.is_empty() && !has_calls && completion.content.is_empty() {
                 return Ended::Failed(llm::UNFINISHED.into());
             }
+            // A call written in the reasoning, which then ended with nothing said and no call: a DeepSeek model on a served Straydog wrote `<｜DSML｜ calls>` to
+            // `</｜DSML｜ calls>` with its thinking never closed, and the server passed it all on as reasoning. Asked again, the same came back as often (9 times in
+            // 20 of one first request), and a turn failed with nothing done. Once a turn, the call goes to the answer's text, where a call written out as text is
+            // told of below, and the model makes it.
+            let mut call_in_reasoning = false;
+            if !has_calls && !markup_told && completion.content.trim().is_empty() {
+                if let Some(at) = call_markup_at(&completion.reasoning) {
+                    completion.content = completion.reasoning.split_off(at);
+                    call_in_reasoning = true;
+                }
+            }
             // Nothing said and nothing asked for: a person would see the turn end blank, and a service refuses an assistant message with nothing in it
             // for the rest of the conversation. It does not join; the same request goes again.
             if !has_calls && completion.content.trim().is_empty() {
@@ -3547,8 +3558,10 @@ impl Agent {
             if let (false, Some(at)) = (markup_told, call_markup_at(&completion.content)) {
                 markup_told = true;
                 let tool = tool_in_markup(&completion.content[at..]);
-                self.intervened("call_as_text", json!({"chars": completion.content[at..].chars().count(), "tool": tool}));
-                self.push(Message::text("user", prompt::call_as_text(tool.as_deref())));
+                let kind = if call_in_reasoning { "call_in_reasoning" } else { "call_as_text" };
+                self.intervened(kind, json!({"chars": completion.content[at..].chars().count(), "tool": tool}));
+                let note = if call_in_reasoning { prompt::call_in_reasoning(tool.as_deref()) } else { prompt::call_as_text(tool.as_deref()) };
+                self.push(Message::text("user", note));
                 continue;
             }
             // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
@@ -8833,6 +8846,38 @@ Body").unwrap();
         let (failed, _) = turn_said(&run);
         assert!(failed[0].contains("cut off"), "{failed:?}");
         assert_eq!(provider.requests() as u32, MAX_CONTINUES + 1);
+    }
+
+    /// A call written in the reasoning, the thinking never closed and nothing said (as a served DeepSeek's first answers came back, in up to 9 of 20): not
+    /// asked for again as it was, which brought the same, but once a turn its call goes to the answer's text and the model is told, and it makes the call.
+    /// Told once: the next such answer is asked for again, as an empty one is.
+    #[test]
+    fn a_call_written_in_the_reasoning_is_told_of_once_and_not_asked_for_again_as_it_was() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let markup = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"list_files\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let in_reasoning = move || -> Step {
+            Box::new(move |_: &AtomicBool| Ok(llm::Completion { reasoning: format!("Let me look at the files.\n\n{markup}"), finish: "stop".into(), ..llm::Completion::default() }))
+        };
+        let (run, provider) = scripted(dir.path(), vec![in_reasoning(), calls(&[("list_files", serde_json::json!({"path": "."}))]), says("One file.")], Mode::Default);
+        run.handle.commands.send(Command::Send("what is here".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(log.iter().filter(|line| line.starts_with("tool:true")).count(), 1, "the call it then made ran: {log:?}");
+        assert_eq!(provider.requests(), 3);
+        let second = provider.messages(1);
+        let kept = &second[second.len() - 2];
+        assert_eq!((kept.content.as_deref(), kept.reasoning_content.as_deref()), (Some(markup), Some("Let me look at the files.\n\n")), "the call in the text, the rest its reasoning");
+        let note = user_text(second.last().unwrap());
+        assert!(note.contains("(`list_files`)") && note.contains("in your reasoning") && note.contains("nothing ran"), "{note}");
+        assert!(of_kind(&trajectory_of(&run), "intervention").iter().any(|line| line["kind"] == "call_in_reasoning"), "said in the trajectory");
+
+        // (told once a turn: the second is asked for again as it was, as an empty answer is)
+        let (run, provider) = scripted(dir.path(), vec![in_reasoning(), in_reasoning(), says("Done.")], Mode::Default);
+        run.handle.commands.send(Command::Send("what is here".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert!(log.iter().all(|line| !line.starts_with("failed:")), "{log:?}");
+        assert_eq!(provider.requests(), 3);
+        assert_eq!(provider.messages(2), provider.messages(1), "the same request");
     }
 
     #[test]
