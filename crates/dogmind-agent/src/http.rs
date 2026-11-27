@@ -328,21 +328,59 @@ fn in_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
     order
 }
 
-/// The first of these that takes the connection, trying the other family second.
+/// How long an address is tried alone before the next is begun beside it, the first to connect taken: the connection attempt delay of "Happy Eyeballs"
+/// (RFC 8305). A machine whose IPv6 has no route out waited out the IPv6 address's 1.5 s before every new connection to an API, IPv4 after it.
+const BEFORE_THE_NEXT_BEGINS: Duration = Duration::from_millis(250);
+
+/// The first of these that takes the connection: the first address begun, and the next beside it when that has not connected within
+/// [`BEFORE_THE_NEXT_BEGINS`] or has failed, the other family second; each with the time it had when they were tried one after another. A single
+/// address (this machine's Straydog) is tried alone, as it was.
 fn connect_to(addresses: &[SocketAddr], connect: Duration, cancel: &AtomicBool) -> Result<TcpStream, Failure> {
     let order = in_order(addresses);
-    let mut failed = None;
-    for (at, address) in order.iter().enumerate() {
+    if order.len() < 2 {
         if cancel.load(Ordering::Relaxed) {
             return Err(Failure::Cancelled);
         }
-        let allowed = if at + 1 < order.len() { connect.min(BEFORE_THE_NEXT_ADDRESS) } else { connect };
-        match TcpStream::connect_timeout(address, allowed) {
-            Ok(socket) => return Ok(socket),
-            Err(error) => failed = Some(format!("{address}: {error}")),
-        }
+        let Some(address) = order.first() else { return Err(Failure::Connect("no address".to_string())) };
+        return TcpStream::connect_timeout(address, connect).map_err(|error| Failure::Connect(format!("{address}: {error}")));
     }
-    Err(Failure::Connect(failed.unwrap_or_else(|| "no address".to_string())))
+    let (said, heard) = std::sync::mpsc::channel::<(usize, io::Result<TcpStream>)>();
+    // (once one is taken, any that connects after it is let go: its socket closes as it goes)
+    let taken = std::sync::Arc::new(AtomicBool::new(false));
+    let (mut begun, mut ended, mut failed, mut next) = (0, 0, None, Instant::now());
+    let outcome = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Err(Failure::Cancelled);
+        }
+        if begun < order.len() && Instant::now() >= next {
+            let (address, allowed) = (order[begun], if begun + 1 < order.len() { connect.min(BEFORE_THE_NEXT_ADDRESS) } else { connect });
+            let (said, taken, at) = (said.clone(), taken.clone(), begun);
+            std::thread::spawn(move || {
+                let result = TcpStream::connect_timeout(&address, allowed);
+                if !taken.load(Ordering::SeqCst) {
+                    let _ = said.send((at, result));
+                }
+            });
+            begun += 1;
+            next = Instant::now() + BEFORE_THE_NEXT_BEGINS;
+        }
+        if ended == order.len() {
+            break Err(Failure::Connect(failed.unwrap_or_else(|| "no address".to_string())));
+        }
+        let wait = if begun < order.len() { next.saturating_duration_since(Instant::now()) } else { Duration::MAX };
+        match heard.recv_timeout(wait.clamp(Duration::from_millis(1), Duration::from_millis(20))) {
+            Ok((_, Ok(socket))) => break Ok(socket),
+            Ok((at, Err(error))) => {
+                ended += 1;
+                failed = Some(format!("{}: {error}", order[at]));
+                // (a failure begins the next at once)
+                next = Instant::now();
+            }
+            Err(_) => {}
+        }
+    };
+    taken.store(true, Ordering::SeqCst);
+    outcome
 }
 
 /// Whether anything takes a connection at this address.
@@ -677,6 +715,33 @@ pub(crate) mod tests {
         assert_eq!(socket.peer_addr().unwrap(), good);
         let failed = connect_to(&[closed], Duration::from_secs(5), &cancel).err().unwrap();
         assert!(matches!(failed, Failure::Connect(_)));
+    }
+
+    /// Where the first address does not answer, as an IPv6 one does on a machine whose IPv6 has no route out, the next is begun beside it 250 ms on, not
+    /// after its 1.5 s: the first connection to a server waits no more for it. And where the first, IPv6, answers, it is the one used.
+    #[test]
+    fn the_next_address_is_begun_beside_a_first_that_does_not_answer() {
+        // (a port nothing listens on: Windows tries it again for some 2 s before it says no, as an address with no route out waits)
+        let silent = {
+            let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            taken.local_addr().unwrap()
+        };
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let cancel = AtomicBool::new(false);
+        let began = Instant::now();
+        let socket = connect_to(&[silent, good], Duration::from_secs(5), &cancel).unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), good);
+        assert!(began.elapsed() < Duration::from_millis(1000), "{:?}", began.elapsed());
+        if let Ok(six) = std::net::TcpListener::bind("[::1]:0") {
+            let answering = six.local_addr().unwrap();
+            for _ in 0..5 {
+                assert_eq!(connect_to(&[answering, good], Duration::from_secs(5), &cancel).unwrap().peer_addr().unwrap(), answering, "IPv6, where it answers");
+            }
+        }
+        // (and a stop is heard while they are tried)
+        let stopped = AtomicBool::new(true);
+        assert!(matches!(connect_to(&[silent, good], Duration::from_secs(5), &stopped), Err(Failure::Cancelled)));
     }
 
     #[test]
