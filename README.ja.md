@@ -35,7 +35,7 @@ Windows 11 で、管理者権限なしで動きます。[Releases](https://githu
 
 | 種類 | 内容 | キー |
 | --- | --- | --- |
-| この PC の Straydog | アプリの横の `straydog.exe` | 不要 |
+| この PC の Straydog | 選んだときにアプリが取得する Straydog の最新リリース(約 0.6 GB)と、モデル | 不要 |
 | OpenAI 互換 | 別のマシンの Straydog や、同じ形の API を持つサービス | 貼り付け、または `env:NAME` |
 | Codex | 公式の Codex CLI を通した ChatGPT のプラン(先に `codex login`) | CLI のもの |
 | Claude | Messages API | 貼り付け、または `env:ANTHROPIC_API_KEY` |

@@ -457,6 +457,13 @@ pub fn check_failed(line: &str, status: &str) -> String {
     format!("[From the app, not the user] The last check after your change failed: `{line}` ended with {status}. First find out whether your change caused the failure: does it fail the same way without your change? What your change broke, fix, and run the check again. What failed before your change, do not fix: at the start of your answer, say which check fails and what shows it failed before your change.")
 }
 
+/// What the model is told after an answer that wrote its tool call in its reasoning and ended there, the thinking never closed: the server read the call as
+/// reasoning, and nothing ran.
+pub fn call_in_reasoning(tool: Option<&str>) -> String {
+    let which = tool.map_or(String::new(), |tool| format!(" (`{tool}`)"));
+    format!("[From the app, not the user] Your last message wrote a tool call{which} in your reasoning, and ended there: the call was read as reasoning, and nothing ran. End your reasoning, then make the call as a tool call.")
+}
+
 /// What the model is told when its answer ended with a tool call written out as text, which the server could not read as a call: nothing ran, and the turn would
 /// have ended with that markup as its answer.
 pub fn call_as_text(tool: Option<&str>) -> String {

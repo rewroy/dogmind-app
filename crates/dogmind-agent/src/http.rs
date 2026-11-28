@@ -1,6 +1,7 @@
 //! HTTP/1.1 over a socket, with the system's TLS for `https`, read so that a cancel can end a request at any moment. A
 //! request that ends early closes its connection, and that is what stops a server generating: Straydog hears nothing else,
-//! and a client that only stops reading holds up its next request for 30 s and more.
+//! and a client that only stops reading holds up its next request for 30 s and more. An `https` connection whose answer was
+//! read to its end is kept for the next request to that server ([`KEPT_FOR`]).
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -12,6 +13,63 @@ const POLL: Duration = Duration::from_millis(100);
 const IDLE_LIMIT: Duration = Duration::from_secs(1800);
 /// What a request that has a deadline says when the deadline comes before its answer is whole.
 const TOO_SLOW: &str = "the server did not answer in time";
+
+/// How long an `https` connection whose answer was read to its end is kept for the next request to its server, and how many to one server at most.
+/// A new one costs a TCP and a TLS handshake: about 240 ms to an API across the Pacific (measured), paid by each of a turn's 10 to 30 requests.
+const KEPT_FOR: Duration = Duration::from_secs(20);
+const KEPT_A_SERVER: usize = 4;
+
+/// A connection kept for its server's next request.
+struct Kept {
+    server: String,
+    stream: Transport,
+    since: Instant,
+}
+
+static KEPT: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+
+// Plain connections are kept too, on a test's own thread: its servers have no certificate.
+#[cfg(test)]
+thread_local! {
+    static KEEP_PLAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a connection for `url` is kept after its answer: an `https` one. A plain one is to this machine's Straydog, where a connection costs
+/// nothing, or through what reads plain HTTP on the way and resets it (`request_at`).
+fn kept_for_url(url: &Url) -> bool {
+    #[cfg(test)]
+    if KEEP_PLAIN.with(std::cell::Cell::get) {
+        return true;
+    }
+    url.tls
+}
+
+fn server_of(url: &Url) -> String {
+    format!("{}://{}:{}", if url.tls { "https" } else { "http" }, url.host.to_ascii_lowercase(), url.port)
+}
+
+/// A connection kept for `server`, the last one kept first; those kept too long are closed.
+fn take_kept(server: &str) -> Option<Transport> {
+    let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    kept.retain(|one| {
+        let fresh = one.since.elapsed() < KEPT_FOR;
+        if !fresh {
+            one.stream.shut();
+        }
+        fresh
+    });
+    let at = kept.iter().rposition(|one| one.server == server)?;
+    Some(kept.remove(at).stream)
+}
+
+fn keep(server: String, stream: Transport) {
+    let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if kept.iter().filter(|one| one.server == server).count() >= KEPT_A_SERVER {
+        stream.shut();
+        return;
+    }
+    kept.push(Kept { server, stream, since: Instant::now() });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Url {
@@ -215,7 +273,14 @@ pub struct Response<'a> {
     pub status: u16,
     /// By name in lower case.
     headers: Vec<(String, String)>,
-    stream: Transport,
+    /// None once it is gone: closed, or kept.
+    stream: Option<Transport>,
+    /// The server the connection may be kept for when the answer has been read to its end ([`kept_for_url`]).
+    keep_for: Option<String>,
+    /// The server's answer lets the connection be kept: HTTP/1.1, and no `Connection: close`.
+    keepable: bool,
+    /// The body has been read to its end: its length, or its last chunk and what follows it.
+    whole: bool,
     buffer: Vec<u8>,
     framing: Framing,
     cancel: &'a AtomicBool,
@@ -263,21 +328,59 @@ fn in_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
     order
 }
 
-/// The first of these that takes the connection, trying the other family second.
+/// How long an address is tried alone before the next is begun beside it, the first to connect taken: the connection attempt delay of "Happy Eyeballs"
+/// (RFC 8305). A machine whose IPv6 has no route out waited out the IPv6 address's 1.5 s before every new connection to an API, IPv4 after it.
+const BEFORE_THE_NEXT_BEGINS: Duration = Duration::from_millis(250);
+
+/// The first of these that takes the connection: the first address begun, and the next beside it when that has not connected within
+/// [`BEFORE_THE_NEXT_BEGINS`] or has failed, the other family second; each with the time it had when they were tried one after another. A single
+/// address (this machine's Straydog) is tried alone, as it was.
 fn connect_to(addresses: &[SocketAddr], connect: Duration, cancel: &AtomicBool) -> Result<TcpStream, Failure> {
     let order = in_order(addresses);
-    let mut failed = None;
-    for (at, address) in order.iter().enumerate() {
+    if order.len() < 2 {
         if cancel.load(Ordering::Relaxed) {
             return Err(Failure::Cancelled);
         }
-        let allowed = if at + 1 < order.len() { connect.min(BEFORE_THE_NEXT_ADDRESS) } else { connect };
-        match TcpStream::connect_timeout(address, allowed) {
-            Ok(socket) => return Ok(socket),
-            Err(error) => failed = Some(format!("{address}: {error}")),
-        }
+        let Some(address) = order.first() else { return Err(Failure::Connect("no address".to_string())) };
+        return TcpStream::connect_timeout(address, connect).map_err(|error| Failure::Connect(format!("{address}: {error}")));
     }
-    Err(Failure::Connect(failed.unwrap_or_else(|| "no address".to_string())))
+    let (said, heard) = std::sync::mpsc::channel::<(usize, io::Result<TcpStream>)>();
+    // (once one is taken, any that connects after it is let go: its socket closes as it goes)
+    let taken = std::sync::Arc::new(AtomicBool::new(false));
+    let (mut begun, mut ended, mut failed, mut next) = (0, 0, None, Instant::now());
+    let outcome = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Err(Failure::Cancelled);
+        }
+        if begun < order.len() && Instant::now() >= next {
+            let (address, allowed) = (order[begun], if begun + 1 < order.len() { connect.min(BEFORE_THE_NEXT_ADDRESS) } else { connect });
+            let (said, taken, at) = (said.clone(), taken.clone(), begun);
+            std::thread::spawn(move || {
+                let result = TcpStream::connect_timeout(&address, allowed);
+                if !taken.load(Ordering::SeqCst) {
+                    let _ = said.send((at, result));
+                }
+            });
+            begun += 1;
+            next = Instant::now() + BEFORE_THE_NEXT_BEGINS;
+        }
+        if ended == order.len() {
+            break Err(Failure::Connect(failed.unwrap_or_else(|| "no address".to_string())));
+        }
+        let wait = if begun < order.len() { next.saturating_duration_since(Instant::now()) } else { Duration::MAX };
+        match heard.recv_timeout(wait.clamp(Duration::from_millis(1), Duration::from_millis(20))) {
+            Ok((_, Ok(socket))) => break Ok(socket),
+            Ok((at, Err(error))) => {
+                ended += 1;
+                failed = Some(format!("{}: {error}", order[at]));
+                // (a failure begins the next at once)
+                next = Instant::now();
+            }
+            Err(_) => {}
+        }
+    };
+    taken.store(true, Ordering::SeqCst);
+    outcome
 }
 
 /// Whether anything takes a connection at this address.
@@ -317,12 +420,23 @@ fn request_at_until<'a>(addresses: &[SocketAddr], method: &str, url: &Url, heade
     }
 }
 
-/// One request, on a connection of its own. `lost_before_answer` says, when it fails, that the connection ended or was reset with no byte of the answer having come.
+/// One request: on a connection kept for its server, or a new one. `lost_before_answer` says, when it fails, that the connection ended or was reset with no byte of the answer having
+/// come. A kept connection that fails before a byte of its answer has come (its server closed it meanwhile) is let go, and the request goes once more, on a new connection: whether
+/// it is a POST or not, as its server never answered it.
 #[allow(clippy::too_many_arguments)]
 fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool, deadline: Option<Instant>, lost_before_answer: &mut bool) -> Result<Response<'a>, Failure> {
+    let server = kept_for_url(url).then(|| server_of(url));
+    if let Some(stream) = server.as_deref().and_then(take_kept) {
+        let mut nothing_came = false;
+        match ask(stream, true, method, url, headers, body, cancel, deadline, server.clone(), &mut nothing_came) {
+            Ok(response) => return Ok(response),
+            Err(_) if nothing_came && !cancel.load(Ordering::Relaxed) && deadline.is_none_or(|by| Instant::now() < by) => {}
+            Err(failure) => return Err(failure),
+        }
+    }
     let socket = connect_to(addresses, connect, cancel)?;
     let _ = socket.set_nodelay(true);
-    let mut stream = if url.tls {
+    let stream = if url.tls {
         // The handshake runs on a blocking socket; once it is done, reads poll as for a plain one.
         socket.set_read_timeout(Some(connect)).map_err(|error| Failure::Connect(error.to_string()))?;
         let connector = native_tls::TlsConnector::new().map_err(|error| Failure::Connect(error.to_string()))?;
@@ -345,7 +459,15 @@ fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: 
         socket.set_read_timeout(Some(POLL)).map_err(|error| Failure::Connect(error.to_string()))?;
         Transport::Plain(socket)
     };
-    // Keep-alive, and the connection closes when the response has been read: `Connection: close` meets resets on Windows.
+    ask(stream, false, method, url, headers, body, cancel, deadline, server, lost_before_answer)
+}
+
+/// The request on this connection (`kept`: one kept from an earlier request), and its answer's head. `nothing_came` says, when it fails, that not a byte of the answer had
+/// come: on a new connection, when it ended or was reset; on a kept one, whatever failed.
+#[allow(clippy::too_many_arguments)]
+fn ask<'a>(mut stream: Transport, kept: bool, method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, cancel: &'a AtomicBool, deadline: Option<Instant>, server: Option<String>, nothing_came: &mut bool) -> Result<Response<'a>, Failure> {
+    // Keep-alive: `Connection: close` meets resets on Windows. A connection whose answer was read to its end is kept for its server, if it may be; any other closes when the
+    // response goes.
     let host = if url.port == if url.tls { 443 } else { 80 } { url.host_for_header() } else { format!("{}:{}", url.host_for_header(), url.port) };
     let accept = if headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept")) { "" } else { "Accept: */*\r\n" };
     let mut head = format!("{method} {} HTTP/1.1\r\nHost: {host}\r\n{accept}Connection: keep-alive\r\n", url.path);
@@ -359,20 +481,33 @@ fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: 
     let sent = stream.send(head.as_bytes(), cancel).and_then(|()| stream.send(body.unwrap_or("").as_bytes(), cancel));
     if let Err(failure) = sent {
         stream.shut();
+        *nothing_came = kept;
         return Err(failure);
     }
-    let mut response = Response { status: 0, headers: Vec::new(), stream, buffer: Vec::new(), framing: Framing::Close, cancel, deadline, lost: false };
+    let sent_at = Instant::now();
+    let mut response = Response { status: 0, headers: Vec::new(), stream: Some(stream), keep_for: server, keepable: false, whole: false, buffer: Vec::new(),
+                                  framing: Framing::Close, cancel, deadline, lost: false };
     if let Err(failure) = response.read_head() {
-        *lost_before_answer = response.lost_with_nothing();
+        // (a kept connection its server had closed is closed at once, or reset: one that went quiet first may have had its request taken, a model's
+        // turn begun, which a second sending would make twice)
+        *nothing_came = response.lost_with_nothing() && (!kept || sent_at.elapsed() < CLOSED_WITHIN);
+        response.keep_for = None;
         return Err(failure);
     }
     Ok(response)
 }
 
-/// However a response ends: read to its end, cancelled, or failed.
+/// How soon after its request a kept connection is found closed, or reset, for the request to be taken as never having reached its server.
+const CLOSED_WITHIN: Duration = Duration::from_secs(2);
+
+/// However a response ends: read to its end (its connection kept, where it may be: [`KEPT_FOR`]), cancelled, or failed.
 impl Drop for Response<'_> {
     fn drop(&mut self) {
-        self.stream.shut();
+        let Some(stream) = self.stream.take() else { return };
+        match self.keep_for.take() {
+            Some(server) if self.keepable && self.whole && self.buffer.is_empty() && !self.lost && !self.cancel.load(Ordering::Relaxed) => keep(server, stream),
+            _ => stream.shut(),
+        }
     }
 }
 
@@ -403,7 +538,8 @@ impl Response<'_> {
             if self.deadline.is_some_and(|by| Instant::now() >= by) {
                 return Err(Failure::Stream(TOO_SLOW.into()));
             }
-            match self.stream.read(&mut block) {
+            let Some(stream) = self.stream.as_mut() else { return Ok(false) };
+            match stream.read(&mut block) {
                 Ok(0) => {
                     self.lost = true;
                     return Ok(false);
@@ -419,7 +555,7 @@ impl Response<'_> {
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    self.lost = matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted);
+                    self.lost = matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::UnexpectedEof);
                     return Err(Failure::Stream(error.to_string()));
                 }
             }
@@ -457,7 +593,30 @@ impl Response<'_> {
         if matches!(self.status, 100..=199 | 204 | 304) {
             self.framing = Framing::Length(0);
         }
+        let closes = self.header("connection").is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("close")));
+        self.keepable = head.starts_with("HTTP/1.1 ") && !closes;
         Ok(())
+    }
+
+    /// What follows a chunked body's last chunk, to its empty line: the trailers, if any. Read so that the connection is where the next answer begins.
+    fn read_trailers(&mut self) -> Result<(), Failure> {
+        loop {
+            let line = loop {
+                if let Some(at) = self.buffer.windows(2).position(|window| window == b"\r\n") {
+                    break at;
+                }
+                if self.buffer.len() > MOST_OF_A_LINE {
+                    return Err(Failure::Stream("a trailer has no end to its line".into()));
+                }
+                if !self.fill()? {
+                    return Err(Failure::Stream("the connection closed inside the answer".into()));
+                }
+            };
+            self.buffer.drain(..line + 2);
+            if line == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// The next bytes of the body as they arrive, `None` at its end.
@@ -473,7 +632,10 @@ impl Response<'_> {
     /// `None`: a chunk's line has been read, and there is still nothing to give.
     fn next_step(&mut self) -> Result<Option<Option<Vec<u8>>>, Failure> {
         match self.framing {
-            Framing::Length(0) => Ok(Some(None)),
+            Framing::Length(0) => {
+                self.whole = true;
+                Ok(Some(None))
+            }
             Framing::Length(left) => {
                 if self.buffer.is_empty() && !self.fill()? {
                     return Err(Failure::Stream("the connection closed inside the answer".into()));
@@ -488,7 +650,13 @@ impl Response<'_> {
                 }
                 Ok(Some(Some(std::mem::take(&mut self.buffer))))
             }
-            Framing::Chunked { ended: true, .. } => Ok(Some(None)),
+            Framing::Chunked { ended: true, .. } => {
+                if !self.whole {
+                    self.read_trailers()?;
+                    self.whole = true;
+                }
+                Ok(Some(None))
+            }
             Framing::Chunked { left: 0, .. } => {
                 let line = loop {
                     if let Some(at) = self.buffer.windows(2).position(|window| window == b"\r\n") {
@@ -549,6 +717,33 @@ pub(crate) mod tests {
         assert!(matches!(failed, Failure::Connect(_)));
     }
 
+    /// Where the first address does not answer, as an IPv6 one does on a machine whose IPv6 has no route out, the next is begun beside it 250 ms on, not
+    /// after its 1.5 s: the first connection to a server waits no more for it. And where the first, IPv6, answers, it is the one used.
+    #[test]
+    fn the_next_address_is_begun_beside_a_first_that_does_not_answer() {
+        // (a port nothing listens on: Windows tries it again for some 2 s before it says no, as an address with no route out waits)
+        let silent = {
+            let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            taken.local_addr().unwrap()
+        };
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = open.local_addr().unwrap();
+        let cancel = AtomicBool::new(false);
+        let began = Instant::now();
+        let socket = connect_to(&[silent, good], Duration::from_secs(5), &cancel).unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), good);
+        assert!(began.elapsed() < Duration::from_millis(1000), "{:?}", began.elapsed());
+        if let Ok(six) = std::net::TcpListener::bind("[::1]:0") {
+            let answering = six.local_addr().unwrap();
+            for _ in 0..5 {
+                assert_eq!(connect_to(&[answering, good], Duration::from_secs(5), &cancel).unwrap().peer_addr().unwrap(), answering, "IPv6, where it answers");
+            }
+        }
+        // (and a stop is heard while they are tried)
+        let stopped = AtomicBool::new(true);
+        assert!(matches!(connect_to(&[silent, good], Duration::from_secs(5), &stopped), Err(Failure::Cancelled)));
+    }
+
     #[test]
     fn the_other_family_is_tried_second_and_a_stop_is_heard() {
         let (six, four): (SocketAddr, SocketAddr) = ("[::1]:9".parse().unwrap(), "127.0.0.1:9".parse().unwrap());
@@ -577,6 +772,104 @@ pub(crate) mod tests {
             while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
         });
         Url { tls: false, host: "127.0.0.1".into(), port, path: "/".into() }
+    }
+
+    /// A server that answers each request on a connection, in turn, as `answer` says for (connection, request), both from 0: the bytes to send, how long to
+    /// wait first, and whether to close after. How many connections it took.
+    fn keep_alive_server(answer: impl Fn(usize, usize) -> (&'static [u8], Duration, bool) + Send + Sync + 'static) -> (Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, answer) = (taken.clone(), std::sync::Arc::new(answer));
+        std::thread::spawn(move || {
+            for (connection, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    let mut asked = Vec::new();
+                    for request in 0.. {
+                        // (a request's head, and its body by its length)
+                        let end = loop {
+                            if let Some(at) = asked.windows(4).position(|window| window == b"\r\n\r\n") {
+                                break at + 4;
+                            }
+                            let mut block = [0u8; 4096];
+                            match stream.read(&mut block) {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => asked.extend_from_slice(&block[..count]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&asked[..end]).to_ascii_lowercase();
+                        let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length:")).map_or(0, |value| value.trim().parse().unwrap());
+                        while asked.len() < end + length {
+                            let mut block = [0u8; 4096];
+                            match stream.read(&mut block) {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => asked.extend_from_slice(&block[..count]),
+                            }
+                        }
+                        asked.drain(..end + length);
+                        let (bytes, wait, close) = answer(connection, request);
+                        std::thread::sleep(wait);
+                        if close && bytes.is_empty() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            return;
+                        }
+                        if stream.write_all(bytes).is_err() {
+                            return;
+                        }
+                        if close {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (Url { tls: false, host: "127.0.0.1".into(), port, path: "/".into() }, taken)
+    }
+
+    /// A connection whose answer was read to its end is kept for its server's next request, a chunked one's to its last chunk and what follows it, and a POST
+    /// goes on it as a GET does. One whose answer was left unread, or whose server said to close it, is not; nor is one the server closed meanwhile, whose
+    /// request goes once more on a new connection, as it never reached its server. A kept connection that went quiet and then closed is not asked again:
+    /// its server may have taken the request.
+    #[test]
+    fn a_connection_read_to_its_end_is_kept_for_the_next_request_to_its_server() {
+        KEEP_PLAIN.with(|keep| keep.set(true));
+        let cancel = AtomicBool::new(false);
+        let get = |url: &Url| request("GET", url, &[], None, Duration::from_secs(5), &cancel).and_then(|mut response| response.text());
+        let post = |url: &Url| request("POST", url, &[], Some("{}"), Duration::from_secs(5), &cancel).and_then(|mut response| response.text());
+        let now = Duration::ZERO;
+        // (kept: three requests, a GET, a POST and a chunked answer, on one connection)
+        let (url, taken) = keep_alive_server(move |_, request| match request {
+            2 => (&b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-After: 1\r\n\r\n"[..], now, false),
+            _ => (&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..], now, false),
+        });
+        assert_eq!((get(&url).unwrap(), post(&url).unwrap(), get(&url).unwrap(), get(&url).unwrap()), ("ok".into(), "ok".into(), "ok".into(), "ok".into()));
+        assert_eq!(taken.load(Ordering::SeqCst), 1, "all four on one connection");
+        // (closed by its server after its answer: the next request goes on a new connection, once, and is answered)
+        let (url, taken) = keep_alive_server(move |_, _| (&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..], now, true));
+        assert_eq!((post(&url).unwrap(), post(&url).unwrap()), ("ok".into(), "ok".into()));
+        assert_eq!(taken.load(Ordering::SeqCst), 2);
+        // (an answer left unread, and one whose server says to close: neither connection is kept)
+        let (url, taken) = keep_alive_server(move |connection, _| match connection {
+            0 => (&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlong"[..], now, false),
+            1 => (&b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok"[..], now, false),
+            _ => (&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..], now, false),
+        });
+        drop(request("GET", &url, &[], None, Duration::from_secs(5), &cancel).unwrap());
+        assert_eq!((get(&url).unwrap(), get(&url).unwrap()), ("ok".into(), "ok".into()));
+        assert_eq!(taken.load(Ordering::SeqCst), 3, "a new connection each time");
+        // (a kept connection that went quiet for 3 s, then closed: the request is not made again, and fails)
+        let (url, taken) = keep_alive_server(move |_, request| match request {
+            0 => (&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..], now, false),
+            _ => (&b""[..], Duration::from_secs(3), true),
+        });
+        assert_eq!(post(&url).unwrap(), "ok");
+        assert!(post(&url).is_err(), "a request its server may have taken is not made twice");
+        assert_eq!(taken.load(Ordering::SeqCst), 1);
+        KEEP_PLAIN.with(|keep| keep.set(false));
     }
 
     /// What a server wrote is not in a failure: a page's server is anyone's, and a failure reaches the model with nothing to mark it as the web's, as a
@@ -660,7 +953,8 @@ pub(crate) mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         stream.set_read_timeout(Some(POLL)).unwrap();
         let (held, _) = listener.accept().unwrap();
-        (Response { status: 0, headers: Vec::new(), stream: Transport::Plain(stream), buffer: bytes.to_vec(), framing, cancel, deadline: None, lost: false }, held)
+        (Response { status: 0, headers: Vec::new(), stream: Some(Transport::Plain(stream)), keep_for: None, keepable: false, whole: false, buffer: bytes.to_vec(), framing, cancel,
+                   deadline: None, lost: false }, held)
     }
 
     #[test]
@@ -764,7 +1058,7 @@ pub(crate) mod tests {
         let (url, hearing) = endless_answer();
         let cancel = AtomicBool::new(false);
         let mut response = request("POST", &url, &[], Some("{}"), Duration::from_secs(5), &cancel).ok().unwrap();
-        let Transport::Plain(socket) = &response.stream else { panic!("plain") };
+        let Some(Transport::Plain(socket)) = &response.stream else { panic!("plain") };
         let other = socket.try_clone().unwrap();
         reads_until_cancelled(&mut response, &cancel);
         let closed = Instant::now();

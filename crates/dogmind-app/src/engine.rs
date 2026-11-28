@@ -19,8 +19,9 @@ use crate::settings::Settings;
 pub fn find(settings: &Settings) -> Option<PathBuf> {
     let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("straydog.exe")));
     let on_path = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|folder| folder.join("straydog.exe")).find(|file| file.is_file()));
+    // (an engine fetched and selected comes before one beside the app: an app that comes without one has only the fetched one)
     settings.straydog.clone().filter(|file| file.is_file())
-        .or_else(|| beside.as_ref().filter(|file| file.is_file()).and_then(|_| crate::engine_updates::selected(&crate::settings::data_folder())))
+        .or_else(|| crate::engine_updates::selected(&crate::settings::data_folder()))
         .or(beside.filter(|file| file.is_file())).or(on_path)
 }
 
@@ -532,6 +533,12 @@ pub fn not_found_words() -> &'static str {
 }
 
 /// The same in a line of a list.
+/// Whether the engine is fetched when "Straydog on this PC" is asked for ([`crate::engine_updates::fetch_first`]): none is found, the app was not
+/// started from inside its zip, and the person named no program of their own. An app that comes without one has none until then.
+pub fn fetches_engine(settings: &Settings) -> bool {
+    find(settings).is_none() && !started_inside_a_zip() && settings.straydog.is_none()
+}
+
 pub fn not_found_short() -> &'static str {
     if started_inside_a_zip() { t("Started from inside the zip: extract it first") } else { t("straydog.exe is not beside this app") }
 }

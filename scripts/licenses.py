@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate assets/licenses/third-party.txt: every Rust crate in what is shipped, the app's executable, its installer and straydog.exe, with its license and the license's own words.
+"""Generate assets/licenses/third-party.txt: every Rust crate in what is shipped, the app's executable and its installer, with its license and the license's own words.
 
-    python scripts/licenses.py [path to Straydog's source]
+    python scripts/licenses.py
 
-Run it after a dependency changes, here or in Straydog. MIT, BSD and the like ask that their text go with a binary, so a list of names is not enough. The same words are given once,
+The engine is not shipped (0.1.18 on): the app fetches Straydog's release, which carries its own crates' licenses. Run it after a dependency changes. MIT, BSD and the like ask that their text go with a binary, so a list of names is not enough. The same words are given once,
 with the crates they cover. The licenses of Dogmind, Straydog and Lucide are copies in assets/ beside it. It reads what cargo has already fetched, and downloads nothing.
 """
 import json
@@ -53,9 +53,10 @@ def license_texts(package):
 
 
 def main():
-    straydog = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT.parent / "Straydog"
+    if len(sys.argv) > 1:
+        print(f"{sys.argv[1]}: not read, as the engine is not shipped with the app", file=sys.stderr)
     shipped = {}
-    for package in crates(ROOT, "dogmind-app") + crates(ROOT, "dogmind-setup") + crates(straydog, "straydog", ["--features", "straydog/cuda"]):
+    for package in crates(ROOT, "dogmind-app") + crates(ROOT, "dogmind-setup"):
         shipped[(package["name"], package["version"])] = package
     lines, by_text, without = [], {}, []
     for (name, version), package in sorted(shipped.items()):

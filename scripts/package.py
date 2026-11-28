@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Put together what is shipped: dist/DogmindApp with the app, straydog.exe and one LICENSE.txt.
+"""Put together what is shipped: dist/DogmindApp with the app and one LICENSE.txt. The engine is not in it (0.1.18 on): the app fetches Straydog's release
+from GitHub, its cuBLAS with it (crates/dogmind-app/src/engine_updates.rs), and Dogmind's release no longer waits on Straydog's build.
 
     cargo build --release -p dogmind-app -p dogmind-setup
     python scripts/licenses.py
     python -I scripts/fetch_tools.py
-    python -I scripts/package.py [path to straydog.exe] [path to the CUDA toolkit it was built with]
+    python -I scripts/package.py
     python -I scripts/package.py --tools-only FOLDER     tools\\ alone, in FOLDER, for a test
     python -I scripts/package.py --setup-only FOLDER OUT.exe   an installer of FOLDER alone, for a test, from the release build of dogmind-setup or %DOGMIND_SETUP_STUB%
 
@@ -17,7 +18,7 @@ sets it, as this replaces tools\\ whole and puts a new exe over the running one.
 tools\\ beside the exe holds what commands run with, so that a person installs nothing: Python with its modules, Node.js, Git. It comes from the pins in tools.lock.json; it is
 an error for it to be missing, as an app without it behaves differently from what was tested.
 
-LICENSE.txt holds this app's license, those of Straydog, Lucide and the CUDA toolkit whose libraries go beside the engine, and the list of Rust crates in the executable.
+LICENSE.txt holds this app's license, those of Straydog (which it fetches and runs) and Lucide, and the list of Rust crates in the executable.
 """
 import filecmp
 import hashlib
@@ -44,7 +45,7 @@ def dist_folder():
 
 PARTS = [
     ("Dogmind (this program)", ROOT / "LICENSE", None),
-    ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program beside this one."),
+    ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program the app fetches from Straydog's releases."),
     ("Lucide", ROOT / "assets" / "lucide" / "LICENSE", "The icons."),
     ("Modern Web Guidance (GoogleChrome)", ROOT / "assets" / "licenses" / "modern-web-guidance-LICENSE.txt", "The built-in skill is adapted from https://github.com/GoogleChrome/modern-web-guidance."),
     ("Rust crates in these executables", ROOT / "assets" / "licenses" / "third-party.txt", None),
@@ -360,24 +361,6 @@ def assemble_tools(target):
     return texts
 
 
-def toolkits():
-    """The toolkits to look in: the one named on the command line, then what the environment names (CUDA_PATH may well name an older one than the engine's)."""
-    named = [Path(sys.argv[2])] if len(sys.argv) > 2 else []
-    return named + [Path(value) for key, value in sorted(os.environ.items()) if key.upper().startswith("CUDA_PATH")]
-
-
-def cublas_for(straydog, places):
-    """The cuBLAS files this engine imports and where they are, and the toolkit they came from: another version beside it would not load."""
-    # (the engine names only cublas64_N.dll, which itself loads cublasLt64_N.dll)
-    versions = sorted({version.decode() for version in re.findall(rb"cublas(?:Lt)?64_(\d+)\.dll", straydog.read_bytes(), re.IGNORECASE)})
-    names = [name for version in versions for name in (f"cublas64_{version}.dll", f"cublasLt64_{version}.dll")]
-    for toolkit in places:
-        for folder in (toolkit / "bin" / "x64", toolkit / "bin"):
-            if names and all((folder / name).is_file() for name in names):
-                return [folder / name for name in names], toolkit
-    return None, None
-
-
 def make_setup(folder, out, version):
     """The installer: `dogmind-setup` itself, with the folder on its end, streamed and deflated by it. No tool beyond that, and what it left out of the folder (symbols, what is this machine's) it knows by itself. It then reads its work back."""
     stub = Path(os.environ.get("DOGMIND_SETUP_STUB") or ROOT / "target" / "release" / "dogmind-setup.exe")
@@ -423,21 +406,12 @@ def main():
     put(ROOT / "assets" / "READ-ME-FIRST.txt", target / "READ-ME-FIRST.txt")
     # (copy, not copy2: a file's date here says when it was installed, or an update looks as if it changed nothing; and the running app sees it as new)
     put(ROOT / "target" / "release" / "dogmind-app.exe", target / "dogmind-app.exe")
-    straydog = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT.parent / "Straydog" / "target" / "release" / "straydog.exe"
-    if straydog.is_file():
-        put(straydog, target / "straydog.exe")
-        # The cuBLAS it links, from the toolkit it was built with: a machine with none, or with another, needs its own beside it.
-        libraries, toolkit = cublas_for(straydog, toolkits())
-        if not libraries:
-            sys.exit(f"the cuBLAS {straydog} imports is in none of {[str(place) for place in toolkits()]}: name its toolkit after it")
-        for old in target.glob("cublas*64_*.dll"):
-            if old.name not in {library.name for library in libraries}:
-                remove(old)
-        for library in libraries:
-            put(library, target / library.name)
-        parts.append(("NVIDIA CUDA Toolkit", toolkit / "LICENSE", "The cuBLAS libraries beside the engine."))
-    else:
-        print(f"no straydog.exe at {straydog}: the app will ask for one", file=sys.stderr)
+    # The engine is not shipped: what an earlier packaging put here goes (an update keeps the copy an installed app has until it fetched its own).
+    if len(sys.argv) > 1:
+        print(f"{sys.argv[1]}: not packaged, as the app fetches the engine", file=sys.stderr)
+    for old in [target / "straydog.exe", *target.glob("cublas*64_*.dll")]:
+        if old.exists():
+            remove(old)
     text = []
     for title, path, note in parts:
         text.append("=" * 72 + f"\n{title}\n" + (f"{note}\n" if note else "") + "=" * 72 + "\n\n" + path.read_text(encoding="utf-8").strip() + "\n\n")
@@ -449,7 +423,7 @@ def main():
     version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
     symbols = dist / f"symbols-{version}"
     symbols.mkdir(exist_ok=True)
-    for pdb in (ROOT / "target" / "release" / "dogmind_app.pdb", straydog.with_name("straydog.pdb")):
+    for pdb in (ROOT / "target" / "release" / "dogmind_app.pdb",):
         if pdb.is_file():
             shutil.copy(pdb, symbols / pdb.name)
     archive = dist / f"DogmindApp-{version}.zip"

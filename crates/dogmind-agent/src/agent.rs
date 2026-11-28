@@ -361,6 +361,9 @@ pub struct PlanReview {
     pub answer: Sender<Result<(), String>>,
 }
 
+/// What the person is told, once a conversation, when the look for repositories before and after a command left folders of the workspace unlooked at.
+pub const UNGUARDED_REPOSITORIES: &str = "Some folders of this workspace are deeper, or more, than the app looks through before and after a command: a git repository there is not guarded, and a command could change its hooks, which git would run outside the sandbox when you use it there.";
+
 pub enum Event {
     SessionStarted { path: PathBuf, workspace: PathBuf, transcript: Vec<Message> },
     /// A new session's first message has given it a file.
@@ -920,9 +923,14 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 
 /// In one turn of the person's, at most: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
 /// note three times in one turn only delayed its first stroke. Once a file is written (when code in its reasoning may be the plan of an edit), only a draft
-/// of more than `LONG_DRAFT_LINES` is stopped; after a stop, with its reasoning kept, one of `DRAFT_LINES_AFTER_STOP`. Not watched at all after the third,
-/// a real turn wrote a whole page of 101,903 characters in its reasoning (567 s) and then wrote it again with create_file.
+/// of more than `LONG_DRAFT_LINES` is stopped; after a stop, with its reasoning kept, one of `DRAFT_LINES_AFTER_STOP`. After the third, only a whole page
+/// (`WHOLE_PAGE_LINES`), once: unwatched, a real turn wrote a whole page of 101,903 characters in its reasoning (567 s) and then wrote it again with create_file.
 const MAX_DRAFTS_STOPPED: u32 = 3;
+/// Past the third stop, one more draft is stopped, of a whole page alone: more than this many lines of code of its own. Over the 345 reasonings kept in 17 of
+/// the owner's sessions, replayed, a watch at this line stopped one, the 101,903 characters above, at 77,412 of them, whose create_file then wrote none of
+/// its 770 lines as they were; it stopped no reasoning that ended in an answer or another tool's call. (At 300 lines it stopped one more, of 59,196
+/// characters, whose file took 3% of its draft; at 500, the same one, later.)
+const WHOLE_PAGE_LINES: usize = 400;
 /// The rounds a goal has when the model does not say (set_goal's `rounds`), and the most it may ask for.
 const GOAL_ROUNDS: u32 = 12;
 const MOST_GOAL_ROUNDS: u32 = 30;
@@ -1640,6 +1648,8 @@ struct Agent {
     japanese_system: bool,
     /// Kana have been typed in this conversation: what follows stays Japanese, however short.
     japanese_session: bool,
+    /// The person was told, in this conversation, that the look for repositories left folders of the workspace unlooked at.
+    told_unguarded: bool,
     live: Arc<Mutex<Live>>,
     instructions: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -1927,6 +1937,7 @@ impl Agent {
             language: config.language,
             japanese_system: config.japanese_system,
             japanese_session: false,
+            told_unguarded: false,
             live: Arc::new(Mutex::new(Live { mode: Mode::Default, effort: None, safe_commands: false })),
             instructions: config.instructions,
             repeated: HashSet::new(),
@@ -2355,6 +2366,7 @@ impl Agent {
         self.emit(Event::Goal(None));
         (self.web_from, self.web_untold, self.web_told) = (Vec::new(), false, false);
         self.japanese_session = false;
+        self.told_unguarded = false;
         self.rewound.clear();
         self.read_only = false;
         self.emit(Event::WebSeen(false));
@@ -2384,7 +2396,7 @@ impl Agent {
             return self.failed(crate::conversation_key::LOCKED.to_string());
         }
         match Session::open_checked(path) {
-            Ok(crate::session::Opened { session, workspace, messages, damaged }) => {
+            Ok(crate::session::Opened { session, workspace, messages, damaged, remembered }) => {
                 self.move_to(&workspace);
                 self.workspace = workspace;
                 self.background.reset();
@@ -2394,24 +2406,26 @@ impl Agent {
                 self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(path, &self.workspace)));
                 // (what it had read, it has read: a real one, refused an edit of a file it had read before the app was closed, read it and wrote the same 4,776
                 // characters again)
-                self.bench.restore_seen(crate::session::seen_of(path));
+                // (all it remembers was read with its messages, in one pass: crate::session::Remembered)
+                self.bench.restore_seen(remembered.seen);
                 self.load_extras();
                 // As it was sent, whatever is installed or running by now: the prefix goes on, and a call to what has gone says so.
-                if let Some(tools) = crate::session::tools_of(path) {
+                if let Some(tools) = remembered.tools {
                     self.tool_schemas = tools;
                 }
-                self.added_tools = crate::session::added_of(path).and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
+                self.added_tools = remembered.added.and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
                 self.messages = messages;
                 // (a fork keeps the tools told of in the one it came from, and maybe not where they were told of)
                 self.added_due = self.added_untold();
                 self.web_rules_due = false;
                 self.japanese_session = false;
+                self.told_unguarded = false;
                 self.rewound.clear();
-                (self.web_from, self.web_untold) = crate::session::web_sources(path);
+                (self.web_from, self.web_untold) = (remembered.web_from, remembered.web_untold);
                 self.web_told = self.web_seen();
                 self.emit(Event::WebSeen(self.web_told));
                 // (the history has said it already; a compaction will say it again)
-                (self.goal, self.goal_due) = (crate::session::goal_of(path), false);
+                (self.goal, self.goal_due) = (remembered.goal, false);
                 self.round_goal = None;
                 self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {
@@ -3126,16 +3140,18 @@ impl Agent {
             // Only where a file may change: a draft in a turn the person asked for no change in, or in plan mode, is the model thinking with code, whose answer will have it once.
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
             let files_may_change = self.mode != Mode::Plan && !self.turn_is_read_only();
-            let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && files_may_change;
-            // (after a stop, a lower line; once a file is written with no stop yet, a higher one, for the plan of an edit)
-            let (line, watch_on) = if drafts_stopped > 0 {
+            let may_stop_drafting = cuts && drafts_stopped <= MAX_DRAFTS_STOPPED && files_may_change;
+            // (after a stop, a lower line; once a file is written with no stop yet, a higher one, for the plan of an edit; past the most, a whole page's)
+            let (line, watch_on) = if drafts_stopped >= MAX_DRAFTS_STOPPED {
+                (WHOLE_PAGE_LINES + 1, "on:whole_page")
+            } else if drafts_stopped > 0 {
                 (DRAFT_LINES_AFTER_STOP, "on:after_stop")
             } else if wrote {
                 (LONG_DRAFT_LINES + 1, "on:long")
             } else {
                 (DRAFT_LINES, "on")
             };
-            let watch_is = if may_stop_drafting { watch_on } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
+            let watch_is = if may_stop_drafting { watch_on } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped > MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
             let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages), line));
             // The app's own stop (of a draft) ends the stream through a flag of the stream's: on the person's,
@@ -3446,6 +3462,17 @@ impl Agent {
             if completion.finish.is_empty() && !has_calls && completion.content.is_empty() {
                 return Ended::Failed(llm::UNFINISHED.into());
             }
+            // A call written in the reasoning, which then ended with nothing said and no call: a DeepSeek model on a served Straydog wrote `<｜DSML｜ calls>` to
+            // `</｜DSML｜ calls>` with its thinking never closed, and the server passed it all on as reasoning. Asked again, the same came back as often (9 times in
+            // 20 of one first request), and a turn failed with nothing done. Once a turn, the call goes to the answer's text, where a call written out as text is
+            // told of below, and the model makes it.
+            let mut call_in_reasoning = false;
+            if !has_calls && !markup_told && completion.content.trim().is_empty() {
+                if let Some(at) = call_markup_at(&completion.reasoning) {
+                    completion.content = completion.reasoning.split_off(at);
+                    call_in_reasoning = true;
+                }
+            }
             // Nothing said and nothing asked for: a person would see the turn end blank, and a service refuses an assistant message with nothing in it
             // for the rest of the conversation. It does not join; the same request goes again.
             if !has_calls && completion.content.trim().is_empty() {
@@ -3531,8 +3558,10 @@ impl Agent {
             if let (false, Some(at)) = (markup_told, call_markup_at(&completion.content)) {
                 markup_told = true;
                 let tool = tool_in_markup(&completion.content[at..]);
-                self.intervened("call_as_text", json!({"chars": completion.content[at..].chars().count(), "tool": tool}));
-                self.push(Message::text("user", prompt::call_as_text(tool.as_deref())));
+                let kind = if call_in_reasoning { "call_in_reasoning" } else { "call_as_text" };
+                self.intervened(kind, json!({"chars": completion.content[at..].chars().count(), "tool": tool}));
+                let note = if call_in_reasoning { prompt::call_in_reasoning(tool.as_deref()) } else { prompt::call_as_text(tool.as_deref()) };
+                self.push(Message::text("user", note));
                 continue;
             }
             // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
@@ -4145,6 +4174,11 @@ impl Agent {
         // A command left running in the background is not followed.)
         let began = (name == "execute_command" && arguments.get("background").and_then(Value::as_bool) != Some(true)).then(std::time::SystemTime::now);
         let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
+        // (the look for repositories before and after a command stopped short of some of the workspace: said once a conversation)
+        if matches!(name, "execute_command" | "check_page") && !self.told_unguarded && crate::sandbox::repositories_left_unguarded(&self.workspace) {
+            self.told_unguarded = true;
+            self.emit(Event::Notice(UNGUARDED_REPOSITORIES.to_string()));
+        }
         if let Some(began) = began {
             let touched = crate::checkpoint::touched_since(&self.workspace, began);
             if !touched.is_empty() {
@@ -8814,6 +8848,38 @@ Body").unwrap();
         assert_eq!(provider.requests() as u32, MAX_CONTINUES + 1);
     }
 
+    /// A call written in the reasoning, the thinking never closed and nothing said (as a served DeepSeek's first answers came back, in up to 9 of 20): not
+    /// asked for again as it was, which brought the same, but once a turn its call goes to the answer's text and the model is told, and it makes the call.
+    /// Told once: the next such answer is asked for again, as an empty one is.
+    #[test]
+    fn a_call_written_in_the_reasoning_is_told_of_once_and_not_asked_for_again_as_it_was() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let markup = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"list_files\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let in_reasoning = move || -> Step {
+            Box::new(move |_: &AtomicBool| Ok(llm::Completion { reasoning: format!("Let me look at the files.\n\n{markup}"), finish: "stop".into(), ..llm::Completion::default() }))
+        };
+        let (run, provider) = scripted(dir.path(), vec![in_reasoning(), calls(&[("list_files", serde_json::json!({"path": "."}))]), says("One file.")], Mode::Default);
+        run.handle.commands.send(Command::Send("what is here".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(log.iter().filter(|line| line.starts_with("tool:true")).count(), 1, "the call it then made ran: {log:?}");
+        assert_eq!(provider.requests(), 3);
+        let second = provider.messages(1);
+        let kept = &second[second.len() - 2];
+        assert_eq!((kept.content.as_deref(), kept.reasoning_content.as_deref()), (Some(markup), Some("Let me look at the files.\n\n")), "the call in the text, the rest its reasoning");
+        let note = user_text(second.last().unwrap());
+        assert!(note.contains("(`list_files`)") && note.contains("in your reasoning") && note.contains("nothing ran"), "{note}");
+        assert!(of_kind(&trajectory_of(&run), "intervention").iter().any(|line| line["kind"] == "call_in_reasoning"), "said in the trajectory");
+
+        // (told once a turn: the second is asked for again as it was, as an empty answer is)
+        let (run, provider) = scripted(dir.path(), vec![in_reasoning(), in_reasoning(), says("Done.")], Mode::Default);
+        run.handle.commands.send(Command::Send("what is here".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert!(log.iter().all(|line| !line.starts_with("failed:")), "{log:?}");
+        assert_eq!(provider.requests(), 3);
+        assert_eq!(provider.messages(2), provider.messages(1), "the same request");
+    }
+
     #[test]
     fn an_answer_with_nothing_in_it_is_asked_for_again_and_does_not_join() {
         let dir = crate::in_container::tempdir().unwrap();
@@ -9817,7 +9883,7 @@ Body").unwrap();
     }
 
     /// After a first stop, a draft is stopped again at a lower line (`DRAFT_LINES_AFTER_STOP`: shorter than the first stop's, and than a whole file's once
-    /// one is written), and three times in a turn at most: then its call goes through.
+    /// one is written), and three times in a turn at most: then a draft shorter than a whole page (`WHOLE_PAGE_LINES`) goes through with its call.
     #[test]
     fn after_the_first_stop_a_draft_is_stopped_at_a_lower_line_and_three_at_most() {
         let dir = crate::in_container::tempdir().unwrap();
@@ -9847,7 +9913,40 @@ Body").unwrap();
         assert_eq!(notes, 3);
         assert!(dir.path().join("index.html").is_file());
         let watched: Vec<String> = of_kind(&trajectory_of(&run), "request").iter().map(|line| line["draft_watch"].as_str().unwrap_or("").to_string()).collect();
-        assert_eq!(watched[..4], ["on", "on:after_stop", "on:after_stop", "off:stopped_most"], "{watched:?}");
+        assert_eq!(watched[..4], ["on", "on:after_stop", "on:after_stop", "on:whole_page"], "{watched:?}");
+    }
+
+    /// Past the third stop, a whole page in its reasoning is stopped once more (a real turn's 101,903 characters, 567 s, went unwatched there and were typed
+    /// again with create_file); then nothing is.
+    #[test]
+    fn past_the_third_stop_a_whole_page_is_stopped_once_more_and_then_nothing() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
+        let long = |text: String| -> Vec<Value> { std::iter::once(think(&text)).chain((0..400).map(|_| think(" more of it"))).collect() };
+        let between = DRAFT_LINES_AFTER_STOP + 5;
+        const _: () = assert!(WHOLE_PAGE_LINES > LONG_DRAFT_LINES);
+        let mut last = vec![think(&format!("The page again.\n{}", fenced(&code_lines(WHOLE_PAGE_LINES + 10))))];
+        last.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
+        let (client, bodies) = trickling_server(vec![
+            long(format!("Plan.\n{}", fenced(&code_lines(DRAFT_LINES + 2)))),
+            long(format!("Again.\n{}", fenced(&code_lines(between)))),
+            long(format!("And again.\n{}", fenced(&code_lines(between)))),
+            long(format!("The whole page.\n{}", fenced(&code_lines(WHOLE_PAGE_LINES + 10)))),
+            last,
+            vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 6, "four stops, then its call: {log:?}");
+        let notes = bodies[5]["messages"].as_array().unwrap().iter()
+            .filter(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))).count();
+        assert_eq!(notes, 4);
+        assert!(dir.path().join("index.html").is_file());
+        let watched: Vec<String> = of_kind(&trajectory_of(&run), "request").iter().map(|line| line["draft_watch"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(watched[..5], ["on", "on:after_stop", "on:after_stop", "on:whole_page", "off:stopped_most"], "{watched:?}");
     }
 
     /// Once a file is written, a whole file in its reasoning is still stopped (a real one, 101,903 characters and 567 s, was written again with create_file);

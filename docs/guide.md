@@ -121,7 +121,7 @@ The icon is `assets/app.ico`, made from the artwork `assets/app.png` by `scripts
 This repository is MIT (`LICENSE`). The icons in `assets/lucide/` are Lucide's (ISC, `assets/lucide/LICENSE`).
 
 `scripts/package.py` puts one `LICENSE.txt` beside the executable, with this app's (MIT), Straydog's (MIT),
-Lucide's (ISC), BIZ UDGothic's (SIL OFL 1.1), the CUDA toolkit's, the WebView2 SDK's, the bundled tools' and every Rust crate in the app and in `straydog.exe` with its license's words. After a dependency changes, here or in Straydog, run `python scripts/licenses.py`.
+Lucide's (ISC), BIZ UDGothic's (SIL OFL 1.1), the WebView2 SDK's, the bundled tools' and every Rust crate in the app with its license's words. After a dependency changes, run `python scripts/licenses.py`. The engine is not shipped: the release of Straydog the app fetches carries its own crates' licenses and the CUDA toolkit's.
 
 ## Building
 
@@ -139,7 +139,7 @@ Work goes on the next version's branch, `dev/X.Y.Z`, and `main` holds released v
 `vVERSION` (as `v0.1.0`) on that merge commit with `dist\DogmindSetup-VERSION.exe`, `dist\DogmindSetup-VERSION.parts` (an app fetches an update by its parts only with that; without it, the whole setup) and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
 update check offers the newest release by its tag's version, pre-releases included, and never a draft; a tag that is not a version is passed over.
 
-No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`.
+No GPU toolkit is needed, and the package holds no engine: choosing *Straydog on this PC*, the app fetches the newest Straydog release from GitHub (the exe and its cuBLAS, checked against the release's SHA256SUMS and GitHub's digests) into its data folder, and updates it there. To run an engine of your own build, name it in the settings, or copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`. An app updated from one that came with the engine (up to 0.1.17) keeps that one until it has fetched its own.
 
 A package also has `tools\` beside the exe, so that a person installs nothing and a command does the same on every machine: Python with common modules, Node.js with npm and npx, and Git, first on every sandboxed command's PATH, ahead of anything installed. `python -I scripts/fetch_tools.py` fetches them by the hashes pinned in `scripts/tools.lock.json`, into a cache outside this tree, and `python -I scripts/package.py` puts them together and adds their licenses. A development build with no `tools\` beside it uses what the machine has, or the folder `DOGMIND_TOOLS` names.
 

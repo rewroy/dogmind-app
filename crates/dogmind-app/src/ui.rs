@@ -369,6 +369,8 @@ const SPINNER_MS: u32 = 33;
 /// How often text goes into the transcript as an answer comes. The view moves on every frame; to insert costs a millisecond or more, and
 /// nobody reads the difference between thirty insertions a second and more of them.
 const REVEAL_EVERY_MS: u128 = 30;
+/// How often the thinking shown goes in, all that has come of it: not each piece, which was an insertion and a drawing of the transcript of its own.
+const THINKING_EVERY_MS: u128 = 100;
 /// The least time between frames: a screen faster than this is served every other time it refreshes.
 const FRAME_LEAST: std::time::Duration = std::time::Duration::from_micros(6500);
 /// How long frames wait where there is no composition to wait for.
@@ -794,6 +796,10 @@ enum Note {
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
     ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
     StraydogUpdate(engine_updates::Result),
+    /// How far the engine fetched for a first start has come ([`App::fetch_engine_first`]), in bytes of the whole.
+    EngineFetch { done: u64, whole: u64 },
+    /// The engine fetched for a first start is here (its path), or why it is not.
+    EngineFetched(Result<PathBuf, String>),
     /// How far the setup of a newer release has come, of how many bytes.
     ReleaseProgress { done: u64, total: u64 },
     /// The setup of a newer release is fetched and checked and waits to be run, or why it is not.
@@ -2259,6 +2265,11 @@ struct App {
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
+    /// An engine fetched and checked over the one that runs, waiting for the app's next start (`engine_updates::waiting`): the notice offers it with the
+    /// app's own update, in one restart, or alone.
+    engine_waiting: Option<String>,
+    /// Later was pressed on the notice of that engine alone.
+    engine_notice_closed: bool,
     /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
     checking_setup: bool,
     /// A newer release on GitHub than this one, found on the app's own look: the notice at the top of the main screen tells of it (`notice`), with a button for its page while nothing of its
@@ -2600,6 +2611,11 @@ struct App {
     pending_text: String,
     /// What has arrived of the answer and is not on screen yet (`reveal_tick`).
     reveal: String,
+    /// What has arrived of the thinking, where it is shown, and is not on screen yet: it goes in with the frames (`reveal_tick`), as the answer
+    /// does, and all of it at once.
+    thinking_reveal: String,
+    /// When thinking last went in from it.
+    thinking_revealed_at: std::time::Instant,
     /// The reply's keys, hidden as they come in pieces: what is shown of it (the reply itself is kept as it was written).
     stream_mask: crate::mask::StreamMask,
     /// When text last went in from it.
@@ -2677,6 +2693,8 @@ struct App {
     leaving: Leaving,
     start_folders: Vec<PathBuf>,
     setting_up: bool,
+    /// The engine is being fetched for a first start ([`App::fetch_engine_first`]).
+    engine_fetching: bool,
     /// What the running setup has said of the whole, for one bar across its stages.
     setup_tally: engine::SetupTally,
     /// The chosen model's licence, as a link.
@@ -3103,8 +3121,11 @@ fn notice_text(shown: &notice::Notice) -> (String, String) {
         Notice::Page { version } => (tf("Dogmind {0} is available.", &[version]), t("Open the release page").to_string()),
         Notice::Fetching { version, percent } => (tf("Dogmind {0} is available.", &[version]), tf("Downloading… {0}%", &[percent])),
         Notice::UpdateNow { waiting: true, checking, .. } => (t("It restarts into the new version when this work is done.").to_string(), if *checking { t("Checking…") } else { t("Not now") }.to_string()),
-        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
-        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+        Notice::UpdateNow { version: Some(version), engine: Some(engine), checking, .. } => (tf("Update: Dogmind {0}, Straydog {1}", &[version, engine]), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
+        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
+        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Restart to update") }.to_string()),
+        Notice::EngineNow { waiting: true, .. } => (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()),
+        Notice::EngineNow { engine, .. } => (tf("Straydog {0} is ready.", &[engine]), t("Restart to update").to_string()),
     }
 }
 
@@ -9296,6 +9317,8 @@ impl App {
                 let claude_key = crate::machine::fresh_variable("ANTHROPIC_API_KEY").is_some();
                 // Only what bears on the choice.
                 let this_pc = match (straydog.is_some(), model_ready) {
+                    // (an app that comes without the engine fetches it when this is chosen)
+                    (false, _) if engine::fetches_engine(&self.settings) => t("Needs an NVIDIA GPU. Downloads the Straydog engine (about 0.6 GB) and a model of about 75 GB"),
                     (false, _) => engine::not_found_short(),
                     (true, true) => "",
                     (true, false) => t("Needs an NVIDIA GPU. Downloads a model of about 75 GB"),
@@ -9316,7 +9339,9 @@ impl App {
                 set_text(self.buttons[1], t("Skip for now"));
                 self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Link]);
                 self.fill_list();
-                SendMessageW(self.list, LB_SETCURSEL, suggested_way(straydog.is_some(), model_ready, codex.is_some(), claude_key), 0);
+                // (an app that comes without the engine fetches it when this PC's way is chosen: offered first as one with it, where the driver can run it)
+                let engine_here = straydog.is_some() || engine::fetches_engine(&self.settings) && engine::driver_problem(false).is_none();
+                SendMessageW(self.list, LB_SETCURSEL, suggested_way(engine_here, model_ready, codex.is_some(), claude_key), 0);
             }
             Panel::SetupDetails => {
                 match self.setup_kind {
@@ -10259,24 +10284,56 @@ impl App {
         self.setup_kind = [Kind::Embedded, Kind::Server, Kind::Codex, Kind::Anthropic][at.min(3)];
         if self.setup_kind == Kind::Embedded {
             if engine::find(&self.settings).is_none() {
-                self.problem_in_panel(engine::not_found_words());
+                if engine::fetches_engine(&self.settings) {
+                    self.fetch_engine_first();
+                } else {
+                    self.problem_in_panel(engine::not_found_words());
+                }
                 return;
             }
-            if self.settings.models_folder.is_none() {
-                self.settings.models_folder = Some(self.folder.join("models"));
-            }
-            self.settings.use_provider(Kind::Embedded, "", "", "");
-            self.save();
-            if engine::is_set_up(&self.folder) {
-                // (it starts when something is written, as it does after any start of the app)
-                self.engine_waits = true;
-                self.connection = "starts when you write".into();
-                self.set_panel(Panel::Start);
-            } else {
-                self.set_panel(Panel::Models);
-            }
+            self.this_pc_chosen();
         } else {
             self.set_panel(Panel::SetupDetails);
+        }
+    }
+
+    /// "On this PC" chosen where the app has no engine (it comes without one): the newest release's is fetched ([`engine_updates::fetch_first`]),
+    /// how far it has come said in the panel, and the setup goes on to the models once it is here; why it is not, where it is not.
+    unsafe fn fetch_engine_first(&mut self) {
+        if self.engine_fetching {
+            return;
+        }
+        self.engine_fetching = true;
+        self.setup_cancel.store(false, Ordering::Relaxed);
+        self.say_in_panel(t("Fetching the Straydog engine from GitHub..."));
+        let (poster, cancel, settings, folder) = (self.poster.clone(), self.setup_cancel.clone(), self.settings.clone(), self.folder.clone());
+        std::thread::spawn(move || {
+            let mut said = std::time::Instant::now();
+            let outcome = engine_updates::fetch_first(&settings, &folder, &cancel, &mut |done, whole| {
+                // (a tenth of a second between two at the least: the window is told, not flooded)
+                if said.elapsed() >= std::time::Duration::from_millis(100) || done == whole {
+                    said = std::time::Instant::now();
+                    poster.send(Note::EngineFetch { done, whole });
+                }
+            });
+            poster.send(Note::EngineFetched(outcome));
+        });
+    }
+
+    /// "On this PC" chosen, with an engine to run: on to the models, or to the conversation where one is set up.
+    unsafe fn this_pc_chosen(&mut self) {
+        if self.settings.models_folder.is_none() {
+            self.settings.models_folder = Some(self.folder.join("models"));
+        }
+        self.settings.use_provider(Kind::Embedded, "", "", "");
+        self.save();
+        if engine::is_set_up(&self.folder) {
+            // (it starts when something is written, as it does after any start of the app)
+            self.engine_waits = true;
+            self.connection = "starts when you write".into();
+            self.set_panel(Panel::Start);
+        } else {
+            self.set_panel(Panel::Models);
         }
     }
 
@@ -10708,6 +10765,13 @@ impl App {
     /// Windows lets it rename): a row above the input asks whether to restart into it, and the tray says so if the window is out of sight. Nothing
     /// restarts unless the person says so. A file still being written is not taken for one: the same new size and time twice in a row is.
     unsafe fn look_for_update(&mut self) {
+        // (an engine that waits, alone: the app restarts on it when the work is done, if the person said so)
+        if self.restart_when_done && !self.update_offer && self.ready_setup().is_none() && self.engine_waiting.is_some() {
+            if !self.at_work() {
+                self.restart_into_update();
+            }
+            return;
+        }
         // (the setup of a release, fetched and checked: it restarts when the work is done, if the person said so)
         if self.restart_when_done && !self.update_offer && self.ready_setup().is_some() {
             if !self.at_work() {
@@ -10788,6 +10852,8 @@ impl App {
             new_build: self.update_offer,
             restart_when_done: self.restart_when_done,
             checking: self.checking_setup,
+            engine: self.engine_waiting.as_deref(),
+            engine_closed: self.engine_notice_closed,
         })
     }
 
@@ -10804,7 +10870,7 @@ impl App {
         shapes.push(Shape::Round { area: rect(left, top, width, tall), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
         let (words, label) = notice_text(notice);
         // (one width for every state the button goes through: one that says how far the fetch has come does not move as the number grows)
-        let widest = [t("Update now (Dogmind restarts)").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
+        let widest = [t("Restart to update").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
             .iter()
             .map(|label| text_width(self.fonts.strong, label))
             .max()
@@ -10822,6 +10888,7 @@ impl App {
             notice::Notice::Page { .. } => (ButtonKind::Secondary, true),
             notice::Notice::Fetching { .. } => (ButtonKind::Secondary, false),
             notice::Notice::UpdateNow { waiting, checking, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, !*checking),
+            notice::Notice::EngineNow { waiting, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, true),
         };
         set_button_style(main, kind, theme::surface());
         EnableWindow(main, i32::from(enabled));
@@ -10840,9 +10907,15 @@ impl App {
         let version = match &shown {
             notice::Notice::Page { version } | notice::Notice::Fetching { version, .. } => Some(version.clone()),
             notice::Notice::UpdateNow { version, .. } => version.clone(),
+            notice::Notice::EngineNow { .. } => None,
         };
         if let Some(version) = version {
             self.dismiss_release(&version);
+        }
+        if matches!(shown, notice::Notice::EngineNow { .. }) {
+            // (the engine waits all the same: the app's next start takes it)
+            self.engine_notice_closed = true;
+            self.restart_when_done = false;
         }
         if matches!(shown, notice::Notice::UpdateNow { .. }) {
             // (not this build: a newer one is offered again)
@@ -11064,6 +11137,8 @@ impl App {
         }
         if updates::is_due_after(self.settings.last_update_check, updates::now(), every) {
             self.start_release_look(true);
+            // (the engine's look with it: what each finds is offered in the one notice, for one restart)
+            self.start_straydog_update();
         }
     }
 
@@ -13560,6 +13635,7 @@ impl App {
             self.greeting = next_greeting(self.greeting, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.subsec_nanos() as u64));
         }
         self.reveal.clear();
+        self.thinking_reveal.clear();
         self.follow_end = true;
         self.line_start = true;
         self.code_fence = None;
@@ -13826,8 +13902,25 @@ impl App {
         }
     }
 
-    /// What waits to be shown goes in now: something else is about to follow it.
+    /// What waits to be shown goes in now: something else is about to follow it. The thinking first: what waits of the answer came after it.
     unsafe fn flush_reveal(&mut self) {
+        self.flush_thinking();
+        self.flush_answer();
+    }
+
+    /// The thinking that waits goes in, in one insertion at the transcript's end, the rest of the transcript as it was.
+    unsafe fn flush_thinking(&mut self) {
+        if !self.thinking_reveal.is_empty() {
+            let text = std::mem::take(&mut self.thinking_reveal);
+            self.thinking_revealed_at = std::time::Instant::now();
+            let revealing = std::mem::replace(&mut self.revealing, true);
+            self.append(&text, Style::Thinking);
+            self.revealing = revealing;
+        }
+    }
+
+    /// What waits of the answer goes in now.
+    unsafe fn flush_answer(&mut self) {
         if !self.reveal.is_empty() {
             let text = std::mem::take(&mut self.reveal);
             self.append_answer(&text);
@@ -13839,6 +13932,10 @@ impl App {
     unsafe fn reveal_tick(&mut self) {
         let mut trace = crate::frametrace::frame();
         let mut went_in = 0;
+        if !self.thinking_reveal.is_empty() && self.thinking_revealed_at.elapsed().as_millis() >= THINKING_EVERY_MS {
+            went_in += self.thinking_reveal.len();
+            self.flush_thinking();
+        }
         if !self.reveal.is_empty() && self.revealed_at.elapsed().as_millis() >= REVEAL_EVERY_MS {
             // (a window held up for long does not rush to make up for it)
             let seconds = self.revealed_at.elapsed().as_secs_f32().min(0.1);
@@ -13848,7 +13945,7 @@ impl App {
             (self.reveal_rate, self.reveal_carried) = (rate, carried);
             let at = self.reveal.char_indices().nth(count).map_or(self.reveal.len(), |(at, _)| at);
             let chunk: String = self.reveal.drain(..at).collect();
-            went_in = chunk.len();
+            went_in += chunk.len();
             self.revealing = true;
             self.append_answer(&chunk);
             self.revealing = false;
@@ -13883,7 +13980,7 @@ impl App {
             trace.part(2);
             trace.end(view.1.y - view.0.y, went_in, self.reveal.len());
         }
-        if self.reveal.is_empty() && settled {
+        if self.reveal.is_empty() && self.thinking_reveal.is_empty() && settled {
             self.frames.wanted.store(false, Ordering::Relaxed);
         }
     }
@@ -13934,7 +14031,10 @@ impl App {
         let event = hidden_shown(event);
         self.timeline_event(&event);
         let live_report = matches!(&event, Event::Usage { usage, .. } if usage.prompt == 0 && usage.completion == 0);
-        if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
+        // (thinking that comes waits for the frames with what came of it before; what waits of the answer goes in first)
+        if matches!(event, Event::Reasoning(_)) {
+            self.flush_answer();
+        } else if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
             self.flush_reveal();
         }
         match event {
@@ -13990,15 +14090,20 @@ impl App {
                 self.set_activity(t("Thinking…").into());
             }
             Event::Reasoning(text) => {
+                // (with the frames, as the answer goes in: a piece at a time, each an insertion and a drawing of the transcript of its own, it took the
+                // app's thread a share of a CPU whose cores are what a partially resident model's decode is held by)
                 if self.settings.show_thinking {
-                    self.append(&text, Style::Thinking);
+                    self.thinking_reveal.push_str(&text);
                     self.line_start = text.ends_with('\n');
                     self.thinking_written = true;
+                    self.want_frames();
                 }
                 self.thinking.push_str(&text);
                 self.set_activity(t("Thinking…").into());
             }
             Event::Content(text) => {
+                // (the thinking that waits came before it)
+                self.flush_thinking();
                 if self.answer.is_empty() {
                     // (the words coming say so: the ring alone says it is not done)
                     self.set_activity(" ".into());
@@ -14764,8 +14869,31 @@ impl App {
                     self.fetch_release_setup(release, on_its_own);
                 }
             }
+            Note::EngineFetch { done, whole } => {
+                if self.engine_fetching && self.panel == Panel::Setup {
+                    self.say_in_panel(&tf("Fetching the Straydog engine: {0} of {1}", &[&engine::gb_file(done), &engine::gb_file(whole)]));
+                }
+            }
+            Note::EngineFetched(outcome) => {
+                self.engine_fetching = false;
+                match outcome {
+                    Ok(_) if self.panel == Panel::Setup && self.setup_kind == Kind::Embedded => self.this_pc_chosen(),
+                    Ok(_) => {}
+                    Err(reason) if self.panel == Panel::Setup => self.problem_in_panel(&reason),
+                    Err(reason) => self.say(&reason),
+                }
+            }
             Note::StraydogUpdate(outcome) => match outcome {
-                engine_updates::Result::Ready(version) => self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version])),
+                engine_updates::Result::Ready(version) => {
+                    // (over the engine that runs, it waits for the restart the notice offers; a first engine, with none before it, is selected at once)
+                    self.engine_waiting = engine_updates::waiting(&self.folder);
+                    if self.engine_waiting.is_some() {
+                        self.engine_notice_closed = false;
+                        self.release_update_changed();
+                    } else {
+                        self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version]));
+                    }
+                }
                 engine_updates::Result::ModelNotReady(reason) => self.say(&reason),
                 engine_updates::Result::Failed(_) => {
                     self.say(t("The Straydog update could not be prepared. See engine.log for details."));
@@ -18546,6 +18674,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_keep: make_button(pane, ID_TOGGLE_KEEP, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
+            engine_waiting: None,
+            engine_notice_closed: false,
             checking_setup: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
@@ -18784,6 +18914,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             last_answer: String::new(),
             pending_text: String::new(),
             reveal: String::new(),
+            thinking_reveal: String::new(),
+            thinking_revealed_at: std::time::Instant::now(),
             stream_mask: crate::mask::StreamMask::default(),
             revealed_at: std::time::Instant::now(),
             revealing: false,
@@ -18836,6 +18968,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             remove_all: make_button(pane, ID_REMOVE_ALL, "", ButtonKind::Secondary, theme::background()),
             start_folders: Vec::new(),
             setting_up: false,
+            engine_fetching: false,
             setup_tally: Default::default(),
             licence_link: make_button(window, ID_MODEL_LICENCE, "", ButtonKind::Link, theme::background()),
             setup_cancel: Arc::new(AtomicBool::new(false)),
@@ -18888,6 +19021,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             ShowWindow(window, if app.settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         }
         SetTimer(window, TIMER_ENGINE, 1000, None);
+        // (the engine an update fetched and checked: its turn is this start, before any engine runs, and never a conversation's middle)
+        if let Some(version) = engine_updates::take_waiting(&app.folder) {
+            engine_updates::log_failure(&app.folder, &format!("Straydog {version} selected at the app's start"));
+        }
         engine_updates::prefer_bundled_if_newer(&app.folder);
         // What this copy runs, to see a new build come in over it.
         app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
@@ -19222,16 +19359,21 @@ mod tests {
         assert_eq!(text(Notice::Page { version: "0.2.0".into() }), (said("0.2.0"), t("Open the release page").to_string()));
         // (while the setup comes, the button is how far it has come)
         assert_eq!(text(Notice::Fetching { version: "0.2.0".into(), percent: 37 }), (said("0.2.0"), tf("Downloading… {0}%", &[&37])));
-        // (once it is here and checked, one press updates, and the button says that Dogmind restarts)
-        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: false });
-        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Update now (Dogmind restarts)").to_string()));
-        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: true }).1, t("Checking…"));
+        // (once it is here and checked, one press updates, and the button says that it restarts: a short label, so that what the notice says fits beside it,
+        // as when the engine comes with it)
+        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: false });
+        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: false, checking: true }).1, t("Checking…"));
         // (work under way is waited for, and the same button takes that back)
-        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
-        assert_eq!(text(Notice::UpdateNow { version: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: None, waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: None, engine: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), engine: Some("0.1.19".into()), waiting: false, checking: false }),
+                   (tf("Update: Dogmind {0}, Straydog {1}", &[&"0.2.0", &"0.1.19"]), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::EngineNow { engine: "0.1.19".into(), waiting: false }), (tf("Straydog {0} is ready.", &[&"0.1.19"]), t("Restart to update").to_string()));
+        assert_eq!(text(Notice::EngineNow { engine: "0.1.19".into(), waiting: true }).1, t("Not now"));
         // (what the person reads in English is the words the test names)
         if !lang::is_japanese() {
-            assert_eq!(ready.1, "Update now (Dogmind restarts)");
+            assert_eq!(ready.1, "Restart to update");
         }
     }
 

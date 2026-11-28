@@ -24,6 +24,8 @@ const ROOT: &str = "engine-updates";
 const SELECTED: &str = "selected.txt";
 const PENDING: &str = "awaiting-ready.txt";
 const FAILED: &str = "failed.txt";
+/// An engine fetched and checked over the one that runs, which waits for the app's next start to be selected ([`take_waiting`]).
+const WAITING: &str = "waiting.txt";
 const MOST_RELEASES: usize = 4 << 20;
 const MOST_EXE: u64 = 128 << 20;
 /// How long a new engine's `--check-model` may take. Its first run is the first time Windows sees the program and its cuBLAS libraries (568 MB), and Defender
@@ -474,7 +476,8 @@ pub fn prefer_bundled_if_newer(data: &Path) {
 }
 
 /// Check in the background after app startup. An unreachable GitHub is a normal offline start.
-/// Only a bundled engine is eligible; a person-supplied path remains their choice.
+/// The engine this app runs is eligible (one fetched before, or one beside the app); a person-supplied path remains their choice. With
+/// none at all (an app that comes without one), the newest is fetched and selected, as [`fetch_first`] does.
 pub fn check_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool) -> Option<Result> {
     if !settings.check_straydog_updates
         || settings.straydog.is_some()
@@ -482,28 +485,92 @@ pub fn check_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool) -> O
     {
         return None;
     }
-    let bundled = std::env::current_exe().ok()?.parent()?.join("straydog.exe");
-    if !bundled.is_file() {
+    let running = running_engine(data);
+    // (with none, only once the person has set the app up for this PC's way: before, the setup's choice fetches it (fetch_first), and an app
+    // set up for another way fetches nothing it would not run)
+    if running.is_none() && !(settings.set_up && settings.active_provider().is_some_and(|provider| provider.kind == crate::settings::Kind::Embedded)) {
         return None;
     }
-    let running = selected(data).unwrap_or(bundled.clone());
-    let running_version = version(&running)?;
-    let release = newest(&release_list(stop)?, &running_version)?;
-    if fs::read_to_string(root(data).join(FAILED))
-        .ok()
-        .is_some_and(|failed| failed.trim() == format!("v{}", release.version))
-    {
+    let running_version = match &running {
+        Some(exe) => Some(version(exe)?),
+        None => None,
+    };
+    let release = newest(&release_list(stop)?, running_version.as_deref().unwrap_or(NONE_RUNNING))?;
+    if failed_before(data, &release) {
         return None;
     }
     if crate::machine::connection_is_metered() || stop.load(Ordering::Relaxed) {
         return None;
     }
-    Some(stage(&release, &running, settings, data, stop))
+    let _staging = STAGING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (a first fetch the person asked for may have selected one meanwhile: it is the one that runs, and no other is fetched over it now)
+    if running.is_none() && running_engine(data).is_some() {
+        return None;
+    }
+    Some(stage(&release, running.as_deref(), settings, data, stop))
+}
+
+/// One staging at a time, in this app: the look after the start and a first fetch the person asked for work in the same folder, and each
+/// takes away what it finds half done there (`v{version}.partial`). The second waits, and finds the first's engine.
+static STAGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The version every release is newer than: what an app with no engine compares the releases with.
+const NONE_RUNNING: &str = "0.0.0";
+
+/// The engine this app runs when the person names none: the one fetched and selected, else the one beside the app (a Dogmind up to 0.1.17
+/// came with it). None for an app that has neither yet.
+fn running_engine(data: &Path) -> Option<PathBuf> {
+    let bundled = std::env::current_exe().ok()?.parent()?.join("straydog.exe");
+    selected(data).or_else(|| bundled.is_file().then_some(bundled))
+}
+
+/// Whether this release's engine was selected before and failed to start (its version in [`FAILED`]): it is not fetched again.
+fn failed_before(data: &Path, release: &Candidate) -> bool {
+    fs::read_to_string(root(data).join(FAILED))
+        .ok()
+        .is_some_and(|failed| failed.trim() == format!("v{}", release.version))
+}
+
+/// The engine for a first start, asked for by the person (the setup's "Straydog on this PC") where this app has none: the newest release's,
+/// fetched, checked as an update is (SHA256SUMS, GitHub's digests, the exe's version against the tag, its cuBLAS from the release's zip) and
+/// selected. `told` hears the bytes that have arrived and the whole as they come (the exe and the zip). The setting that turns the background
+/// look off does not hold this back: the person asked for it. The engine's path once it is there, or why it is not.
+pub fn fetch_first(settings: &Settings, data: &Path, stop: &AtomicBool, told: &mut dyn FnMut(u64, u64)) -> std::result::Result<PathBuf, String> {
+    // (after a staging under way, whose engine is then the one: see STAGING)
+    let _staging = STAGING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(running) = running_engine(data) {
+        return Ok(running);
+    }
+    let list = release_list(stop).ok_or_else(|| t("GitHub could not be reached to fetch the Straydog engine. It is fetched once this PC is online.").to_string())?;
+    let release = newest(&list, NONE_RUNNING).ok_or_else(|| t("No Straydog release for this PC was found on GitHub.").to_string())?;
+    if failed_before(data, &release) {
+        return Err(tf("Straydog {0} failed to start on this PC before, so it was not fetched again.", &[&release.version]));
+    }
+    // (the exe, then the zip with cuBLAS: their sizes are the whole; SHA256SUMS is a few hundred bytes)
+    let whole = release.exe.size + release.zip.as_ref().map_or(0, |zip| zip.size);
+    let mut done = 0u64;
+    let mut fetch = |asset: &Setup, target: &Path, stop: &AtomicBool| {
+        let counted = asset.url != release.sums.url;
+        let before = done;
+        let result = updates::fetch_straydog_asset_told(asset, target, stop, &mut |arrived, _| {
+            if counted {
+                told(before + arrived, whole);
+            }
+        });
+        if counted {
+            done = before + asset.size;
+        }
+        result
+    };
+    match stage_with(&release, None, settings, data, stop, &mut fetch) {
+        Result::Ready(_) => selected(data).ok_or_else(|| t("The fetched Straydog engine could not be selected.").to_string()),
+        Result::ModelNotReady(reason) | Result::Failed(reason) => Err(reason),
+    }
 }
 
 fn stage(
     release: &Candidate,
-    running: &Path,
+    running: Option<&Path>,
     settings: &Settings,
     data: &Path,
     stop: &AtomicBool,
@@ -514,13 +581,43 @@ fn stage(
         settings,
         data,
         stop,
-        &mut updates::fetch_straydog_asset,
+        &mut |asset: &Setup, target: &Path, stop: &AtomicBool| updates::fetch_straydog_asset(asset, target, stop),
     )
+}
+
+/// What a staged engine comes to: selected at once where none runs (a first start's), else waiting for the app's next start ([`WAITING`]), which
+/// the person's one restart brings with the app's own update, so that the engine never changes under a conversation.
+fn staged(data: &Path, version: &str, running: Option<&Path>) -> std::io::Result<()> {
+    if running.is_none() {
+        return select(data, version);
+    }
+    let folder = root(data);
+    flushed_partial(&folder.join("waiting.partial"), version)?;
+    fs::rename(folder.join("waiting.partial"), folder.join(WAITING))
+}
+
+/// The engine that waits for the app's next start ([`staged`]): its version, where its folder holds it and it is not the one selected.
+pub fn waiting(data: &Path) -> Option<String> {
+    let version = fs::read_to_string(root(data).join(WAITING)).ok()?.trim().to_string();
+    let here = plain_version(&version) && root(data).join(format!("v{version}")).join("straydog.exe").is_file();
+    let selected_now = selected(data).and_then(|exe| exe.parent()?.file_name()?.to_str().map(str::to_string));
+    (here && selected_now.as_deref() != Some(format!("v{version}").as_str())).then_some(version)
+}
+
+/// At the app's start, before any engine runs: the engine that waits is selected (its first start may roll it back, as any update's), and no
+/// longer waits. Its version where there was one.
+pub fn take_waiting(data: &Path) -> Option<String> {
+    let version = waiting(data);
+    if let Some(version) = &version {
+        select(data, version).ok()?;
+    }
+    let _ = fs::remove_file(root(data).join(WAITING));
+    version
 }
 
 fn stage_with<F>(
     release: &Candidate,
-    running: &Path,
+    running: Option<&Path>,
     settings: &Settings,
     data: &Path,
     stop: &AtomicBool,
@@ -553,7 +650,7 @@ where
                 if let Err(reason) = check_model(&ready, settings, data) {
                     return Ok(Result::ModelNotReady(reason));
                 }
-                select(data, &release.version).map_err(|error| error.to_string())?;
+                staged(data, &release.version, running).map_err(|error| error.to_string())?;
                 return Ok(Result::Ready(release.version.clone()));
             }
             fs::remove_dir_all(&version_folder).map_err(|error| error.to_string())?;
@@ -600,7 +697,7 @@ where
             return Err(t("The engine update was cancelled.").into());
         }
         fs::rename(&partial, &version_folder).map_err(|error| error.to_string())?;
-        select(data, &release.version).map_err(|error| error.to_string())?;
+        staged(data, &release.version, running).map_err(|error| error.to_string())?;
         Ok(Result::Ready(release.version.clone()))
     };
     let outcome = attempt().unwrap_or_else(Result::Failed);
@@ -646,8 +743,11 @@ fn needed_libraries(exe: &Path) -> Option<[String; 2]> {
     Some([cublas.clone(), format!("cublasLt64_{major}.dll")])
 }
 
+/// The cuBLAS libraries the new engine `exe` imports, beside it in `partial`: copied from the running engine's folder where it imports the same,
+/// else from the release's zip, checked against SHA256SUMS. With no engine running (`running` None: a first start's fetch, nothing bundled),
+/// from the zip.
 fn copy_libraries<F>(
-    running: &Path,
+    running: Option<&Path>,
     exe: &Path,
     partial: &Path,
     release: &Candidate,
@@ -660,24 +760,26 @@ where
 {
     let names =
         needed_libraries(exe).ok_or(t("Cannot identify the new engine's cuBLAS dependency."))?;
-    let old = running
-        .parent()
-        .ok_or(t("The current engine folder is missing."))?;
-    let old_names = needed_libraries(running)
-        .ok_or(t("Cannot identify the current engine's cuBLAS dependency."))?;
-    if names == old_names {
-        if !names.iter().all(|name| old.join(name).is_file()) {
-            return Err(t("The current engine's cuBLAS DLL is missing.").into());
+    if let Some(running) = running {
+        let old = running
+            .parent()
+            .ok_or(t("The current engine folder is missing."))?;
+        let old_names = needed_libraries(running)
+            .ok_or(t("Cannot identify the current engine's cuBLAS dependency."))?;
+        if names == old_names {
+            if !names.iter().all(|name| old.join(name).is_file()) {
+                return Err(t("The current engine's cuBLAS DLL is missing.").into());
+            }
+            for name in &names {
+                fs::copy(old.join(name), partial.join(name)).map_err(|error| error.to_string())?;
+            }
+            let license = old.join("NVIDIA-CUDA-LICENSE.txt");
+            if license.is_file() {
+                fs::copy(license, partial.join("NVIDIA-CUDA-LICENSE.txt"))
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(());
         }
-        for name in &names {
-            fs::copy(old.join(name), partial.join(name)).map_err(|error| error.to_string())?;
-        }
-        let license = old.join("NVIDIA-CUDA-LICENSE.txt");
-        if license.is_file() {
-            fs::copy(license, partial.join("NVIDIA-CUDA-LICENSE.txt"))
-                .map_err(|error| error.to_string())?;
-        }
-        return Ok(());
     }
     let zip_name = format!("straydog-v{}-windows-x86_64-cuda.zip", release.version);
     let zip = release.zip.as_ref().ok_or(t(
@@ -976,7 +1078,7 @@ mod tests {
             fs::copy(&source, target).unwrap();
             Ok(())
         };
-        copy_libraries(&running, &exe, &partial, &release, &sums, &stop, &mut fetch).unwrap();
+        copy_libraries(Some(&running), &exe, &partial, &release, &sums, &stop, &mut fetch).unwrap();
         assert_eq!(fs::read(partial.join("cublas64_14.dll")).unwrap(), b"MZ14");
         assert_eq!(
             fs::read(partial.join("cublasLt64_14.dll")).unwrap(),
@@ -988,7 +1090,7 @@ mod tests {
         );
         assert!(!partial.join(zip_name).exists());
         assert!(
-            copy_libraries(&running, &exe, &partial, &release, "bad sum", &stop, &mut fetch)
+            copy_libraries(Some(&running), &exe, &partial, &release, "bad sum", &stop, &mut fetch)
                 .is_err()
         );
     }
@@ -1027,7 +1129,7 @@ mod tests {
             Ok(())
         };
         let error =
-            copy_libraries(&running, &exe, &partial, &release, "", &stop, &mut fetch).unwrap_err();
+            copy_libraries(Some(&running), &exe, &partial, &release, "", &stop, &mut fetch).unwrap_err();
         assert!(error.contains("cuBLAS DLL"), "{error}");
         assert!(!fetched);
     }
@@ -1277,7 +1379,7 @@ mod tests {
             Ok(())
         };
         let started = Instant::now();
-        let outcome = stage_with(&release, &running, &settings, data.path(), &stop, &mut fetched);
+        let outcome = stage_with(&release, Some(&running), &settings, data.path(), &stop, &mut fetched);
         assert!(matches!(&outcome, Result::ModelNotReady(reason) if reason == t("The new Straydog model check timed out.")), "{outcome:?}");
         assert!(started.elapsed() < Duration::from_secs(4), "ended at its limit: {:?}", started.elapsed());
         assert!(selected(data.path()).is_none());
@@ -1286,9 +1388,73 @@ mod tests {
         // (the next look: the program is there and checked again, in its time now)
         fs::write(engine::config_path(data.path()), "model = 'ready'\n").unwrap();
         let mut no_download = |_: &Setup, _: &Path, _: &AtomicBool| -> std::result::Result<(), updates::Failed> { panic!("the update put in place should be checked again") };
-        assert_eq!(stage_with(&release, &running, &settings, data.path(), &stop, &mut no_download), Result::Ready("0.1.11".into()));
+        assert_eq!(stage_with(&release, Some(&running), &settings, data.path(), &stop, &mut no_download), Result::Ready("0.1.11".into()));
         TEST_CHECK_LIMIT.with(|limit| limit.set(None));
         assert_eq!(model_check_limit(), Duration::from_secs(30));
+    }
+
+    /// An app that comes without an engine (0.1.18 on): with none running, the first release fetched brings its cuBLAS from the release's zip,
+    /// checked against SHA256SUMS, and is selected at once; it is then the engine the app runs, and a release that failed to start before is
+    /// not fetched again.
+    #[test]
+    fn an_app_without_an_engine_selects_the_first_one_fetched_with_its_cublas_from_the_zip() {
+        use std::io::Write;
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let data = crate::in_container::tempdir().unwrap();
+        let source = data.path().join("engine.rs");
+        fs::write(&source, r#"
+            fn main() {
+                let args: Vec<String> = std::env::args().collect();
+                if args.iter().any(|arg| arg == "--version") { println!("straydog 0.1.18"); return }
+                if args.iter().any(|arg| arg == "--dlls") { println!("cublas64_13.dll cublasLt64_13.dll"); }
+            }
+        "#).unwrap();
+        let candidate_exe = data.path().join("engine.exe");
+        assert!(Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into())).arg(&source).arg("-o").arg(&candidate_exe).status().unwrap().success());
+        let zip_name = "straydog-v0.1.18-windows-x86_64-cuda.zip";
+        let zip_file = data.path().join(zip_name);
+        let mut archive = zip::ZipWriter::new(fs::File::create(&zip_file).unwrap());
+        for (name, body) in [("cublas64_13.dll", b"MZ13".as_slice()), ("cublasLt64_13.dll", b"MZLT13".as_slice()), ("NVIDIA-CUDA-LICENSE.txt", b"license".as_slice())] {
+            archive.start_file(format!("straydog-v0.1.18-windows-x86_64-cuda/{name}"), zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(body).unwrap();
+        }
+        archive.finish().unwrap();
+        let (exe_hash, zip_hash) = (sha256(&candidate_exe).unwrap(), sha256(&zip_file).unwrap());
+        let sums = format!("{exe_hash}  {EXE}\n{zip_hash}  {zip_name}\n");
+        let release = Candidate {
+            version: "0.1.18".into(),
+            exe: Setup { url: EXE.into(), size: fs::metadata(&candidate_exe).unwrap().len(), sha256: exe_hash, parts: None },
+            sums: Setup { url: SUMS.into(), size: sums.len() as u64, sha256: format!("{:x}", Sha256::digest(sums.as_bytes())), parts: None },
+            zip: Some(Setup { url: zip_name.into(), size: fs::metadata(&zip_file).unwrap().len(), sha256: zip_hash, parts: None }),
+        };
+        let stop = AtomicBool::new(false);
+        let mut asked = Vec::new();
+        let mut fetched = |asset: &Setup, path: &Path, _: &AtomicBool| {
+            asked.push(asset.url.clone());
+            match asset.url.as_str() {
+                SUMS => fs::write(path, &sums).unwrap(),
+                EXE => { fs::copy(&candidate_exe, path).unwrap(); }
+                _ => { fs::copy(&zip_file, path).unwrap(); }
+            }
+            Ok(())
+        };
+        assert!(selected(data.path()).is_none());
+        let outcome = stage_with(&release, None, &Settings::default(), data.path(), &stop, &mut fetched);
+        assert_eq!(outcome, Result::Ready("0.1.18".into()));
+        assert_eq!(asked, [SUMS, EXE, zip_name], "with nothing running, the libraries come from the zip");
+        let engine = selected(data.path()).expect("the first one fetched is selected");
+        assert_eq!(engine, root(data.path()).join("v0.1.18").join("straydog.exe"));
+        let folder = engine.parent().unwrap();
+        assert_eq!(fs::read(folder.join("cublas64_13.dll")).unwrap(), b"MZ13");
+        assert_eq!(fs::read(folder.join("cublasLt64_13.dll")).unwrap(), b"MZLT13");
+        assert!(folder.join("NVIDIA-CUDA-LICENSE.txt").is_file() && !folder.join(zip_name).exists());
+        assert_eq!(running_engine(data.path()).as_deref(), Some(engine.as_path()), "the one the app runs now");
+        // (its first start is the one that may roll it back, as for any update: with none before it, to no engine)
+        assert!(rollback_if_pending(data.path(), &engine));
+        assert!(selected(data.path()).is_none());
+        assert!(failed_before(data.path(), &release), "and it is not fetched again");
     }
 
     #[cfg(windows)]
@@ -1371,7 +1537,7 @@ mod tests {
         assert!(matches!(
             stage_with(
                 &release,
-                &running,
+                Some(&running),
                 &settings,
                 data.path(),
                 &stop,
@@ -1393,7 +1559,7 @@ mod tests {
         assert!(matches!(
             stage_with(
                 &release,
-                &running,
+                Some(&running),
                 &settings,
                 data.path(),
                 &stop,
@@ -1411,7 +1577,7 @@ mod tests {
         assert!(matches!(
             stage_with(
                 &release,
-                &running,
+                Some(&running),
                 &settings,
                 data.path(),
                 &stop,
@@ -1419,6 +1585,11 @@ mod tests {
             ),
             Result::Ready(_)
         ));
+        // (over a running engine it waits for the app's next start, and is selected then)
+        assert!(selected(data.path()).is_none());
+        assert_eq!(waiting(data.path()).as_deref(), Some("0.1.11"));
+        assert_eq!(take_waiting(data.path()).as_deref(), Some("0.1.11"));
+        assert!(waiting(data.path()).is_none() && take_waiting(data.path()).is_none(), "taken once");
         assert!(selected(data.path()).is_some());
         let attempted = selected(data.path()).unwrap();
         assert!(rollback_if_pending(data.path(), &attempted));
