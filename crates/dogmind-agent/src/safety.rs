@@ -443,16 +443,18 @@ fn command_parts(line: &str) -> Vec<&str> {
 pub fn uses_network(command: &str) -> bool {
     const WORDS: &str = concat!(
         r"(curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|ssh|scp|sftp|ftp|nslookup)",
-        r"|(pip|pip3|uv|npm|pnpm|yarn|cargo|winget|choco|scoop|dotnet|go)\s+(install|add|publish|update|upgrade|sync|restore|fetch|get|download)",
+        // (a program's own switches may come before what it is told to do: `pip --no-cache-dir install`, `npm --silent install`)
+        r"|(pip|pip3|uv|npm|pnpm|yarn|cargo|winget|choco|scoop|dotnet|go)(?:\s+--?[a-z][\w-]*(?:=\S+)?)*\s+(install|add|publish|update|upgrade|sync|restore|fetch|get|download)",
         r"|(npm|pnpm|yarn)\s+(i|ci)",
         r"|git\s+(push|pull|fetch|clone|ls-remote|submodule)",
     );
     // (`do @curl` in a `for` is the same curl: the `@` that keeps it from being echoed can come after the word that starts it)
-    let run = Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\d.]+)?\s+-m\s+(?:pip|uv)\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid");
+    let run = Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\w.]+)*?\s+-m\s+(?:pip|uv)(?:\s+--?[a-z][\w-]*(?:=\S+)?)*\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid");
     let shell = Regex::new(r"(?i)^\s*@?(?:call\s+)?(?:cmd|powershell|pwsh|bash|sh|wsl)\b").expect("the pattern is valid");
     let anywhere = Regex::new(&format!(r"(?i)\b(?:{WORDS})\b")).expect("the pattern is valid");
     let before_program = Regex::new(r"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*").expect("the pattern is valid");
-    let line = command.replace('^', "");
+    // (git's own options before its subcommand say nothing of what it does: `git -C sub push` pushes)
+    let line = without_git_options(&command.replace('^', "")).into_owned();
     command_parts(&line).iter().any(|part| {
         // (a program by its path or in quotes is the same program)
         let at = before_program.find(part).map_or(0, |found| found.end());
@@ -474,6 +476,7 @@ pub fn network_reach(command: &str, compound: bool) -> Option<String> {
     if compound {
         return None;
     }
+    let command = without_git_options(command);
     let mut words = command.split_whitespace();
     let first = words.next()?.rsplit(['\\', '/']).next()?.trim_matches('"').to_lowercase();
     let program = first.strip_suffix(".exe").unwrap_or(&first);
@@ -481,13 +484,14 @@ pub fn network_reach(command: &str, compound: bool) -> Option<String> {
     let reach = match program {
         "curl" | "wget" => fetched_site(program, &rest)?,
         "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "uv" | "cargo" | "go" | "dotnet" | "winget" | "choco" | "scoop" => {
-            let verb = rest.first()?.to_lowercase();
+            // (after the program's own switches, as `pip --no-cache-dir install`)
+            let verb = rest.iter().find(|word| !word.starts_with('-'))?.to_lowercase();
             ["install", "i", "ci", "add", "update", "upgrade", "sync", "restore", "fetch", "get", "download"].contains(&verb.as_str()).then_some(verb)?
         }
         // (as often written as `pip` itself)
         "python" | "python3" | "py" => {
             let at = rest.iter().position(|word| *word == "-m")?;
-            let verb = rest.get(at + 2)?.to_lowercase();
+            let verb = rest.iter().skip(at + 2).find(|word| !word.starts_with('-'))?.to_lowercase();
             (rest.get(at + 1).is_some_and(|module| module.eq_ignore_ascii_case("pip")) && ["install", "download"].contains(&verb.as_str())).then_some(verb)?
         }
         // What it runs is fetched first unless it is in the project already, and it cannot be told which from here.
@@ -817,7 +821,7 @@ impl Gate {
                 // What cmd works out before it reads the line: `%x:~1,1%` can be any letter of any variable, a `&` from `%CMDCMDLINE%` as well, so the line says nothing of what runs.
                 r"%[^%]*:[^%]*%", r"%cmdcmdline%",
                 r"\b(rm|del|erase|rd|rmdir|mv|move|ren|rename|kill|taskkill|stop-process)\b", r"\b(curl|wget|iwr|irm|invoke-webrequest|ssh|scp)\b",
-                r"\b(pip|uv|npm|pnpm|yarn|cargo|winget|choco|scoop)\s+(install|add|publish|update|uninstall)\b", r"\bgit\s+(push|pull|fetch|clone|reset|clean|checkout|rebase|commit)\b",
+                r"\b(pip|uv|npm|pnpm|yarn|cargo|winget|choco|scoop)(\s+--?[a-z][\w-]*(=\S+)?)*\s+(install|add|publish|update|uninstall)\b", r"\bgit\s+(push|pull|fetch|clone|reset|clean|checkout|rebase|commit)\b",
                 r"\b(cmd|powershell|pwsh|bash|sh)(\.exe)?\b.*\s(/c|-[a-z]*c|-command|-encodedcommand|-e)\b",
                 // Words the safe list lets through, that change something.
                 r"\bgit\s+branch\b.*\s(-[a-z]*[dmfcu][a-z]*(\s|$)|--delete|--move|--force|--copy|--set-upstream|--unset-upstream|--edit-description|--track|--no-track|--create-reflog)", r"\bgit\s+(log|show|diff)\b.*\s(--output|--ext-diff)\b", r"\brg\b.*\s--pre\b",
@@ -846,7 +850,10 @@ impl Gate {
     /// A command's risk by its text, and the model's own word: a rule's `safe` is not raised by the model's, as a model
     /// that says `medium` of `git status` would only spend the person's attention.
     pub fn command_risk(&self, command: &str, stated: Option<Risk>) -> Result<Risk, String> {
-        let read = as_cmd_reads(command);
+        // (git's own options before its subcommand say nothing of what it does: `git -C sub reset --hard` is a `git reset --hard`)
+        // (taken out where its quotes still say what is one word, `-C "my dir"`, and again once cmd's escapes are gone, `g^it -C x reset`)
+        let reads = as_cmd_reads(command);
+        let read = without_git_options(&as_cmd_reads(&without_git_options(command))).into_owned();
         if self.denied.is_match(&read) {
             return Err(format!("blocked, it can destroy the system: {command}"));
         }
@@ -854,7 +861,7 @@ impl Gate {
         if self.high.is_match(&read) || self.names_a_secret(command) || names_a_place_off_this_pc(command).is_some() {
             return Ok(Risk::High);
         }
-        let medium = self.medium.is_match(&without_what_a_program_is_given(command)) || names_a_new_branch(&read);
+        let medium = self.medium.is_match(&without_git_options(&without_what_a_program_is_given(&without_git_options(command)))) || names_a_new_branch(&read) || sets_gits_config(&reads);
         if !self.is_compound(command) && !medium && self.safe.is_match(command) {
             return Ok(Risk::Safe);
         }
@@ -1038,7 +1045,7 @@ impl Gate {
             } else if !within(workspace, &full) {
                 Some((Risk::High, reason_of(REASON_OUTSIDE, &[&shown])))
             // A hook or a line of config there runs outside the sandbox, the next time a person uses git here.
-            } else if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
+            } else if in_gits_folder(&full) {
                 Some((Risk::High, reason_of(REASON_GIT_FOLDER, &[&shown])))
             // A file too large for a rewind to keep a copy of: written over or taken away, it cannot be brought back, and the person is told so.
             } else if std::fs::metadata(&full).is_ok_and(|found| found.is_file() && found.len() > crate::checkpoint::MOST_KEPT) {
@@ -1074,6 +1081,26 @@ fn without_what_a_program_is_given(command: &str) -> String {
         }
     }).collect();
     parts.join(" & ")
+}
+
+/// A line with git's own options before each git's subcommand taken out: `git -C sub reset --hard`, `git -c a=b --no-pager checkout -- .` and `git.exe
+/// --git-dir=x clean -fd` are what they do without them, a `git reset --hard`, a `git checkout -- .` and a `git clean -fd`, and every check that looks for a
+/// subcommand finds it so. (What `-c` sets for the run is looked at by [`sets_gits_config`], on the line as it was.)
+fn without_git_options(command: &str) -> std::borrow::Cow<'_, str> {
+    static OPTIONS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let options = OPTIONS.get_or_init(|| Regex::new(concat!(
+        r#"(?i)\bgit(?:\.exe)?"?(?:\s+(?:-c\s+(?:"[^"]*"|\S+)|--(?:git-dir|work-tree|namespace|exec-path|super-prefix|config-env|attr-source)(?:=(?:"[^"]*"|\S+)|\s+(?:"[^"]*"|\S+))"#,
+        r#"|--(?:no-pager|paginate|bare|no-replace-objects|no-lazy-fetch|no-optional-locks|no-advice|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs)|-p))*(?:\s|$)"#,
+    )).expect("the pattern is valid"));
+    options.replace_all(command, "git ")
+}
+
+/// A git command that sets config for its run (`git -c core.pager=… log`, `--config-env`): a line of config can name a program to run (a pager, an editor,
+/// an ssh command, an alias), so whatever the subcommand, the line is more than a look, and asks. (`-c` and `-C` are told apart: `-C` names a folder.)
+fn sets_gits_config(command: &str) -> bool {
+    static SHAPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    SHAPE.get_or_init(|| Regex::new(r#"(?i:\bgit(?:\.exe)?)"?(?:\s+(?:-C\s+(?:"[^"]*"|\S+)|--[a-z][\w-]*(?:=(?:"[^"]*"|\S+))?|-[pP]))*?\s+(?:-c\s|--config-env\b)"#).expect("the pattern is valid"))
+        .is_match(command)
 }
 
 /// `git branch name` makes a branch, for all that its first words are those of a look at them. After a word that lists, what follows is what to list.
@@ -1176,6 +1203,13 @@ fn command_path() -> Vec<PathBuf> {
 }
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
+/// Whether a path is in a `.git` folder, as Windows opens it (`.git.\hooks` and `.git \config` open `.git\hooks` and `.git\config`; `.git::$INDEX_ALLOCATION`
+/// is `.git`) and where it really leads (a junction or a link in the workspace to a `.git`, a short name for one), as `within` looks at both.
+fn in_gits_folder(path: &Path) -> bool {
+    let has = |path: &Path| as_opened(&path.to_string_lossy().replace('\\', "/").to_lowercase()).split('/').any(|part| part == ".git");
+    has(path) || real_path(path).is_some_and(|real| has(&real))
+}
+
 pub(crate) fn within(workspace: &Path, path: &Path) -> bool {
     // (a workspace's root made a link since, by a command, leads wherever it likes: nothing is in it then)
     if std::fs::symlink_metadata(workspace).is_ok_and(|found| found.file_type().is_symlink() || reparse_point(&found)) {
@@ -2019,16 +2053,82 @@ mod tests {
         assert!(!covered(&cdn, &[], &[], &["curl example.com".to_string()]));
     }
 
+    /// git's own options before its subcommand (`-C dir`, `-c name=value`, `--git-dir`, `--no-pager`…) do not hide what it does: each line is as risky as
+    /// it is without them, and so is its network; a config set for the run (which can name a program to run) makes any git command ask.
+    #[test]
+    fn gits_options_before_its_subcommand_do_not_hide_what_it_does() {
+        let gate = Gate::new();
+        for (with, without) in [
+            ("git -C sub reset --hard", "git reset --hard"),
+            ("git -C \"my dir\" clean -fd", "git clean -fd"),
+            ("git -c core.autocrlf=false checkout -- .", "git checkout -- ."),
+            ("git --no-pager -C x restore a.txt", "git restore a.txt"),
+            ("git --git-dir=.git --work-tree . stash drop", "git stash drop"),
+            ("git.exe -C sub push --force origin main", "git push --force origin main"),
+            ("git -C sub commit -m x", "git commit -m x"),
+            ("git -C sub branch topic", "git branch topic"),
+        ] {
+            assert_eq!(gate.command_risk(with, None), gate.command_risk(without, None), "{with}");
+        }
+        assert_eq!(gate.command_risk("git -C sub reset --hard", None), Ok(Risk::High));
+        assert_eq!(gate.command_risk("g^it -C sub reset --hard", None), Ok(Risk::High), "cmd's escape");
+        for line in ["git -C sub push origin main", "git -C sub fetch", "git --no-pager -C sub clone https://example.com/r.git", "python -m pip --no-cache-dir install requests",
+                     "pip --disable-pip-version-check install requests", "npm --silent install"] {
+            assert!(uses_network(line), "{line}");
+        }
+        assert_eq!(network_reach("git -C sub fetch", false).as_deref(), Some("git fetch"));
+        assert_eq!(network_reach("pip --no-cache-dir install requests", false).as_deref(), Some("pip install"));
+        assert_eq!(network_reach("python -m pip --no-cache-dir install requests", false).as_deref(), Some("python install"));
+        assert_eq!(network_reach("git -C sub push", false), None, "what sends is its own question");
+        assert_eq!(gate.command_risk("pip --no-cache-dir install requests", None), Ok(Risk::Medium));
+        // (config set for the run can name a program: asked, and no look)
+        for line in ["git -c core.pager=calc log", "git -C sub -c alias.x=!calc x", "git --config-env=core.editor=ED status"] {
+            assert_eq!(gate.command_risk(line, None), Ok(Risk::Medium), "{line}");
+            assert!(!gate.is_look(line), "{line}");
+        }
+        // (not a look: where -C points is not this folder)
+        assert_eq!(gate.command_risk("git -C sub status", None), Ok(Risk::Low));
+        // (nothing else is taken for git's options)
+        assert_eq!(gate.command_risk("git status", None), Ok(Risk::Safe));
+        assert!(!uses_network("python -c \"print('git -C x push')\""), "words handed to a program are not its own");
+    }
+
     #[test]
     fn writing_in_gits_own_folder_asks_a_person_in_every_mode() {
         let gate = Gate::new();
         let root = Path::new("C:\\work");
-        for path in [".git\\config", ".git/hooks/pre-commit", "sub\\.GIT\\config"] {
+        // (also as Windows opens it: a trailing dot or space, or a stream's name, is the same folder)
+        for path in [".git\\config", ".git/hooks/pre-commit", "sub\\.GIT\\config", ".git.\\hooks\\pre-commit", ".git \\config", "sub\\.git. .\\config", ".git::$INDEX_ALLOCATION\\hooks\\x"] {
             let Verdict::Ask { risk, reason } = gate.check("create_file", &json!({"path": path, "content": ""}), root) else { panic!("{path}") };
             assert!(!delegated(Mode::Auto, "create_file", risk, reason.as_deref(), true), "{path}");
         }
         assert!(matches!(gate.check("create_file", &json!({"path": ".gitignore", "content": ""}), root), Verdict::Ask { risk: Risk::Low, reason: None }));
         assert!(matches!(gate.check("create_file", &json!({"path": ".github\\x.yml", "content": ""}), root), Verdict::Ask { risk: Risk::Low, reason: None }));
+        assert!(matches!(gate.check("create_file", &json!({"path": ".git.txt", "content": ""}), root), Verdict::Ask { risk: Risk::Low, reason: None }));
+    }
+
+    /// A junction in the workspace to its `.git` leads into it: writing through it is writing in git's own folder, and asks as that does.
+    #[test]
+    fn a_junction_to_gits_folder_is_gits_folder() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join(".git").join("hooks")).unwrap();
+        #[cfg(windows)]
+        let made = {
+            let mut command = std::process::Command::new("cmd");
+            command.arg("/c").arg("mklink").arg("/J").arg(work.join("plain")).arg(work.join(".git")).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            crate::tools::no_window(&mut command);
+            command.status().is_ok_and(|status| status.success())
+        };
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(work.join(".git"), work.join("plain")).is_ok();
+        if !made {
+            panic!("no link could be made here, so this was not tested");
+        }
+        let gate = Gate::new();
+        let Verdict::Ask { risk, reason } = gate.check("create_file", &json!({"path": "plain\\hooks\\pre-commit", "content": ""}), &work) else { panic!("asked") };
+        assert_eq!(risk, Risk::High);
+        assert!(!delegated(Mode::Auto, "create_file", risk, reason.as_deref(), true));
     }
 
     #[test]
