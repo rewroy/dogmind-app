@@ -79,13 +79,13 @@ fn address_key(url: &str) -> String {
 impl Web {
     /// What the person wrote: its addresses may be read.
     pub fn note_typed(&mut self, text: &str) {
-        let pattern = Regex::new(r#"(?i)https?://[^\s<>"'\)\]」』）、。]+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?][^\s<>"'\)\]」』）、。]*)?"#).expect("the pattern is valid");
+        let pattern = { static TYPED: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); TYPED.get_or_init(|| Regex::new(r#"(?i)https?://[^\s<>"'\)\]」』）、。]+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?][^\s<>"'\)\]」』）、。]*)?"#).expect("the pattern is valid")) };
         self.known.extend(pattern.find_iter(text).map(|found| address_key(found.as_str())));
     }
 
     /// What the web gave: results and links. An address a page names cannot hold what is on this machine.
     pub fn note_found(&mut self, text: &str) {
-        let pattern = Regex::new(r#"https?://[^\s<>"'\)\]]+"#).expect("the pattern is valid");
+        let pattern = { static FOUND: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); FOUND.get_or_init(|| Regex::new(r#"https?://[^\s<>"'\)\]]+"#).expect("the pattern is valid")) };
         self.known.extend(pattern.find_iter(text).map(|found| address_key(found.as_str())));
     }
 
@@ -774,7 +774,7 @@ fn decode_entities(text: &str) -> String {
 }
 
 fn strip_tags(html: &str) -> String {
-    let tags = Regex::new(r"<[^>]*>").expect("the pattern is valid");
+    let tags = { static TAGS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); TAGS.get_or_init(|| Regex::new(r"<[^>]*>").expect("the pattern is valid")) };
     let text = decode_entities(&tags.replace_all(html, ""));
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     clean(&text)
@@ -1028,9 +1028,9 @@ fn push_text(text: &mut String, link: &mut Option<(String, String)>, raw: &str, 
 }
 
 fn parse_duckduckgo(page: &str, limit: usize) -> Vec<Hit> {
-    let block = Regex::new(r#"(?i)<div[^>]+class="([^"]*\bresult\b[^"]*)""#).expect("the pattern is valid");
-    let title = Regex::new(r#"(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>|<a[^>]+href="([^"]+)"[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>"#).expect("the pattern is valid");
-    let snippet = Regex::new(r#"(?is)class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|td)>"#).expect("the pattern is valid");
+    let block = { static BLOCK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); BLOCK.get_or_init(|| Regex::new(r#"(?i)<div[^>]+class="([^"]*\bresult\b[^"]*)""#).expect("the pattern is valid")) };
+    let title = { static TITLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); TITLE.get_or_init(|| Regex::new(r#"(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>|<a[^>]+href="([^"]+)"[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>"#).expect("the pattern is valid")) };
+    let snippet = { static SNIPPET: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); SNIPPET.get_or_init(|| Regex::new(r#"(?is)class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|td)>"#).expect("the pattern is valid")) };
     let starts: Vec<(usize, String)> = block.captures_iter(page).map(|found| (found.get(0).map_or(0, |whole| whole.start()), found[1].to_string())).collect();
     let mut hits = Vec::new();
     for (at, (start, classes)) in starts.iter().enumerate() {
@@ -1062,9 +1062,12 @@ fn ddg_target(raw: &str) -> String {
 }
 
 fn parse_bing(xml: &str, limit: usize) -> Vec<Hit> {
-    let item = Regex::new(r"(?is)<item>(.*?)</item>").expect("the pattern is valid");
+    let item = { static ITEM: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); ITEM.get_or_init(|| Regex::new(r"(?is)<item>(.*?)</item>").expect("the pattern is valid")) };
+    // (the three fields asked for, each built once)
+    static FIELDS: std::sync::OnceLock<[(&str, Regex); 3]> = std::sync::OnceLock::new();
+    let fields = FIELDS.get_or_init(|| ["link", "title", "description"].map(|name| (name, Regex::new(&format!(r"(?is)<{name}>(.*?)</{name}>")).expect("the pattern is valid"))));
     let field = |part: &str, name: &str| -> String {
-        let pattern = Regex::new(&format!(r"(?is)<{name}>(.*?)</{name}>")).expect("the pattern is valid");
+        let Some((_, pattern)) = fields.iter().find(|(known, _)| *known == name) else { return String::new() };
         pattern.captures(part).map_or(String::new(), |found| {
             let raw = found[1].trim();
             let raw = raw.strip_prefix("<![CDATA[").and_then(|inner| inner.strip_suffix("]]>")).unwrap_or(raw);

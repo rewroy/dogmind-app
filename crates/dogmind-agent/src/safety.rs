@@ -449,10 +449,15 @@ pub fn uses_network(command: &str) -> bool {
         r"|git\s+(push|pull|fetch|clone|ls-remote|submodule)",
     );
     // (`do @curl` in a `for` is the same curl: the `@` that keeps it from being echoed can come after the word that starts it)
-    let run = Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\w.]+)*?\s+-m\s+(?:pip|uv)(?:\s+--?[a-z][\w-]*(?:=\S+)?)*\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid");
-    let shell = Regex::new(r"(?i)^\s*@?(?:call\s+)?(?:cmd|powershell|pwsh|bash|sh|wsl)\b").expect("the pattern is valid");
-    let anywhere = Regex::new(&format!(r"(?i)\b(?:{WORDS})\b")).expect("the pattern is valid");
-    let before_program = Regex::new(r"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*").expect("the pattern is valid");
+    // (built once: every command's every check asks this)
+    static RUN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static SHELL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static ANYWHERE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static BEFORE_PROGRAM: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\w.]+)*?\s+-m\s+(?:pip|uv)(?:\s+--?[a-z][\w-]*(?:=\S+)?)*\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid"));
+    let shell = SHELL.get_or_init(|| Regex::new(r"(?i)^\s*@?(?:call\s+)?(?:cmd|powershell|pwsh|bash|sh|wsl)\b").expect("the pattern is valid"));
+    let anywhere = ANYWHERE.get_or_init(|| Regex::new(&format!(r"(?i)\b(?:{WORDS})\b")).expect("the pattern is valid"));
+    let before_program = BEFORE_PROGRAM.get_or_init(|| Regex::new(r"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*").expect("the pattern is valid"));
     // (git's own options before its subcommand say nothing of what it does: `git -C sub push` pushes)
     let line = without_git_options(&command.replace('^', "")).into_owned();
     command_parts(&line).iter().any(|part| {
@@ -625,7 +630,7 @@ pub fn line_parts(line: &str) -> LineParts {
         return LineParts::Whole;
     }
     // (filled in before cmd reads the line, so that what it holds could be any command at all)
-    let variable = Regex::new(r#"%[^%\s]+%|%[^%\s:="]+:[^%\r\n]*%"#).expect("the pattern is valid");
+    let variable = { static VARIABLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); VARIABLE.get_or_init(|| Regex::new(r#"%[^%\s]+%|%[^%\s:="]+:[^%\r\n]*%"#).expect("the pattern is valid")) };
     if variable.is_match(line) {
         return LineParts::Unreadable;
     }
@@ -742,9 +747,9 @@ fn for_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), LinePar
     if depth > 2 {
         return Err(LineParts::Whole);
     }
-    let shape = Regex::new(r"(?is)^for\s+%([A-Za-z])\s+in\s*\(([^()]*)\)\s*do\s+(.*)$").expect("the pattern is valid");
+    let shape = { static SHAPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); SHAPE.get_or_init(|| Regex::new(r"(?is)^for\s+%([A-Za-z])\s+in\s*\(([^()]*)\)\s*do\s+(.*)$").expect("the pattern is valid")) };
     let Some(found) = shape.captures(line) else {
-        let switched = Regex::new(r"(?i)^for\s+/").expect("the pattern is valid");
+        let switched = { static SWITCHED: std::sync::OnceLock<Regex> = std::sync::OnceLock::new(); SWITCHED.get_or_init(|| Regex::new(r"(?i)^for\s+/").expect("the pattern is valid")) };
         return Err(if switched.is_match(line) { LineParts::Unreadable } else { LineParts::Whole });
     };
     let (name, words, body) = (&found[1], &found[2], &found[3]);
