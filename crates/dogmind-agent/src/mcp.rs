@@ -844,14 +844,18 @@ impl HttpLink {
 }
 
 impl Drop for HttpLink {
-    /// The session ends with this side of it, as the protocol asks of a client that is done.
+    /// The session ends with this side of it, as the protocol asks of a client that is done: said on a thread of its own, as a server that does not
+    /// answer would hold the app's end, or its reload of the servers, for seconds.
     fn drop(&mut self) {
         self.listening = None;
         let Some(session) = self.session.take() else { return };
         let mut headers = self.headers.clone();
         headers.push(("Mcp-Session-Id".into(), session));
-        let never = AtomicBool::new(false);
-        let _ = crate::http::request_within("DELETE", &self.url, &headers, Duration::from_secs(2), &never, Duration::from_secs(3));
+        let url = self.url.clone();
+        let _ = std::thread::Builder::new().name("mcp-session-end".into()).spawn(move || {
+            let never = AtomicBool::new(false);
+            let _ = crate::http::request_within("DELETE", &url, &headers, Duration::from_secs(2), &never, Duration::from_secs(3));
+        });
     }
 }
 
@@ -1315,7 +1319,8 @@ impl LastWords {
             let (mut reader, mut line) = (BufReader::new(stderr), Vec::new());
             loop {
                 line.clear();
-                if matches!(reader.read_until(b'\n', &mut line), Ok(0) | Err(_)) {
+                // (a line no longer than is kept of it and some: a server that writes on with no line break is not held in memory for it)
+                if matches!(read_line_within(&mut reader, &mut line, 64 << 10), Ok(0) | Err(_)) {
                     break;
                 }
                 let text: String = String::from_utf8_lossy(&line).trim().chars().take(Self::CHARS).collect();

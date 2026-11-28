@@ -690,14 +690,28 @@ impl Response<'_> {
         }
     }
 
+    /// The whole answer, as text, no larger than [`MOST_TEXT`]: a server that sends on and on with no end is not kept in memory for it.
     pub fn text(&mut self) -> Result<String, Failure> {
+        self.text_within(MOST_TEXT)
+    }
+
+    /// [`text`](Response::text), no larger than `most` bytes: past that, the answer is given up and the connection with it.
+    pub fn text_within(&mut self, most: usize) -> Result<String, Failure> {
         let mut body = Vec::new();
         while let Some(bytes) = self.next()? {
+            if body.len() + bytes.len() > most {
+
+                return Err(Failure::Stream(format!("the answer is larger than {} MiB", most >> 20)));
+            }
             body.extend_from_slice(&bytes);
         }
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 }
+
+/// The most of an answer read whole ([`Response::text`]): as much as an MCP message may be, more than any answer of a model's or a page's that is
+/// read so.
+pub const MOST_TEXT: usize = 64 << 20;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1176,6 +1190,18 @@ pub(crate) mod tests {
         let mut response = request("GET", &url, &[], None, Duration::from_secs(5), &cancel).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.text().unwrap(), "hello world");
+    }
+
+    /// An answer read whole stops at its bound: past it, it is given up with an error and not kept in memory (`text` holds [`MOST_TEXT`]).
+    #[test]
+    fn an_answer_read_whole_stops_at_its_bound() {
+        let cancel = AtomicBool::new(false);
+        let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n01234567890123456789");
+        let mut response = request("GET", &url, &[], None, Duration::from_secs(5), &cancel).unwrap();
+        assert!(response.text_within(10).err().unwrap().to_string().contains("larger than"));
+        let url = serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+        let mut response = request("GET", &url, &[], None, Duration::from_secs(5), &cancel).unwrap();
+        assert_eq!(response.text_within(11).unwrap(), "hello world", "the bound itself is within");
     }
 
     #[test]
