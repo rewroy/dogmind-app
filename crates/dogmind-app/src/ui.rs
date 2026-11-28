@@ -770,6 +770,17 @@ enum ReleaseUpdate {
     Ready(updates::Ready),
 }
 
+/// What About says of Straydog's update besides the engine that waits for the restart (`engine_waiting`), as it says the app's.
+enum EngineLook {
+    None,
+    /// The person's look, under way: the button says so.
+    Checking,
+    /// A release's engine on its way: how far.
+    Fetching { version: String, done: u64, total: u64 },
+    /// What a look came to, and whether that is a trouble.
+    Said(String, bool),
+}
+
 /// What About says when the setup of an update was not fetched, and whether that is a trouble.
 fn fetch_words(failed: &updates::Failed) -> (String, bool) {
     use updates::Failed;
@@ -795,7 +806,10 @@ enum Note {
     EngineVersion(Option<String>, Option<u64>),
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
     ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
-    StraydogUpdate(engine_updates::Result),
+    /// What a look at Straydog's releases came to (`engine_updates::look_and_stage`); `asked`: the person's, from "Check for updates".
+    StraydogLooked { asked: bool, look: engine_updates::Look },
+    /// How far the download of a Straydog release has come.
+    StraydogProgress { version: String, done: u64, total: u64 },
     /// How far the engine fetched for a first start has come ([`App::fetch_engine_first`]), in bytes of the whole.
     EngineFetch { done: u64, whole: u64 },
     /// The engine fetched for a first start is here (its path), or why it is not.
@@ -2270,6 +2284,8 @@ struct App {
     engine_waiting: Option<String>,
     /// Later was pressed on the notice of that engine alone.
     engine_notice_closed: bool,
+    /// What About says of Straydog's update besides the engine that waits: the person's look going on, the download as it comes, or what a look came to.
+    engine_look: EngineLook,
     /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
     checking_setup: bool,
     /// A newer release on GitHub than this one, found on the app's own look: the notice at the top of the main screen tells of it (`notice`), with a button for its page while nothing of its
@@ -8124,7 +8140,9 @@ impl App {
                 form.y += s(ds::space::M);
                 // Whether a newer release is out: asked for here, and said here. Once its setup is here, there is nothing left to look for: the button that stands in the look's place restarts into it.
                 let setup_here = self.ready_setup().is_some();
-                form.button_centered(if setup_here { self.buttons[3] } else { self.buttons[1] });
+                // (so too with Straydog waiting alone: its restart stands where the look stood; with the app's setup here, that one's restart takes both)
+                let engine_alone = self.engine_waiting.is_some() && !setup_here;
+                form.button_centered(if setup_here { self.buttons[3] } else if engine_alone { self.buttons[4] } else { self.buttons[1] });
                 if let Some((words, problem)) = self.release_words() {
                     let tall = text_height(self.fonts.small, &words, form.width);
                     form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
@@ -8143,6 +8161,12 @@ impl App {
                     } else if self.update_button_words().is_some() {
                         form.link_centered(self.buttons[3]);
                     }
+                }
+                // Straydog's update, said as the app's: what the look came to, the download as it comes, or the engine that waits (its restart is above).
+                if let Some((words, problem)) = self.engine_words() {
+                    let tall = text_height(self.fonts.small, &words, form.width);
+                    form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
+                    form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
                 }
                 form.toggle_centered(t("Update automatically"), self.toggle_updates);
                 let what_it_does = t("It downloads in the background and asks before restarting.");
@@ -11138,7 +11162,7 @@ impl App {
         if updates::is_due_after(self.settings.last_update_check, updates::now(), every) {
             self.start_release_look(true);
             // (the engine's look with it: what each finds is offered in the one notice, for one restart)
-            self.start_straydog_update();
+            self.start_straydog_look(false);
         }
     }
 
@@ -11158,13 +11182,18 @@ impl App {
 
     /// The About page's button for the look: what it says, and that it waits while a look is going on.
     unsafe fn show_release_controls(&self) {
-        set_text_if_changed(self.buttons[1], if self.release_checking { t("Checking…") } else { t("Check for updates") });
+        // (a look at either, the app's or Straydog's, is a look going on)
+        let checking = self.release_checking || matches!(self.engine_look, EngineLook::Checking);
+        set_text_if_changed(self.buttons[1], if checking { t("Checking…") } else { t("Check for updates") });
         set_text_if_changed(self.buttons[2], t("Open the release page"));
         if let Some(words) = self.update_button_words() {
             set_text_if_changed(self.buttons[3], words);
             set_button_style(self.buttons[3], self.update_button_kind(), theme::background());
         }
-        EnableWindow(self.buttons[1], i32::from(!self.release_checking));
+        // (the restart into Straydog that waits, alone, when no setup of the app's is here: with one, the app's button restarts into both)
+        set_text_if_changed(self.buttons[4], if self.restart_when_done { t("Not now") } else { t("Restart to update") });
+        set_button_style(self.buttons[4], if self.restart_when_done { ButtonKind::Secondary } else { ButtonKind::Primary }, theme::background());
+        EnableWindow(self.buttons[1], i32::from(!checking));
         EnableWindow(self.buttons[3], i32::from(!self.checking_setup));
     }
 
@@ -11221,19 +11250,56 @@ impl App {
         self.save();
         self.update_toggles();
         self.layout();
-        if self.settings.check_straydog_updates { self.start_straydog_update(); }
+        if self.settings.check_straydog_updates { self.start_straydog_look(false); }
     }
 
-    fn start_straydog_update(&self) {
-        if !self.settings.check_straydog_updates || self.engine_update_inflight.swap(true, Ordering::AcqRel) { return }
-        let (poster, settings, data, cancel, inflight) = (self.poster.clone(), self.settings.clone(), self.folder.clone(), self.engine_update_cancel.clone(), self.engine_update_inflight.clone());
+    /// Straydog's look, on a thread of its own: the app's (`asked` false: only with its switch on, and said only once an engine is ready or could not
+    /// be) or the person's, from "Check for updates" (said in About whatever it comes to, as the app's look is, and not held back by the switch). The
+    /// person's, while the app's is under way, takes that one's answer.
+    unsafe fn start_straydog_look(&mut self, asked: bool) {
+        if asked {
+            self.engine_look = EngineLook::Checking;
+        } else if !self.settings.check_straydog_updates {
+            return;
+        }
+        if self.engine_update_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // (the switch turned off stops the app's look; the person's has a stop of its own, which nothing but the app's end sets)
+        let cancel = if asked { Arc::new(AtomicBool::new(false)) } else { self.engine_update_cancel.clone() };
+        let (poster, settings, data, inflight) = (self.poster.clone(), self.settings.clone(), self.folder.clone(), self.engine_update_inflight.clone());
         std::thread::spawn(move || {
-            let outcome = engine_updates::check_and_stage(&settings, &data, &cancel);
+            let progress = poster.clone();
+            let mut said = None;
+            let look = engine_updates::look_and_stage(&settings, &data, &cancel, asked, &mut |version, done, total| {
+                // (a note for each percent: the bytes come in pieces of a few kilobytes)
+                let percent = done * 100 / total.max(1);
+                if said != Some(percent) {
+                    said = Some(percent);
+                    progress.send(Note::StraydogProgress { version: version.to_string(), done, total });
+                }
+            });
             inflight.store(false, Ordering::Release);
             if !cancel.load(Ordering::Relaxed) {
-                if let Some(outcome) = outcome { poster.send(Note::StraydogUpdate(outcome)); }
+                poster.send(Note::StraydogLooked { asked, look });
             }
         });
+        if self.panel == Panel::About {
+            self.show_release_controls();
+            self.layout();
+        }
+    }
+
+    /// About's line on Straydog's update, as the app's: the engine that waits for the restart, the download as it comes, or what the person's look came to.
+    fn engine_words(&self) -> Option<(String, bool)> {
+        if let Some(version) = &self.engine_waiting {
+            return Some((tf("Straydog {0} is ready: it is used after the app restarts.", &[version]), false));
+        }
+        match &self.engine_look {
+            EngineLook::None | EngineLook::Checking => None,
+            EngineLook::Fetching { version, done, total } => Some((tf("Downloading Straydog {0}… {1}%", &[version, &(done * 100 / (*total).max(1))]), false)),
+            EngineLook::Said(words, problem) => Some((words.clone(), *problem)),
+        }
     }
 
     unsafe fn asked_to_quit(&mut self) {
@@ -14883,22 +14949,51 @@ impl App {
                     Err(reason) => self.say(&reason),
                 }
             }
-            Note::StraydogUpdate(outcome) => match outcome {
-                engine_updates::Result::Ready(version) => {
-                    // (over the engine that runs, it waits for the restart the notice offers; a first engine, with none before it, is selected at once)
-                    self.engine_waiting = engine_updates::waiting(&self.folder);
-                    if self.engine_waiting.is_some() {
-                        self.engine_notice_closed = false;
-                        self.release_update_changed();
-                    } else {
-                        self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version]));
+            Note::StraydogProgress { version, done, total } => {
+                self.engine_look = EngineLook::Fetching { version, done, total };
+                if self.panel == Panel::About {
+                    self.layout();
+                }
+            }
+            Note::StraydogLooked { asked, look } => {
+                // (the person's look, or the app's while the person's waited on it: About says what it came to)
+                let answering = asked || matches!(self.engine_look, EngineLook::Checking | EngineLook::Fetching { .. });
+                self.engine_look = EngineLook::None;
+                match look {
+                    engine_updates::Look::Staged(engine_updates::Result::Ready(version)) => {
+                        // (over the engine that runs, it waits for the restart the notice offers; a first engine, with none before it, is selected at once)
+                        self.engine_waiting = engine_updates::waiting(&self.folder);
+                        if self.engine_waiting.is_some() {
+                            self.engine_notice_closed = false;
+                            self.release_update_changed();
+                        } else {
+                            let words = tf("Straydog {0} is ready for the next engine start.", &[&version]);
+                            if answering {
+                                self.engine_look = EngineLook::Said(words.clone(), false);
+                            }
+                            self.say(&words);
+                        }
                     }
+                    engine_updates::Look::Staged(engine_updates::Result::ModelNotReady(reason)) => {
+                        self.engine_look = EngineLook::Said(reason.clone(), true);
+                        self.say(&reason);
+                    }
+                    engine_updates::Look::Staged(engine_updates::Result::Failed(_)) => {
+                        let words = t("The Straydog update could not be prepared. See engine.log for details.");
+                        self.engine_look = EngineLook::Said(words.to_string(), true);
+                        self.say(words);
+                    }
+                    engine_updates::Look::UpToDate(version) if answering => {
+                        self.engine_look = EngineLook::Said(tf("Straydog {0} is up to date.", &[&version]), false);
+                    }
+                    engine_updates::Look::NotLooked { why, trouble } if answering => self.engine_look = EngineLook::Said(why, trouble),
+                    engine_updates::Look::UpToDate(_) | engine_updates::Look::NotLooked { .. } => {}
                 }
-                engine_updates::Result::ModelNotReady(reason) => self.say(&reason),
-                engine_updates::Result::Failed(_) => {
-                    self.say(t("The Straydog update could not be prepared. See engine.log for details."));
+                if self.panel == Panel::About {
+                    self.show_release_controls();
+                    self.layout();
                 }
-            },
+            }
             Note::ReleaseProgress { done, total } => {
                 if let ReleaseUpdate::Fetching { done: so_far, total: of, .. } = &mut self.release_update {
                     (*so_far, *of) = (done, total);
@@ -15337,7 +15432,16 @@ impl App {
             (Panel::ConfirmRemove, 0) => self.leave_this_pc(false),
             (Panel::ConfirmRemove, 1) if self.model_in_the_data_folder().is_some() => self.leave_this_pc(true),
             (Panel::ConfirmRemove, _) => self.set_panel(Panel::General),
-            (Panel::About, 1) => self.start_release_look(false),
+            (Panel::About, 1) => {
+                // (the app and its engine: both are looked at, and each says what it found)
+                self.start_release_look(false);
+                self.start_straydog_look(true);
+            }
+            // (the restart into the Straydog that waits, as the notice's)
+            (Panel::About, 4) => {
+                self.update_offer_pressed();
+                self.show_release_controls();
+            }
             (Panel::About, 3) => match &self.release_update {
                 ReleaseUpdate::Fetching { stop, .. } => stop.store(true, Ordering::Relaxed),
                 ReleaseUpdate::Ready(_) => {
@@ -18676,6 +18780,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             restart_when_done: false,
             engine_waiting: None,
             engine_notice_closed: false,
+            engine_look: EngineLook::None,
             checking_setup: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
@@ -19031,7 +19136,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         SetTimer(window, TIMER_UPDATE, 5000, None);
         SetTimer(window, TIMER_RELEASES, FIRST_RELEASE_LOOK_MS, None);
         app.tidy_updates();
-        app.start_straydog_update();
+        app.start_straydog_look(false);
         app.update_status();
         app.refresh_sessions();
         if !needs_folder {

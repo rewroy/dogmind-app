@@ -478,36 +478,85 @@ pub fn prefer_bundled_if_newer(data: &Path) {
 /// Check in the background after app startup. An unreachable GitHub is a normal offline start.
 /// The engine this app runs is eligible (one fetched before, or one beside the app); a person-supplied path remains their choice. With
 /// none at all (an app that comes without one), the newest is fetched and selected, as [`fetch_first`] does.
-pub fn check_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool) -> Option<Result> {
-    if !settings.check_straydog_updates
-        || settings.straydog.is_some()
-        || stop.load(Ordering::Relaxed)
-    {
-        return None;
+/// What a look at Straydog's releases came to: About says it after "Check for updates", as it says the app's; the app's own looks say only an
+/// engine that is ready, or one that could not be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Look {
+    /// The engine that runs is the newest release's: its version.
+    UpToDate(String),
+    /// Nothing was fetched: why, and whether that is a trouble.
+    NotLooked { why: String, trouble: bool },
+    /// A newer release was fetched and checked, or that was tried: what it came to.
+    Staged(Result),
+}
+
+/// The look and the fetch, with why wherever nothing is done. `asked`: the person pressed "Check for updates", which the switch for the app's own
+/// looks and a metered connection do not hold back, as they do not hold back the app's own update then. `told` hears the release's version and
+/// the bytes that have arrived of the whole (the exe, then the zip with cuBLAS).
+pub fn look_and_stage(settings: &Settings, data: &Path, stop: &AtomicBool, asked: bool, told: &mut dyn FnMut(&str, u64, u64)) -> Look {
+    let not = |why: String, trouble: bool| Look::NotLooked { why, trouble };
+    if !asked && !settings.check_straydog_updates {
+        return not(t("Straydog is not updated automatically.").into(), false);
+    }
+    if let Some(named) = &settings.straydog {
+        return not(tf("Straydog is the engine named in the settings ({0}): Dogmind does not update it.", &[&named.display()]), false);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return not(t("The engine update was cancelled.").into(), false);
     }
     let running = running_engine(data);
     // (with none, only once the person has set the app up for this PC's way: before, the setup's choice fetches it (fetch_first), and an app
     // set up for another way fetches nothing it would not run)
     if running.is_none() && !(settings.set_up && settings.active_provider().is_some_and(|provider| provider.kind == crate::settings::Kind::Embedded)) {
-        return None;
+        return not(t("This app has no Straydog engine of its own to update.").into(), false);
     }
     let running_version = match &running {
-        Some(exe) => Some(version(exe)?),
+        Some(exe) => match version(exe) {
+            Some(version) => Some(version),
+            None => return not(t("The version of the Straydog engine in use could not be read.").into(), true),
+        },
         None => None,
     };
-    let release = newest(&release_list(stop)?, running_version.as_deref().unwrap_or(NONE_RUNNING))?;
+    let Some(list) = release_list(stop) else { return not(t("Could not reach GitHub.").into(), true) };
+    let Some(release) = newest(&list, running_version.as_deref().unwrap_or(NONE_RUNNING)) else {
+        return match running_version {
+            Some(version) => Look::UpToDate(version),
+            None => not(t("No Straydog release for this PC was found on GitHub.").into(), true),
+        };
+    };
     if failed_before(data, &release) {
-        return None;
+        return not(tf("Straydog {0} failed to start on this PC before, so it was not fetched again.", &[&release.version]), true);
     }
-    if crate::machine::connection_is_metered() || stop.load(Ordering::Relaxed) {
-        return None;
+    if !asked && crate::machine::connection_is_metered() {
+        return not(t("The update was not downloaded: this connection is metered. Check for updates downloads it anyway.").into(), false);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return not(t("The engine update was cancelled.").into(), false);
     }
     let _staging = STAGING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // (a first fetch the person asked for may have selected one meanwhile: it is the one that runs, and no other is fetched over it now)
-    if running.is_none() && running_engine(data).is_some() {
-        return None;
+    if running.is_none() {
+        if let Some(fetched) = running_engine(data) {
+            return Look::UpToDate(version(&fetched).unwrap_or_default());
+        }
     }
-    Some(stage(&release, running.as_deref(), settings, data, stop))
+    // (the exe, then the zip with cuBLAS: their sizes are the whole; SHA256SUMS is a few hundred bytes)
+    let whole = release.exe.size + release.zip.as_ref().map_or(0, |zip| zip.size);
+    let mut done = 0u64;
+    let mut fetch = |asset: &Setup, target: &Path, stop: &AtomicBool| {
+        let counted = asset.url != release.sums.url;
+        let before = done;
+        let result = updates::fetch_straydog_asset_told(asset, target, stop, &mut |arrived, _| {
+            if counted {
+                told(&release.version, before + arrived, whole);
+            }
+        });
+        if counted {
+            done = before + asset.size;
+        }
+        result
+    };
+    Look::Staged(stage_with(&release, running.as_deref(), settings, data, stop, &mut fetch))
 }
 
 /// One staging at a time, in this app: the look after the start and a first fetch the person asked for work in the same folder, and each
@@ -566,23 +615,6 @@ pub fn fetch_first(settings: &Settings, data: &Path, stop: &AtomicBool, told: &m
         Result::Ready(_) => selected(data).ok_or_else(|| t("The fetched Straydog engine could not be selected.").to_string()),
         Result::ModelNotReady(reason) | Result::Failed(reason) => Err(reason),
     }
-}
-
-fn stage(
-    release: &Candidate,
-    running: Option<&Path>,
-    settings: &Settings,
-    data: &Path,
-    stop: &AtomicBool,
-) -> Result {
-    stage_with(
-        release,
-        running,
-        settings,
-        data,
-        stop,
-        &mut |asset: &Setup, target: &Path, stop: &AtomicBool| updates::fetch_straydog_asset(asset, target, stop),
-    )
 }
 
 /// What a staged engine comes to: selected at once where none runs (a first start's), else waiting for the app's next start ([`WAITING`]), which
@@ -953,6 +985,28 @@ fn grant_worker_access(_folder: &Path) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A look says why wherever it fetches nothing, and the person's ("Check for updates") is not held back by the switch for the app's own looks:
+    /// past it, an app with no engine of its own says so (all of this before any network).
+    #[test]
+    fn a_look_says_why_it_fetched_nothing_and_the_persons_goes_past_the_switch() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let stop = AtomicBool::new(false);
+        let mut told = |_: &str, _: u64, _: u64| panic!("nothing is fetched");
+        let off = Settings { check_straydog_updates: false, ..Settings::default() };
+        let why = |look: Look| match look {
+            Look::NotLooked { why, .. } => why,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(why(look_and_stage(&off, dir.path(), &stop, false, &mut told)), t("Straydog is not updated automatically."));
+        // (asked, the switch does not hold it back: what holds it here is that this test's app has no engine and is set up for no PC's way)
+        assert_eq!(why(look_and_stage(&off, dir.path(), &stop, true, &mut told)), t("This app has no Straydog engine of its own to update."));
+        let named = Settings { straydog: Some(PathBuf::from(r"D:\engines\straydog.exe")), ..Settings::default() };
+        let said = why(look_and_stage(&named, dir.path(), &stop, true, &mut told));
+        assert!(said.contains(r"D:\engines\straydog.exe"), "{said}");
+        let stopped = AtomicBool::new(true);
+        assert_eq!(why(look_and_stage(&Settings::default(), dir.path(), &stopped, true, &mut told)), t("The engine update was cancelled."));
+    }
 
     thread_local! {
         /// The files `flushed_partial` has put on the disk in this test's thread.
